@@ -26,10 +26,10 @@ bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 echo "=== 1. the catalogue is priced at boot, not lazily ==="
 ROWS=$(q "SELECT COUNT(*) FROM shop_prices;")
 echo "  priced rows: $ROWS"
-if [ "$ROWS" -ge 40 ]; then
-  ok "the whole catalogue is priced ($ROWS rows) - the invariants below examine something"
+if [ "$ROWS" -eq 40 ]; then
+  ok "the table matches the catalogue exactly ($ROWS rows) - no orphans, nothing missing"
 else
-  bad "only $ROWS rows priced; expected 40+. Seeding did not run"
+  bad "$ROWS priced rows against a catalogue of 40 - the table and the code disagree"
 fi
 
 echo "=== 2. buy > sell for every row (no money printer) ==="
@@ -59,12 +59,22 @@ else
 fi
 # Go straight at the data, bypassing the plugin entirely - the price-table equivalent of a
 # modified client.
-VIOL=$(q "UPDATE shop_prices SET current_price = base_price * 99 WHERE item = 'IRON_INGOT';" || true)
+# THE TARGET ROW IS ASSERTED TO EXIST FIRST. This test previously named IRON_INGOT, which the
+# arbitrage audit later forced out of the catalogue - so the UPDATE matched zero rows, no constraint
+# fired, and the test reported the CHECK as missing. The reverse mistake is worse and was the real
+# risk: an UPDATE that matches nothing looks exactly like a refusal, so a test written this way can
+# report a constraint as working when the row simply is not there.
+TARGET=RAW_IRON
+EXISTS=$(q "SELECT COUNT(*) FROM shop_prices WHERE item = '$TARGET';")
+if [ "$EXISTS" != "1" ]; then
+  bad "test target $TARGET is not in the price table, so this check would prove nothing"
+fi
+VIOL=$(q "UPDATE shop_prices SET current_price = base_price * 99 WHERE item = '$TARGET';" || true)
 if echo "$VIOL" | grep -qiE 'constraint|check'; then
   ok "the database REFUSED a price 99x base: $(echo "$VIOL" | tail -1 | cut -c1-80)"
 else
   bad "the database ACCEPTED a price 99x base - the CHECK is missing or wrong"
-  q "UPDATE shop_prices SET current_price = base_price WHERE item = 'IRON_INGOT';" >/dev/null || true
+  q "UPDATE shop_prices SET current_price = base_price WHERE item = '$TARGET';" >/dev/null || true
 fi
 
 echo "=== 5. row 40's gate is not stored where anyone can edit it ==="

@@ -54,23 +54,35 @@ final class Shop {
     }
 
     static {
+        // NOTE ON WHAT IS DELIBERATELY ABSENT: IRON_INGOT, GOLD_INGOT, NETHERITE_SCRAP and STONE.
+        //
+        // Each is the OUTPUT of a smelting recipe whose INPUT is also in this catalogue, and the
+        // arbitrage audit caught all four as money printers on its first run: buy raw iron at the
+        // bottom of its band for 12, smelt it, sell the ingot at the top of its band for 24.
+        //
+        // The root cause is structural, not a wrong number. Two items linked by a recipe hold
+        // INDEPENDENT prices, and the P4 band lets them drift apart by 1.4/0.6 = 2.33x, which
+        // swamps the 12% spread entirely. No choice of base prices fixes it while both sides are
+        // priced independently - to be safe the ingot would have to be worth under half the ore,
+        // which is absurd and would confuse every player who saw it.
+        //
+        // So only ONE side of each transformation is priced. Players sell what they mine, which is
+        // the raw form; ingots stay for crafting. The alternative considered was linked price groups
+        // that move together - more elegant, more machinery - recorded in decisions.md as the option
+        // to reach for if the catalogue ever needs both sides sellable.
         // --- ore and mining. The bulk of early income. -------------------------
         add(Material.COBBLESTONE,     "ore",     1, 1200);   // 1
-        add(Material.STONE,           "ore",     1, 600);    // 2
         add(Material.COAL,            "ore",     1, 150);    // 8
         add(Material.RAW_COPPER,      "ore",     1, 100);    // 12
         add(Material.RAW_IRON,        "ore",     1, 60);     // 20
-        add(Material.IRON_INGOT,      "ore",     1, 60);     // 20
         add(Material.REDSTONE,        "ore",     2, 120);    // 10
         add(Material.LAPIS_LAZULI,    "ore",     2, 100);    // 12
         add(Material.RAW_GOLD,        "ore",     2, 34);     // 35
-        add(Material.GOLD_INGOT,      "ore",     2, 34);     // 35
         add(Material.QUARTZ,          "ore",     3, 60);     // 20
         add(Material.AMETHYST_SHARD,  "ore",     3, 40);     // 30
         add(Material.DIAMOND,         "ore",     4, 10);     // 120
         add(Material.EMERALD,         "ore",     4, 12);     // 100
         add(Material.ANCIENT_DEBRIS,  "ore",     6, 2);      // 600
-        add(Material.NETHERITE_SCRAP, "ore",     6, 2);      // 600
 
         // --- farming. Lower value per unit, far higher throughput. -------------
         add(Material.WHEAT,           "farm",    1, 200);

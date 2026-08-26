@@ -37,6 +37,7 @@ $files = @(
   'src/main/java/gg/laughtail/core/Menu.java',
   'src/main/java/gg/laughtail/core/Hud.java',
   'src/main/java/gg/laughtail/core/Shop.java',
+  'src/main/java/gg/laughtail/core/Arbitrage.java',
   'src/main/java/gg/laughtail/core/ShopService.java',
   'src/main/java/gg/laughtail/core/SellBox.java'
 )

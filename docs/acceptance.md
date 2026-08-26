@@ -60,7 +60,7 @@ Five rows carry a caveat recorded in `docs/questions.md`: row **14** cannot pass
 | **23** | Login time | Under 3 seconds from connect to spawn | Timed measurement | 6 | Not started | - |
 | **24** | Command latency | Every command responds within 100 ms, or acknowledges and runs async | Timing log | 6 | Built by design, not yet measured | Every command that touches the database acknowledges immediately and does its work on an async task - which is the same property row 25 enforces. Not claimed: nobody has measured the latency, and the row asks for a number |
 | **25** | Main-thread database calls | No blocking database call on the main thread anywhere | Spark profile plus code review | 0 rule, 6 proof | **PASS 2026-08-26** | - |
-| **26** | Economy audit | Zero positive-yield cycles across all items and all recipe chains | Audit output | 3 | Partial - per-item PASS, chains not started | Per-item positive-yield cycles are excluded by the spread invariant proven in row 27, at both band extremes. **What is missing is the hard half**: the walk across crafting and smelting chains, where a profit appears only after a transformation - buy iron, craft something, sell it for more than the inputs. That audit does not exist yet and is the next economy task. Until it does, the economy is proven safe against direct resale and unproven against recipes |
+| **26** | Economy audit | Zero positive-yield cycles across all items and all recipe chains | Audit output | 3 | **PASS 2026-08-26** | `Arbitrage.audit` walks every recipe the server knows - crafting, smelting, blasting, smoking, campfire, stonecutting, smithing - and reports positive-yield cycles. Boot log 12:15:18: **1585 recipes examined, 0 positive-yield cycles**. Deliberately PESSIMISTIC: inputs priced at the bottom of the P4 band (0.6x base, the cheapest they can ever be) and the output at the top (1.4x base less the 12% spread), so a pass holds under any real conditions rather than only today. Where a RecipeChoice accepts several materials the CHEAPEST is used, because that is what an attacker would use. **It ran inside the server rather than in CI on purpose**: the recipe list is whatever this Minecraft version actually ships, and a CI copy could drift from the server after any update. **The audit has teeth** - a finding closes the shop, refusing buy and sell, because an economy with a known printer should be shut rather than left open while it is abused; Berries once minted cannot be un-minted without rolling back everyone who traded since. A zero-recipe result is treated as a FAILURE too, since the dangerous outcome is a green light nobody earned |
 | **27** | Price spread | Buy exceeds sell by the minimum spread at both extremes of the dynamic band | Audit output | 3 | **PASS 2026-08-26** | - |
 | **28** | Atomic order match | Server killed mid-match creates and destroys nothing | Before and after query | 3 | Not started | - |
 | **29** | Trade safety | Disconnect, item-swap, and spam-click exploits all fail | Test log | 3 | Not started | - |
@@ -236,3 +236,52 @@ Fixed by removing the duplication rather than by correcting both copies: `movePr
 price under its transaction lock and calls `Shop.sellPrice`, so one function knows what the spread
 is. `currentPrice` additionally repairs any stored sell price that disagrees, on read - so drift
 self-heals instead of waiting for a test to find it. Re-run: DIAMOND 12.5%, all 44 rows compliant.
+## Row 26 - the arbitrage audit found seven money printers on its first run
+
+This is the entry worth reading, because the audit failed the moment it was written and the failure
+was mine.
+
+First run: **7 positive-yield cycles out of 1585 recipes.** All seven were one mistake made four
+times - raw ore and its smelted form both priced, independently:
+
+```
+minecraft:iron_ingot_from_smelting_raw_iron:   buy inputs for 12, sell for 24  = +12 per cycle
+minecraft:gold_ingot_from_smelting_raw_gold:   buy inputs for 21, sell for 43  = +22 per cycle
+minecraft:netherite_scrap:                     buy inputs for 360, sell for 739 = +379 per cycle
+minecraft:stone:                               buy inputs for 1, sell for 2    = +1 per cycle
+```
+(each also appearing as its blasting variant)
+
+**The root cause was structural, not a wrong number.** Two items linked by a recipe held independent
+prices, and the P4 band lets them drift apart by 1.4 / 0.6 = **2.33x** - which swamps a 12% spread
+entirely. No choice of base prices fixes it while both sides float independently: to be safe an iron
+ingot would have to be worth under half a raw iron, which is absurd and would confuse every player
+who saw it.
+
+Fixed by pricing only ONE side of each transformation. Players sell what they mine - the raw form -
+and ingots remain for crafting. Re-run: **1585 recipes, 0 cycles.**
+
+### What the audit deliberately does not claim
+
+A security claim with an unstated limit is worse than no claim, so the limits are in the code and
+repeated here:
+
+* It covers recipes the **server** knows. Multi-step chains through unsellable intermediates cannot
+  pay out, because a chain only yields Berries where it touches the shop, and every such point is a
+  recipe the audit sees.
+* It does **not** cover buying low and selling high **over time**. That window is real: the band
+  floor is 0.6x base and the ceiling sell is 1.232x base, so an item bought at the floor and sold at
+  the ceiling roughly doubles. That is speculation, not a cycle - it needs other players to move the
+  price, it is bounded by the band, and P5 pulls prices back at 5% an hour. Recorded rather than
+  hidden. The lever to close it is the band width, not this audit.
+* It does not model mob or block drops. Those are income; a cycle needs a purchase at the start.
+
+### A second bug, in the test rather than the code
+
+Removing IRON_INGOT broke `test-shop.sh`, which named it when proving the price-band CHECK. The
+UPDATE matched zero rows, so no constraint fired and the test reported the CHECK as missing.
+
+**The reverse of that mistake is the dangerous one**, and it is why the fix matters more than the
+symptom: an UPDATE that matches nothing is indistinguishable from a refusal, so a test written this
+way can report a constraint as working when the row is simply absent. The test now asserts its
+target row exists before trying to violate it.

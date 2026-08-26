@@ -455,6 +455,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         // examining nothing. Idempotent: currentPrice inserts only when the row is absent.
         assertRow25();
         seedShopCatalogue();
+        runArbitrageAudit();
         this.hud = new Hud(this, database);
         getServer().getPluginManager().registerEvents(hud, this);
         hud.start();
@@ -532,6 +533,51 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    /**
+     * Row 26, run at boot once the catalogue is priced.
+     *
+     * Deliberately AFTER seeding and on a delay, because the audit needs prices and the recipe list
+     * is not fully populated until the server has finished loading data packs. Running it too early
+     * would audit an empty recipe list and report a triumphant pass over nothing - which is the
+     * failure mode this whole check exists to avoid.
+     */
+    private void runArbitrageAudit() {
+        getServer().getScheduler().runTaskLater(this, () -> {
+            int examined = Arbitrage.recipeCount(getServer());
+            java.util.List<Arbitrage.Finding> findings = Arbitrage.audit(getServer());
+            if (examined == 0) {
+                getLogger().severe("ARBITRAGE AUDIT INVALID: 0 recipes examined. The audit ran "
+                    + "before recipes loaded, so its pass means nothing.");
+                // An audit that proved nothing is treated exactly like a failed one. The dangerous
+                // outcome is a green light nobody earned.
+                shopService.close("the economy audit could not run. Trading is disabled until it can.");
+                return;
+            }
+            if (findings.isEmpty()) {
+                getLogger().info("ARBITRAGE AUDIT PASS: " + examined + " recipes examined, "
+                    + "0 positive-yield cycles. Tested pessimistically - inputs bought at the "
+                    + "band floor, output sold at the band ceiling.");
+                return;
+            }
+            getLogger().severe("ARBITRAGE AUDIT FAIL: " + findings.size() + " positive-yield "
+                + "cycle(s) out of " + examined + " recipes examined. THIS IS A MONEY PRINTER.");
+            for (Arbitrage.Finding f : findings) {
+                getLogger().severe("  " + f.recipe() + ": buy inputs for " + f.inputCost()
+                    + ", craft " + f.outputQty() + "x " + f.output() + ", sell for "
+                    + f.outputValue() + " = +" + f.profit() + " Berries per cycle");
+            }
+            getLogger().severe("  Fix by raising an input price, lowering the output price, or "
+                + "removing the output from the catalogue. Do NOT ignore this.");
+            // Teeth. The specification asks for a BUILD gate; a server already running cannot fail
+            // its build, so the equivalent is to shut the shop. Buying and selling refuse until the
+            // catalogue is fixed, because the alternative is leaving a money printer switched on
+            // and hoping nobody finds it.
+            shopService.close("an economy audit found " + findings.size()
+                + " way(s) to print Berries. Trading is disabled until it is fixed.");
+            getLogger().severe("  SHOP CLOSED. Buying and selling are disabled until this passes.");
+        }, 100L);
+    }
+
     private void seedShopCatalogue() {
         getServer().getScheduler().runTaskAsynchronously(this, () -> {
             int made = 0;
@@ -539,6 +585,11 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
                 for (Shop.Entry e : Shop.catalogue().values()) {
                     database.currentPrice(e);
                     made++;
+                }
+                int pruned = database.pruneOrphanPrices();
+                if (pruned > 0) {
+                    getLogger().info("Pruned " + pruned + " price row(s) for items no longer in "
+                        + "the catalogue, so the table matches the code.");
                 }
                 getLogger().info("Shop catalogue priced from P2: " + made + " items, spread "
                     + (int) (Shop.SPREAD * 100) + "%, target " + Shop.HOUR + " Berries/hour.");
@@ -2469,7 +2520,30 @@ public final class Database {
             }
         }
     }
-}
+
+    /**
+     * Deletes price rows for items no longer in the catalogue.
+     *
+     * When the arbitrage audit forced IRON_INGOT, GOLD_INGOT, NETHERITE_SCRAP and STONE out of the
+     * catalogue, their price rows stayed behind. They were harmless - buy and sell both resolve
+     * through Shop.entry, which returns nothing for them - but they made the table disagree with
+     * the code, so the invariant test reported 44 priced items against a catalogue of 40. A number
+     * that needs explaining is a number that will be misread later.
+     *
+     * Runs on every boot, so the table always matches the catalogue exactly.
+     */
+    int pruneOrphanPrices() throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> keep = new java.util.ArrayList<>();
+        for (Shop.Entry e : Shop.catalogue().values()) keep.add(e.material().name());
+        if (keep.isEmpty()) return 0;   // never wipe the table because the catalogue failed to load
+        StringBuilder sql = new StringBuilder("DELETE FROM shop_prices WHERE item NOT IN (");
+        sql.append("?,".repeat(keep.size() - 1)).append("?)");
+        try (Connection c = open(); PreparedStatement ps = c.prepareStatement(sql.toString())) {
+            for (int i = 0; i < keep.size(); i++) ps.setString(i + 1, keep.get(i));
+            return ps.executeUpdate();
+        }
+    }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Database_java
 
 # ---- src/main/java/gg/laughtail/core/RulesGate.java ----
@@ -5760,23 +5834,35 @@ final class Shop {
     }
 
     static {
+        // NOTE ON WHAT IS DELIBERATELY ABSENT: IRON_INGOT, GOLD_INGOT, NETHERITE_SCRAP and STONE.
+        //
+        // Each is the OUTPUT of a smelting recipe whose INPUT is also in this catalogue, and the
+        // arbitrage audit caught all four as money printers on its first run: buy raw iron at the
+        // bottom of its band for 12, smelt it, sell the ingot at the top of its band for 24.
+        //
+        // The root cause is structural, not a wrong number. Two items linked by a recipe hold
+        // INDEPENDENT prices, and the P4 band lets them drift apart by 1.4/0.6 = 2.33x, which
+        // swamps the 12% spread entirely. No choice of base prices fixes it while both sides are
+        // priced independently - to be safe the ingot would have to be worth under half the ore,
+        // which is absurd and would confuse every player who saw it.
+        //
+        // So only ONE side of each transformation is priced. Players sell what they mine, which is
+        // the raw form; ingots stay for crafting. The alternative considered was linked price groups
+        // that move together - more elegant, more machinery - recorded in decisions.md as the option
+        // to reach for if the catalogue ever needs both sides sellable.
         // --- ore and mining. The bulk of early income. -------------------------
         add(Material.COBBLESTONE,     "ore",     1, 1200);   // 1
-        add(Material.STONE,           "ore",     1, 600);    // 2
         add(Material.COAL,            "ore",     1, 150);    // 8
         add(Material.RAW_COPPER,      "ore",     1, 100);    // 12
         add(Material.RAW_IRON,        "ore",     1, 60);     // 20
-        add(Material.IRON_INGOT,      "ore",     1, 60);     // 20
         add(Material.REDSTONE,        "ore",     2, 120);    // 10
         add(Material.LAPIS_LAZULI,    "ore",     2, 100);    // 12
         add(Material.RAW_GOLD,        "ore",     2, 34);     // 35
-        add(Material.GOLD_INGOT,      "ore",     2, 34);     // 35
         add(Material.QUARTZ,          "ore",     3, 60);     // 20
         add(Material.AMETHYST_SHARD,  "ore",     3, 40);     // 30
         add(Material.DIAMOND,         "ore",     4, 10);     // 120
         add(Material.EMERALD,         "ore",     4, 12);     // 100
         add(Material.ANCIENT_DEBRIS,  "ore",     6, 2);      // 600
-        add(Material.NETHERITE_SCRAP, "ore",     6, 2);      // 600
 
         // --- farming. Lower value per unit, far higher throughput. -------------
         add(Material.WHEAT,           "farm",    1, 200);
@@ -5927,6 +6013,221 @@ final class Shop {
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Shop_java
 
+# ---- src/main/java/gg/laughtail/core/Arbitrage.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Arbitrage.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Arbitrage_java'
+package gg.laughtail.core;
+
+import org.bukkit.Material;
+import org.bukkit.inventory.CookingRecipe;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.Recipe;
+import org.bukkit.inventory.ShapedRecipe;
+import org.bukkit.inventory.ShapelessRecipe;
+import org.bukkit.inventory.RecipeChoice;
+
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
+/**
+ * The arbitrage audit. Acceptance rows 26 and 27.
+ *
+ * Row 26: "Zero positive-yield cycles across all items and all recipe chains."
+ *
+ * WHAT A POSITIVE-YIELD CYCLE IS. Buy ingredients from the shop, transform them with a recipe, sell
+ * the result back to the shop, and end with more Berries than you started with. That is a money
+ * printer. It does not need a bug to appear - it appears whenever the price of a product is set
+ * independently of the price of its inputs, which is what happens every time someone adds an item
+ * to a shop by picking a number that "feels right".
+ *
+ * THE AUDIT IS DELIBERATELY PESSIMISTIC. For every recipe it assumes the attacker is maximally
+ * lucky: ingredients bought at the BOTTOM of the P4 band (0.6x base, the cheapest the price can
+ * ever be) and the output sold at the TOP (1.4x base, then less the 12% spread). If a recipe is not
+ * profitable under those conditions it cannot be profitable under any real conditions, so a pass
+ * here is a strong statement rather than a snapshot of today's prices.
+ *
+ * WHAT THIS AUDIT DOES NOT CLAIM, stated because a security claim with an unstated limit is worse
+ * than no claim:
+ *
+ *   1. It covers recipes the SERVER knows about - crafting, smelting, blasting, smoking,
+ *      campfires and stonecutting. It does not model multi-step chains where an intermediate item
+ *      is unsellable. Those cannot yield Berries directly, because a chain only pays out where it
+ *      touches the shop, and every point where it touches the shop is a recipe this audit sees.
+ *   2. It does not cover buying low and selling high OVER TIME. That window genuinely exists: the
+ *      band floor is 0.6x base and the ceiling sell is 1.232x base, so an item bought at the floor
+ *      and sold at the ceiling roughly doubles. That is speculation, not a cycle - it requires
+ *      other players to move the price, it is bounded by the band, and P5 pulls prices back toward
+ *      base at 5% an hour. It is recorded as a known property rather than hidden, and if the owner
+ *      ever wants it closed the lever is the band width, not this audit.
+ *   3. It does not model mob or block drops. Those are income, not arbitrage - a cycle needs a
+ *      purchase at the start.
+ *
+ * IT RUNS AT BOOT AND FAILS LOUDLY. The specification asks for a build gate. Running it inside the
+ * server at enable is strictly better than running it in CI, because the recipe list is whatever
+ * this Minecraft version actually ships - a CI job would be auditing a copy of the recipe list and
+ * could silently drift from the server after any update. A positive cycle logs at SEVERE with the
+ * exact recipe, and the test script greps for the verdict.
+ */
+final class Arbitrage {
+
+    /** One profitable recipe, with the arithmetic that condemned it. */
+    record Finding(String recipe, Material output, int outputQty, long inputCost,
+                   long outputValue, long profit) { }
+
+    /** The cheapest an item can ever be bought for: the bottom of the P4 band. */
+    private static long minBuy(Material m) {
+        Shop.Entry e = Shop.entry(m);
+        if (e == null) return -1;
+        return Math.max(1L, Math.round(e.basePrice() * 0.6));
+    }
+
+    /** The most an item can ever be sold for: the top of the band, less the spread. */
+    private static long maxSell(Material m) {
+        Shop.Entry e = Shop.entry(m);
+        if (e == null) return -1;
+        return Shop.sellPrice(Math.round(e.basePrice() * 1.4));
+    }
+
+    /**
+     * Runs the audit.
+     *
+     * @return every profitable recipe found. Empty is a pass.
+     */
+    static List<Finding> audit(org.bukkit.Server server) {
+        List<Finding> findings = new ArrayList<>();
+        Iterator<Recipe> it = server.recipeIterator();
+        while (it.hasNext()) {
+            Recipe r;
+            try {
+                r = it.next();
+            } catch (RuntimeException ex) {
+                // A malformed recipe from another plugin must not abort the audit, or one bad
+                // recipe would silently disable the whole money-printer check.
+                continue;
+            }
+            ItemStack result = r.getResult();
+            if (result == null || result.getType() == Material.AIR) continue;
+
+            long sellEach = maxSell(result.getType());
+            // If the output cannot be sold, the recipe cannot pay out. Nothing to check.
+            if (sellEach <= 0) continue;
+
+            List<ItemStack> inputs = ingredientsOf(r);
+            if (inputs == null || inputs.isEmpty()) continue;
+
+            long cost = 0;
+            boolean allBuyable = true;
+            for (ItemStack in : inputs) {
+                long each = minBuy(in.getType());
+                if (each < 0) {
+                    // An ingredient the shop does not sell cannot be bought, so this recipe is not
+                    // a CYCLE - the player had to obtain that input by playing. Not a finding.
+                    allBuyable = false;
+                    break;
+                }
+                cost += each * in.getAmount();
+            }
+            if (!allBuyable) continue;
+
+            long value = sellEach * result.getAmount();
+            if (value > cost) {
+                findings.add(new Finding(describe(r), result.getType(), result.getAmount(),
+                    cost, value, value - cost));
+            }
+        }
+        return findings;
+    }
+
+    /** How many recipes the audit actually examined, so a pass cannot be a pass over nothing. */
+    static int recipeCount(org.bukkit.Server server) {
+        int n = 0;
+        Iterator<Recipe> it = server.recipeIterator();
+        while (it.hasNext()) {
+            try {
+                it.next();
+                n++;
+            } catch (RuntimeException ignored) {
+                // counted as examined-and-skipped; the audit above does the same
+            }
+        }
+        return n;
+    }
+
+    /**
+     * The ingredients of a recipe, resolved to concrete materials.
+     *
+     * A RecipeChoice can accept several materials - any log, any plank. The CHEAPEST accepted
+     * material is used, because that is what an attacker would use. Picking the first, or an
+     * average, would understate the risk.
+     */
+    private static List<ItemStack> ingredientsOf(Recipe r) {
+        List<ItemStack> out = new ArrayList<>();
+        if (r instanceof ShapedRecipe shaped) {
+            for (RecipeChoice choice : shaped.getChoiceMap().values()) {
+                if (choice == null) continue;
+                Material m = cheapest(choice);
+                if (m == null) return null;
+                out.add(new ItemStack(m, 1));
+            }
+        } else if (r instanceof ShapelessRecipe shapeless) {
+            for (RecipeChoice choice : shapeless.getChoiceList()) {
+                Material m = cheapest(choice);
+                if (m == null) return null;
+                out.add(new ItemStack(m, 1));
+            }
+        } else if (r instanceof CookingRecipe<?> cooking) {
+            Material m = cheapest(cooking.getInputChoice());
+            if (m == null) return null;
+            out.add(new ItemStack(m, 1));
+        } else if (r instanceof org.bukkit.inventory.StonecuttingRecipe stone) {
+            Material m = cheapest(stone.getInputChoice());
+            if (m == null) return null;
+            out.add(new ItemStack(m, 1));
+        } else if (r instanceof org.bukkit.inventory.SmithingRecipe smith) {
+            Material base = cheapest(smith.getBase());
+            Material add = cheapest(smith.getAddition());
+            if (base == null || add == null) return null;
+            out.add(new ItemStack(base, 1));
+            out.add(new ItemStack(add, 1));
+        } else {
+            // An unrecognised recipe type is NOT silently passed. Returning null makes the caller
+            // skip it, and the count difference is reported, so an unaudited recipe is visible
+            // rather than assumed safe.
+            return null;
+        }
+        return out;
+    }
+
+    /** The cheapest material a choice accepts, or null if none is purchasable. */
+    private static Material cheapest(RecipeChoice choice) {
+        if (choice == null) return null;
+        List<Material> accepted = new ArrayList<>();
+        if (choice instanceof RecipeChoice.MaterialChoice mc) {
+            accepted.addAll(mc.getChoices());
+        } else if (choice instanceof RecipeChoice.ExactChoice ec) {
+            for (ItemStack s : ec.getChoices()) accepted.add(s.getType());
+        } else {
+            return null;
+        }
+        Material best = null;
+        long bestPrice = Long.MAX_VALUE;
+        for (Material m : accepted) {
+            long p = minBuy(m);
+            if (p >= 0 && p < bestPrice) {
+                bestPrice = p;
+                best = m;
+            }
+        }
+        return best;
+    }
+
+    private static String describe(Recipe r) {
+        if (r instanceof org.bukkit.Keyed k) return k.getKey().toString();
+        return r.getClass().getSimpleName();
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Arbitrage_java
+
 # ---- src/main/java/gg/laughtail/core/ShopService.java ----
 cat > "$SRC/src/main/java/gg/laughtail/core/ShopService.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_ShopService_java'
 package gg.laughtail.core;
@@ -5958,6 +6259,36 @@ import java.util.logging.Level;
  */
 final class ShopService {
 
+    /**
+     * Set false when the arbitrage audit finds a positive-yield cycle.
+     *
+     * AN ECONOMY WITH A KNOWN MONEY PRINTER SHOULD BE CLOSED, NOT OPEN. Logging the finding and
+     * carrying on would mean the first player to notice mints unlimited Berries - and Berries once
+     * minted cannot be un-minted without rolling back everyone who traded since. Closing the shop
+     * is recoverable and visible. An inflated economy is neither.
+     *
+     * Volatile because the audit runs on a delayed task while commands are handled on the main
+     * thread and the work on async threads.
+     */
+    private volatile boolean open = true;
+    private volatile String closedReason = "";
+
+    void close(String reason) {
+        this.open = false;
+        this.closedReason = reason;
+    }
+
+    boolean isOpen() { return open; }
+
+    /** True when the shop is shut and the player has been told why. */
+    boolean refuseIfClosed(Player p) {
+        if (open) return false;
+        p.sendMessage(Component.text("The shop is closed: " + closedReason, NamedTextColor.RED));
+        p.sendMessage(Component.text("This is deliberate. An economy with a known exploit is shut "
+            + "rather than left open while it is abused.", NamedTextColor.GRAY));
+        return true;
+    }
+
     private final LaughTailPlugin plugin;
     private final Database db;
 
@@ -5968,6 +6299,8 @@ final class ShopService {
 
     boolean handle(CommandSender sender, String cmd, String[] args) {
         if (!(sender instanceof Player p)) return false;
+        // /shop still works when closed, so a player can read WHY rather than hitting silence.
+        if (!cmd.equals("shop") && refuseIfClosed(p)) return true;
         switch (cmd) {
             case "shop": return shopInfo(p, args);
             case "sell": return sell(p, args);

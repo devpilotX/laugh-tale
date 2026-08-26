@@ -1472,4 +1472,27 @@ public final class Database {
             }
         }
     }
-}
+
+    /**
+     * Deletes price rows for items no longer in the catalogue.
+     *
+     * When the arbitrage audit forced IRON_INGOT, GOLD_INGOT, NETHERITE_SCRAP and STONE out of the
+     * catalogue, their price rows stayed behind. They were harmless - buy and sell both resolve
+     * through Shop.entry, which returns nothing for them - but they made the table disagree with
+     * the code, so the invariant test reported 44 priced items against a catalogue of 40. A number
+     * that needs explaining is a number that will be misread later.
+     *
+     * Runs on every boot, so the table always matches the catalogue exactly.
+     */
+    int pruneOrphanPrices() throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> keep = new java.util.ArrayList<>();
+        for (Shop.Entry e : Shop.catalogue().values()) keep.add(e.material().name());
+        if (keep.isEmpty()) return 0;   // never wipe the table because the catalogue failed to load
+        StringBuilder sql = new StringBuilder("DELETE FROM shop_prices WHERE item NOT IN (");
+        sql.append("?,".repeat(keep.size() - 1)).append("?)");
+        try (Connection c = open(); PreparedStatement ps = c.prepareStatement(sql.toString())) {
+            for (int i = 0; i < keep.size(); i++) ps.setString(i + 1, keep.get(i));
+            return ps.executeUpdate();
+        }
+    }}

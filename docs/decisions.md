@@ -735,3 +735,23 @@ Most of the list is already specified, which is worth saying because it means th
 ### Order of work
 
 The GUI is last, not first. A menu is a *view*, and building the view before the things it shows produces a menu full of buttons that do nothing - which looks like progress and is not. So: homes, then TPA and RTP, then the shop, then the order book and auction, then the GUI that fronts all of them, then nametags and Apollo.
+
+## D-0036 - only one side of a transformation is priced
+
+**Decision.** Where a crafting or smelting recipe turns one catalogue item into another, only one of
+the two is in the shop catalogue. Raw ores are sellable; their smelted forms are not.
+
+**Why.** The arbitrage audit found four money printers of exactly this shape on its first run. The
+cause is not a badly chosen price, it is that two independently priced items linked by a recipe can
+drift apart by 1.4/0.6 = 2.33x inside the P4 band, which swamps the 12% spread. There is no safe pair
+of base prices while both float.
+
+**The alternative considered, and when to reach for it.** Linked price GROUPS: items in a group share
+one multiplier so they cannot drift apart, and the spread then guarantees a loss on any
+buy-transform-sell. It is more elegant and keeps both sides sellable, at the cost of a group column,
+group-aware elasticity, and a migration. If the owner ever wants ingots sellable directly, that is
+the correct implementation - not a hand-tuned price.
+
+**Consequence accepted.** A player holding ingots cannot sell them directly; they sell raw ore. This
+is a small loss of convenience against a guarantee that the economy cannot be printed, which
+Law 1 and row 26 both rank higher.

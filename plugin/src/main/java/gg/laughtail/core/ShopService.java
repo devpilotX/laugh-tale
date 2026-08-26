@@ -27,6 +27,36 @@ import java.util.logging.Level;
  */
 final class ShopService {
 
+    /**
+     * Set false when the arbitrage audit finds a positive-yield cycle.
+     *
+     * AN ECONOMY WITH A KNOWN MONEY PRINTER SHOULD BE CLOSED, NOT OPEN. Logging the finding and
+     * carrying on would mean the first player to notice mints unlimited Berries - and Berries once
+     * minted cannot be un-minted without rolling back everyone who traded since. Closing the shop
+     * is recoverable and visible. An inflated economy is neither.
+     *
+     * Volatile because the audit runs on a delayed task while commands are handled on the main
+     * thread and the work on async threads.
+     */
+    private volatile boolean open = true;
+    private volatile String closedReason = "";
+
+    void close(String reason) {
+        this.open = false;
+        this.closedReason = reason;
+    }
+
+    boolean isOpen() { return open; }
+
+    /** True when the shop is shut and the player has been told why. */
+    boolean refuseIfClosed(Player p) {
+        if (open) return false;
+        p.sendMessage(Component.text("The shop is closed: " + closedReason, NamedTextColor.RED));
+        p.sendMessage(Component.text("This is deliberate. An economy with a known exploit is shut "
+            + "rather than left open while it is abused.", NamedTextColor.GRAY));
+        return true;
+    }
+
     private final LaughTailPlugin plugin;
     private final Database db;
 
@@ -37,6 +67,8 @@ final class ShopService {
 
     boolean handle(CommandSender sender, String cmd, String[] args) {
         if (!(sender instanceof Player p)) return false;
+        // /shop still works when closed, so a player can read WHY rather than hitting silence.
+        if (!cmd.equals("shop") && refuseIfClosed(p)) return true;
         switch (cmd) {
             case "shop": return shopInfo(p, args);
             case "sell": return sell(p, args);

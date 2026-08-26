@@ -99,6 +99,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         // examining nothing. Idempotent: currentPrice inserts only when the row is absent.
         assertRow25();
         seedShopCatalogue();
+        runArbitrageAudit();
         this.hud = new Hud(this, database);
         getServer().getPluginManager().registerEvents(hud, this);
         hud.start();
@@ -176,6 +177,51 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    /**
+     * Row 26, run at boot once the catalogue is priced.
+     *
+     * Deliberately AFTER seeding and on a delay, because the audit needs prices and the recipe list
+     * is not fully populated until the server has finished loading data packs. Running it too early
+     * would audit an empty recipe list and report a triumphant pass over nothing - which is the
+     * failure mode this whole check exists to avoid.
+     */
+    private void runArbitrageAudit() {
+        getServer().getScheduler().runTaskLater(this, () -> {
+            int examined = Arbitrage.recipeCount(getServer());
+            java.util.List<Arbitrage.Finding> findings = Arbitrage.audit(getServer());
+            if (examined == 0) {
+                getLogger().severe("ARBITRAGE AUDIT INVALID: 0 recipes examined. The audit ran "
+                    + "before recipes loaded, so its pass means nothing.");
+                // An audit that proved nothing is treated exactly like a failed one. The dangerous
+                // outcome is a green light nobody earned.
+                shopService.close("the economy audit could not run. Trading is disabled until it can.");
+                return;
+            }
+            if (findings.isEmpty()) {
+                getLogger().info("ARBITRAGE AUDIT PASS: " + examined + " recipes examined, "
+                    + "0 positive-yield cycles. Tested pessimistically - inputs bought at the "
+                    + "band floor, output sold at the band ceiling.");
+                return;
+            }
+            getLogger().severe("ARBITRAGE AUDIT FAIL: " + findings.size() + " positive-yield "
+                + "cycle(s) out of " + examined + " recipes examined. THIS IS A MONEY PRINTER.");
+            for (Arbitrage.Finding f : findings) {
+                getLogger().severe("  " + f.recipe() + ": buy inputs for " + f.inputCost()
+                    + ", craft " + f.outputQty() + "x " + f.output() + ", sell for "
+                    + f.outputValue() + " = +" + f.profit() + " Berries per cycle");
+            }
+            getLogger().severe("  Fix by raising an input price, lowering the output price, or "
+                + "removing the output from the catalogue. Do NOT ignore this.");
+            // Teeth. The specification asks for a BUILD gate; a server already running cannot fail
+            // its build, so the equivalent is to shut the shop. Buying and selling refuse until the
+            // catalogue is fixed, because the alternative is leaving a money printer switched on
+            // and hoping nobody finds it.
+            shopService.close("an economy audit found " + findings.size()
+                + " way(s) to print Berries. Trading is disabled until it is fixed.");
+            getLogger().severe("  SHOP CLOSED. Buying and selling are disabled until this passes.");
+        }, 100L);
+    }
+
     private void seedShopCatalogue() {
         getServer().getScheduler().runTaskAsynchronously(this, () -> {
             int made = 0;
@@ -183,6 +229,11 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
                 for (Shop.Entry e : Shop.catalogue().values()) {
                     database.currentPrice(e);
                     made++;
+                }
+                int pruned = database.pruneOrphanPrices();
+                if (pruned > 0) {
+                    getLogger().info("Pruned " + pruned + " price row(s) for items no longer in "
+                        + "the catalogue, so the table matches the code.");
                 }
                 getLogger().info("Shop catalogue priced from P2: " + made + " items, spread "
                     + (int) (Shop.SPREAD * 100) + "%, target " + Shop.HOUR + " Berries/hour.");
