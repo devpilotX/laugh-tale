@@ -1,0 +1,63 @@
+# LaughTail SMP - .gitignore
+# Spec 33.3 step 2: this file must exist and be correct BEFORE the first commit.
+# A secret committed once lives in history forever, even after deletion.
+# Never-break rule 5 (AGENTS.md): never commit a secret.
+
+# --- Required minimum set, verbatim from spec 33.3 ---
+.env
+*.env
+docs/private/
+*.key
+*.pem
+id_rsa*
+*.sql
+backups/
+logs/
+world*/
+*.log
+
+# --- Carve-out: see docs/decisions.md D-0001 and docs/questions.md Q-01 ---
+# Spec 33.3 excludes *.sql, but the same section's tree requires db/migrations/
+# and Appendix D defines a schema that must be version-controlled.
+# Schema migrations are code, not data, and contain no secrets.
+!db/migrations/
+!db/migrations/**/*.sql
+
+# --- Additional exclusions (spec 33.3 says "at minimum") ---
+*.jar
+*.jar.sha256.tmp
+*.p12
+*.pfx
+*.ppk
+id_ed25519*
+*.kdbx
+credentials*
+secrets*
+*.dump
+*.bak
+
+# Paper / Pelican runtime artefacts that must never enter git (Section 29:
+# the repository is the source of truth for CONFIG, not for runtime state)
+server/**/cache/
+server/**/libraries/
+server/**/versions/
+server/**/plugins/**/*.db
+server/**/plugins/**/data/
+server/**/crash-reports/
+server/**/banned-*.json
+server/**/ops.json
+server/**/usercache.json
+server/**/session.lock
+server/**/eula.txt
+*.mca
+*.mcr
+
+# OS and editor noise
+Thumbs.db
+Desktop.ini
+desktop.ini
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
