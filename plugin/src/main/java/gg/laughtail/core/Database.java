@@ -2486,4 +2486,21 @@ public final class Database {
                 return rs.getInt(1);
             }
         }
+    }
+    /** The richest players, for the economy page. Names only, no UUIDs shown to players. */
+    java.util.List<String> topBalances(int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT p.current_name, b.berries FROM balances b "
+               + "JOIN players p ON p.uuid = b.uuid WHERE b.berries > 0 "
+               + "ORDER BY b.berries DESC, p.current_name ASC LIMIT ?")) {
+            ps.setInt(1, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                int i = 1;
+                while (rs.next()) out.add((i++) + ". " + rs.getString(1) + "  " + rs.getLong(2));
+            }
+        }
+        return out;
     }}

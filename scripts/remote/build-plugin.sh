@@ -3633,6 +3633,23 @@ public final class Database {
                 return rs.getInt(1);
             }
         }
+    }
+    /** The richest players, for the economy page. Names only, no UUIDs shown to players. */
+    java.util.List<String> topBalances(int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT p.current_name, b.berries FROM balances b "
+               + "JOIN players p ON p.uuid = b.uuid WHERE b.berries > 0 "
+               + "ORDER BY b.berries DESC, p.current_name ASC LIMIT ?")) {
+            ps.setInt(1, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                int i = 1;
+                while (rs.next()) out.add((i++) + ". " + rs.getString(1) + "  " + rs.getLong(2));
+            }
+        }
+        return out;
     }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Database_java
 
@@ -6225,8 +6242,20 @@ final class Menu implements Listener {
      * shows a nonsense repair cost, and it does not work reliably for Bedrock players through
      * Geyser - which 4.4 puts in scope. A chat prompt works identically for everyone.
      */
-    private final java.util.Set<java.util.UUID> pendingSearch =
-        java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /**
+     * Players the GUI is waiting on for typed input, and what it will do with it.
+     *
+     * A CHAT PROMPT rather than an anvil rename box. An anvil GUI is the usual trick for text input,
+     * but it needs a real anvil inventory whose behaviour differs between versions, it shows a
+     * nonsense repair cost, and it is unreliable for Bedrock players through Geyser - which 4.4 puts
+     * in scope. A chat prompt behaves identically for everyone.
+     *
+     * The value is a command TEMPLATE containing {0}, so one handler serves every prompt. Adding a
+     * new one that needs typing costs a template rather than another branch here - and a branch per
+     * prompt is how the fifth one ends up subtly different from the first four.
+     */
+    private final java.util.Map<java.util.UUID, String> pendingInput =
+        new java.util.concurrent.ConcurrentHashMap<>();
 
     Menu(LaughTailPlugin plugin) {
         this.plugin = plugin;
@@ -6369,6 +6398,10 @@ final class Menu implements Listener {
                             "The price rises with each slot.",
                             "A slot you buy is yours permanently.")));
                 }
+                inv.setItem(20, item(Material.OAK_SIGN, "Set a home here", NamedTextColor.AQUA,
+                    List.of("Type a name in chat.", "Uses one of your slots.")));
+                inv.setItem(24, item(Material.SHEARS, "Delete a home", NamedTextColor.RED,
+                    List.of("Type its name in chat.", "The slot stays yours.")));
                 inv.setItem(18, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
                 inv.setItem(26, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
                 p.openInventory(inv);
@@ -6475,6 +6508,18 @@ final class Menu implements Listener {
         });
     }
 
+    /**
+     * Asks for a line of text, then runs a command template with it.
+     *
+     * One helper rather than the same four lines at every call site - a prompt that forgets to close
+     * the inventory leaves the player typing into a menu they cannot see.
+     */
+    private void prompt(Player p, String template, String question) {
+        p.closeInventory();
+        pendingInput.put(p.getUniqueId(), template);
+        p.sendMessage(Component.text(question + ", or type cancel.", NamedTextColor.AQUA));
+    }
+
     private boolean matches(Shop.Entry e, String category, String query) {
         if (query != null) {
             return e.material().name().toLowerCase().contains(query.toLowerCase());
@@ -6536,6 +6581,10 @@ final class Menu implements Listener {
                 }
                 inv.setItem(16, item(Material.PAPER, "Leaderboards", NamedTextColor.YELLOW,
                     List.of("Rank, kills, streak and playtime.", "Runs /top.")));
+                inv.setItem(20, item(Material.OAK_SIGN, "Set a home here", NamedTextColor.AQUA,
+                    List.of("Type a name in chat.", "Uses one of your slots.")));
+                inv.setItem(24, item(Material.SHEARS, "Delete a home", NamedTextColor.RED,
+                    List.of("Type its name in chat.", "The slot stays yours.")));
                 inv.setItem(18, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
                 inv.setItem(26, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
                 p.openInventory(inv);
@@ -6671,11 +6720,167 @@ final class Menu implements Listener {
                         "The season story. Everyone's",
                         "work counts toward it.",
                         "Click to read.")));
+                // The three chat commands are reachable here too. A chest cannot hold a sentence, so
+                // these prompt for one - which is the same pattern the shop search and the pay amount
+                // use. Without them a player who never reads a command list never finds /me at all.
+                inv.setItem(38, item(Material.FEATHER, "Describe an action", NamedTextColor.LIGHT_PURPLE,
+                    List.of("Runs /me. Seen within 100 blocks.", "Type it in chat when asked.")));
+                inv.setItem(40, item(Material.PAPER, "Speak locally", NamedTextColor.DARK_AQUA,
+                    List.of("Runs /local. Only people who can", "see you will hear it.")));
+                inv.setItem(42, item(Material.BELL, "Speak to your House", NamedTextColor.GOLD,
+                    List.of("Runs /hc. Reaches members", "wherever they are.")));
                 inv.setItem(36, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
                 inv.setItem(44, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
                 p.openInventory(inv);
             });
         });
+    }
+    /**
+     * A player picker. One head per online player, and a click runs an action against them.
+     *
+     * ONE PAGE SERVES PAY, TELEPORT AND FRIEND REQUESTS, because they are the same interaction -
+     * choose a person, then do a thing. Three near-identical pages would drift apart, and the third
+     * one would be the one missing the confirmation.
+     *
+     * ONLY ONLINE PLAYERS ARE LISTED. An offline list would need every player who ever joined, which
+     * grows without limit and cannot be paged usefully in a chest. Paying or friending someone offline
+     * still works by typing their name, and the page says so.
+     */
+    void openPlayers(Player p, String action) {
+        Inventory inv = Bukkit.createInventory(new MenuHolder("players:" + action), 54,
+            Component.text(switch (action) {
+                case "pay" -> "Pay whom?";
+                case "tpa" -> "Teleport to whom?";
+                case "tpahere" -> "Ask whom to come here?";
+                default -> "Add whom as a friend?";
+            }, NamedTextColor.AQUA));
+        int slot = 0;
+        for (Player other : plugin.getServer().getOnlinePlayers()) {
+            if (other.equals(p) || slot >= 45) continue;
+            ItemStack head = new ItemStack(Material.PLAYER_HEAD);
+            org.bukkit.inventory.meta.SkullMeta sm =
+                (org.bukkit.inventory.meta.SkullMeta) head.getItemMeta();
+            sm.setOwningPlayer(other);
+            sm.displayName(Component.text(other.getName(), NamedTextColor.WHITE)
+                .decoration(TextDecoration.ITALIC, false));
+            sm.lore(java.util.List.of(
+                Component.text("Click to " + switch (action) {
+                    case "pay" -> "pay them Berries";
+                    case "tpa" -> "ask to teleport to them";
+                    case "tpahere" -> "ask them to come to you";
+                    default -> "send a friend request";
+                }, NamedTextColor.GRAY).decoration(TextDecoration.ITALIC, false)));
+            head.setItemMeta(sm);
+            inv.setItem(slot++, head);
+        }
+        if (slot == 0) {
+            inv.setItem(22, item(Material.BARRIER, "Nobody else is online",
+                NamedTextColor.GRAY, List.of("This list shows online players only.",
+                    "For someone offline, type their name:",
+                    action.equals("pay") ? "/pay <name> <amount>"
+                        : action.equals("friend") ? "/friend add <name>" : "/tpa <name>")));
+        }
+        inv.setItem(49, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+        inv.setItem(53, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+        p.openInventory(inv);
+    }
+
+    /**
+     * Amount presets for a payment.
+     *
+     * Presets plus a typed option, rather than click-to-increment. Incrementing is the usual chest-GUI
+     * answer to numbers and it is miserable: paying 3,470 would take dozens of clicks. Four common
+     * amounts cover most payments and the typed option covers the rest honestly.
+     */
+    void openPayAmount(Player p, String target) {
+        Inventory inv = Bukkit.createInventory(new MenuHolder("pay:" + target), 27,
+            Component.text("Pay " + target, NamedTextColor.GOLD));
+        int[] amounts = { 100, 500, 1000, 5000 };
+        Material[] icons = { Material.IRON_NUGGET, Material.GOLD_NUGGET,
+                             Material.GOLD_INGOT, Material.GOLD_BLOCK };
+        for (int i = 0; i < amounts.length; i++) {
+            inv.setItem(10 + i, item(icons[i], String.valueOf(amounts[i]),
+                NamedTextColor.YELLOW, List.of("Send " + amounts[i] + " Berries to " + target,
+                    amounts[i] > 5000 ? "A 5% tax applies above 5000." : "No tax at or below 5000.")));
+        }
+        inv.setItem(15, item(Material.WRITABLE_BOOK, "Another amount", NamedTextColor.AQUA,
+            List.of("Type the amount in chat.", "Anything over 5000 carries a 5% tax.")));
+        inv.setItem(18, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+        inv.setItem(26, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+        p.openInventory(inv);
+    }
+
+    /** Berries: balance, the rich list, and where money comes from. */
+    void openEconomy(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final long bal;
+            final java.util.List<String> top;
+            try {
+                bal = plugin.database().balance(p.getUniqueId());
+                top = plugin.database().topBalances(8);
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read your balance.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                Inventory inv = Bukkit.createInventory(new MenuHolder("economy"), 45,
+                    Component.text("Berries", NamedTextColor.GOLD));
+                inv.setItem(4, item(Material.GOLD_INGOT, "You have " + bal + " Berries",
+                    NamedTextColor.GOLD, List.of("One currency, server-wide.",
+                        "There is no second currency and",
+                        "there never will be - that is how",
+                        "servers hyperinflate.")));
+                inv.setItem(20, item(Material.PLAYER_HEAD, "Pay someone", NamedTextColor.GREEN,
+                    List.of("Send Berries to another player.",
+                        "Over 5000 carries a 5% tax.")));
+                inv.setItem(22, item(Material.CHEST, "Shop", NamedTextColor.YELLOW,
+                    List.of("Buy and sell at server prices.")));
+                inv.setItem(24, item(Material.PAPER, "Bazaar", NamedTextColor.AQUA,
+                    List.of("Trade with other players.")));
+                int slot = 28;
+                inv.setItem(slot++, item(Material.DIAMOND, "Richest players",
+                    NamedTextColor.LIGHT_PURPLE, top.isEmpty()
+                        ? List.of("Nobody has any Berries yet.")
+                        : top));
+                // The three chat commands are reachable here too. A chest cannot hold a sentence, so
+                // these prompt for one - which is the same pattern the shop search and the pay amount
+                // use. Without them a player who never reads a command list never finds /me at all.
+                inv.setItem(38, item(Material.FEATHER, "Describe an action", NamedTextColor.LIGHT_PURPLE,
+                    List.of("Runs /me. Seen within 100 blocks.", "Type it in chat when asked.")));
+                inv.setItem(40, item(Material.PAPER, "Speak locally", NamedTextColor.DARK_AQUA,
+                    List.of("Runs /local. Only people who can", "see you will hear it.")));
+                inv.setItem(42, item(Material.BELL, "Speak to your House", NamedTextColor.GOLD,
+                    List.of("Runs /hc. Reaches members", "wherever they are.")));
+                inv.setItem(36, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(44, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
+
+    /**
+     * Pending teleport requests, with accept and deny.
+     *
+     * This page exists because /tpaccept was previously reachable only by typing, which means a player
+     * who does not read chat closely never discovers it - and a teleport request that is never answered
+     * looks like a broken feature to whoever sent it.
+     */
+    void openRequests(Player p) {
+        Inventory inv = Bukkit.createInventory(new MenuHolder("requests"), 27,
+            Component.text("Teleport requests", NamedTextColor.AQUA));
+        inv.setItem(11, item(Material.LIME_DYE, "Accept", NamedTextColor.GREEN,
+            List.of("Accept the request waiting for you.",
+                    "Refused while you are in combat -",
+                    "accepting is what moves you.")));
+        inv.setItem(15, item(Material.RED_DYE, "Deny", NamedTextColor.RED,
+            List.of("Refuse it. They are told.")));
+        inv.setItem(13, item(Material.ENDER_PEARL, "Send a request", NamedTextColor.AQUA,
+            List.of("Choose someone to teleport to.")));
+        inv.setItem(18, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+        inv.setItem(26, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+        p.openInventory(inv);
     }
     private void openAdmin(Player p) {
         Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
@@ -6735,7 +6940,7 @@ final class Menu implements Listener {
                 case "Sell box" -> { p.closeInventory(); plugin.sellBox().open(p); }
                 case "Search" -> {
                     p.closeInventory();
-                    pendingSearch.add(p.getUniqueId());
+                    pendingInput.put(p.getUniqueId(), "\u0000search");
                     p.sendMessage(Component.text("Type what you are looking for, or cancel.",
                         NamedTextColor.AQUA));
                 }
@@ -6761,7 +6966,10 @@ final class Menu implements Listener {
                 case ARROW -> openMain(p);
                 case WRITTEN_BOOK -> { p.closeInventory(); run(p, "chronicle"); }
                 case WHITE_BANNER -> { p.closeInventory(); run(p, "house"); }
+                case FEATHER -> prompt(p, "me {0}", "Describe what you are doing");
+                case BELL -> prompt(p, "hc {0}", "What do you want to tell your House");
                 case NAME_TAG -> { p.closeInventory(); run(p, "title"); }
+                case PAPER -> prompt(p, "local {0}", "What do you want to say");
                 default -> {
                     // A Path button. The display name starts with the Path name, so it is matched by
                     // prefix rather than by exact text - the label carries a level that changes.
@@ -6777,6 +6985,59 @@ final class Menu implements Listener {
             return;
         }
 
+        if (holder.page.startsWith("players:")) {
+            String action = holder.page.substring("players:".length());
+            if (clicked.getType() == Material.ARROW) { openMain(p); return; }
+            if (clicked.getType() != Material.PLAYER_HEAD) return;
+            // The head's display name is the target. Read from the item rather than from a map, so a
+            // stale server-side map cannot send Berries to the wrong person.
+            switch (action) {
+                case "pay" -> openPayAmount(p, name);
+                case "tpa" -> { p.closeInventory(); run(p, "tpa " + name); }
+                case "tpahere" -> { p.closeInventory(); run(p, "tpahere " + name); }
+                default -> { p.closeInventory(); run(p, "friend add " + name); }
+            }
+            return;
+        }
+
+        if (holder.page.startsWith("pay:")) {
+            String target = holder.page.substring("pay:".length());
+            if (clicked.getType() == Material.ARROW) { openPlayers(p, "pay"); return; }
+            if (clicked.getType() == Material.WRITABLE_BOOK) {
+                p.closeInventory();
+                pendingInput.put(p.getUniqueId(), "pay " + target + " {0}");
+                p.sendMessage(Component.text("Type the amount to send " + target
+                    + ", or cancel.", NamedTextColor.AQUA));
+                return;
+            }
+            if (name.matches("\\d+")) {
+                p.closeInventory();
+                run(p, "pay " + target + " " + name);
+            }
+            return;
+        }
+
+        if (holder.page.equals("economy")) {
+            switch (name) {
+                case "Back" -> openMain(p);
+                case "Pay someone" -> openPlayers(p, "pay");
+                case "Shop" -> openShop(p, null);
+                case "Bazaar" -> openBazaar(p);
+                default -> { }
+            }
+            return;
+        }
+
+        if (holder.page.equals("requests")) {
+            switch (name) {
+                case "Back" -> openMain(p);
+                case "Accept" -> { p.closeInventory(); run(p, "tpaccept"); }
+                case "Deny" -> { p.closeInventory(); run(p, "tpdeny"); }
+                case "Send a request" -> openPlayers(p, "tpa");
+                default -> { }
+            }
+            return;
+        }
         if (holder.page.equals("bazaar")) {
             switch (name) {
                 case "Back" -> openMain(p);
@@ -6799,6 +7060,18 @@ final class Menu implements Listener {
         if (holder.page.equals("homes")) {
             switch (clicked.getType()) {
                 case RED_BED -> { p.closeInventory(); run(p, "home " + name); }
+                case OAK_SIGN -> {
+                    p.closeInventory();
+                    pendingInput.put(p.getUniqueId(), "sethome {0}");
+                    p.sendMessage(Component.text("Type a name for this home, or cancel.",
+                        NamedTextColor.AQUA));
+                }
+                case SHEARS -> {
+                    p.closeInventory();
+                    pendingInput.put(p.getUniqueId(), "delhome {0}");
+                    p.sendMessage(Component.text("Type the name of the home to delete, or cancel.",
+                        NamedTextColor.AQUA));
+                }
                 case EMERALD -> { p.closeInventory(); run(p, "buyhome"); }
                 case ARROW   -> openMain(p);
                 default -> { }
@@ -6827,13 +7100,9 @@ final class Menu implements Listener {
             case "Paths and Story"     -> openRoleplay(p);
             case "Friends"             -> { p.closeInventory(); run(p, "friend list"); }
             case "Leaderboards"        -> { p.closeInventory(); run(p, "top rank"); }
-            case "Berries"             -> run(p, "berries");
+            case "Berries"             -> openEconomy(p);
             case "Random Teleport"     -> { p.closeInventory(); run(p, "rtp"); }
-            case "Teleport to a player" -> {
-                p.closeInventory();
-                p.sendMessage(Component.text("Use /tpa <player>. They must accept.",
-                    NamedTextColor.GRAY));
-            }
+            case "Teleport to a player" -> openRequests(p);
             case "Rules"               -> { p.closeInventory(); run(p, "rules"); }
             case "Staff and Owner tools" -> {
                 if (p.hasPermission("laughtail.status")) openAdmin(p);
@@ -6859,24 +7128,38 @@ final class Menu implements Listener {
     @EventHandler(priority = org.bukkit.event.EventPriority.LOWEST)
     public void onChat(io.papermc.paper.event.player.AsyncChatEvent e) {
         Player p = e.getPlayer();
-        if (!pendingSearch.remove(p.getUniqueId())) return;
+        String template = pendingInput.remove(p.getUniqueId());
+        if (template == null) return;
+        // Cancelled so a typed answer is never broadcast. Somebody typing an amount to pay a friend
+        // should not appear to be announcing it to the server.
         e.setCancelled(true);
         String typed = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
             .plainText().serialize(e.message()).trim();
         if (typed.isEmpty() || typed.equalsIgnoreCase("cancel")) {
-            plugin.getServer().getScheduler().runTask(plugin, () -> openShop(p, null, null));
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                p.sendMessage(Component.text("Cancelled.", NamedTextColor.GRAY));
+                openMain(p);
+            });
             return;
         }
-        // Bound the query. An unbounded string would be put into an inventory title, and a very
-        // long title is a client-side crash on some versions.
-        final String q = typed.length() > 32 ? typed.substring(0, 32) : typed;
-        plugin.getServer().getScheduler().runTask(plugin, () -> openShop(p, null, q));
+        // Bounded. An unbounded string can end up in an inventory title, and a very long title is a
+        // client-side crash on some versions.
+        final String answer = typed.length() > 32 ? typed.substring(0, 32) : typed;
+
+        if (template.equals("\u0000search")) {
+            plugin.getServer().getScheduler().runTask(plugin, () -> openShop(p, null, answer));
+            return;
+        }
+        // Anything else is a command template. Dispatched AS THE PLAYER, so permissions, audit rows
+        // and refusals behave exactly as if they had typed the whole thing.
+        final String command = template.replace("{0}", answer);
+        plugin.getServer().getScheduler().runTask(plugin, () -> run(p, command));
     }
 
     @EventHandler
     public void onSearchQuit(org.bukkit.event.player.PlayerQuitEvent e) {
         // Otherwise a player who quits mid-prompt would have their next message eaten on rejoin.
-        pendingSearch.remove(e.getPlayer().getUniqueId());
+        pendingInput.remove(e.getPlayer().getUniqueId());
     }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Menu_java
 
