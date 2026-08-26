@@ -44,6 +44,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Homes homes;
     private Teleports teleports;
     private ResourceWorldGuard resourceGuard;
+    private Menu menu;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -84,6 +85,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.resourceGuard = new ResourceWorldGuard(this);
         getServer().getPluginManager().registerEvents(resourceGuard, this);
         resourceGuard.start();
+        this.menu = new Menu(this);
+        getServer().getPluginManager().registerEvents(menu, this);
         getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
@@ -179,6 +182,38 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
             rulesGate.gate(p);
         }
 
+        // 9.6: the Champion keeps "a unique chat and tab prefix marking them as a past
+        // Champion, kept forever, through every future season". Applied on join because a
+        // title granted once at crowning would be lost by any LuckPerms reset or migration,
+        // whereas the champions table is the durable record and this derives from it.
+        //
+        // Note what the Champion does NOT get: 9.6 is explicit - "no Berries, no items, no
+        // gear, no stat bonus, no permission, no shop discount". The prize is entirely
+        // recognition, which is what keeps Law 1 intact.
+        getServer().getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                java.util.List<Integer> won = database.championSeasons(p.getUniqueId());
+                if (won.isEmpty()) return;
+                String label = won.size() == 1
+                    ? "Champion of Season " + won.get(0)
+                    : "Champion x" + won.size() + " (seasons "
+                      + won.stream().map(String::valueOf)
+                           .collect(java.util.stream.Collectors.joining(", ")) + ")";
+                getServer().getScheduler().runTask(this, () -> {
+                    if (!p.isOnline()) return;
+                    p.sendMessage(Component.text("\u2726 " + label + " \u2726", NamedTextColor.GOLD));
+                    p.sendMessage(Component.text(
+                        "Your title is permanent. It survives every season reset.",
+                        NamedTextColor.DARK_GRAY));
+                    // Announced to everyone, once per join. 9.6 says the advancement is
+                    // announced server-wide; a returning Champion being visible is the flex.
+                    getServer().broadcast(Component.text(label + " has joined: " + p.getName(),
+                        NamedTextColor.GOLD));
+                });
+            } catch (SQLException ex) {
+                getLogger().log(Level.WARNING, "champion title lookup failed: " + ex.getMessage());
+            }
+        });
         getServer().getScheduler().runTaskAsynchronously(this, () -> {
             try {
                 String accepted = database.registerAndGetAcceptedRules(
@@ -224,6 +259,11 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (economy.handle(sender, name, args)) return true;
         if (homes.handle(sender, name, args)) return true;
         if (teleports.handle(sender, name, args)) return true;
+        if (name.equals("menu")) {
+            if (sender instanceof Player mp) { menu.openMain(mp); }
+            else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }
+            return true;
+        }
 
         if (name.equals("rules")) {
             if (!(sender instanceof Player p)) {

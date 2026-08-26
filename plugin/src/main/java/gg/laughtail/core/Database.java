@@ -947,6 +947,11 @@ public final class Database {
                 }
 
                 c.commit();
+                // The Champion's permanent title is applied OUTSIDE this transaction, by the
+                // caller, because it is a LuckPerms operation rather than a database one. Doing
+                // it inside would mean a LuckPerms failure could roll back a crowning that has
+                // already been announced - and 31.2 says a season must never end without a
+                // Champion, so the crowning is the part that must be durable.
                 return "champion " + leader + " with " + leaderRp + " RP";
             } catch (SQLException e) {
                 c.rollback();
@@ -1032,6 +1037,21 @@ public final class Database {
             ps.setInt(5, season);
             ps.executeUpdate();
         }
+    }
+
+    /** The seasons a specific player won. 9.6: kept forever, through every future season. */
+    java.util.List<Integer> championSeasons(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        java.util.List<Integer> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT season_number FROM champions WHERE uuid = ? ORDER BY season_number")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(rs.getInt(1));
+            }
+        }
+        return out;
     }
 
     /** Test helper: gives a player a rating so the season lifecycle can be exercised. */    void setRatingForTest(UUID uuid, int season, int rp) throws SQLException {

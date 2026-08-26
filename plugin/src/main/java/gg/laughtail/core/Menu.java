@@ -1,0 +1,225 @@
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
+import org.bukkit.Bukkit;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * The chest-GUI front door. `/menu`, and the same thing under `/laughtail menu`.
+ *
+ * WHY A CHEST GUI AND NOT A CLIENT MOD BUTTON. The owner asked for an option in the ESC pause
+ * menu. A server cannot put one there - the pause menu is rendered entirely client-side, and the
+ * only way in is Lunar Client Apollo, which works for Lunar users and nobody else. A chest GUI
+ * works for every Java client AND for Bedrock players through Geyser, which matters because 4.4
+ * puts Bedrock support in scope. Apollo remains worth adding later as an extra door to the same
+ * room, and nothing will depend on it.
+ *
+ * BUTTONS FOR UNBUILT FEATURES SAY SO. This is the whole reason D-0035 scheduled the GUI last: a
+ * menu of buttons that silently do nothing looks like a finished server and is worse than no
+ * menu, because it moves the disappointment from "that isn't built" to "this server is broken".
+ * Every unbuilt entry is greyed, labelled "not built yet", and does nothing when clicked except
+ * say the same thing.
+ *
+ * IDENTIFICATION IS BY HOLDER, NOT BY TITLE. A menu identified by its title can be spoofed by a
+ * renamed chest or confused by a resource pack, and clicking in the wrong inventory would run a
+ * command. A private InventoryHolder cannot be forged by a client.
+ */
+final class Menu implements Listener {
+
+    /** Marks an inventory as ours. A client cannot fabricate this. */
+    private static final class MenuHolder implements InventoryHolder {
+        private final String page;
+        private MenuHolder(String page) { this.page = page; }
+        @Override public Inventory getInventory() { return null; }
+    }
+
+    private final LaughTailPlugin plugin;
+
+    Menu(LaughTailPlugin plugin) {
+        this.plugin = plugin;
+    }
+
+    // ---- building ------------------------------------------------------------
+
+    private ItemStack item(Material m, String name, NamedTextColor colour, List<String> lore) {
+        ItemStack it = new ItemStack(m);
+        ItemMeta meta = it.getItemMeta();
+        meta.displayName(Component.text(name, colour).decoration(TextDecoration.ITALIC, false));
+        List<Component> l = new ArrayList<>();
+        for (String line : lore) {
+            l.add(Component.text(line, NamedTextColor.GRAY)
+                .decoration(TextDecoration.ITALIC, false));
+        }
+        meta.lore(l);
+        it.setItemMeta(meta);
+        return it;
+    }
+
+    private ItemStack notBuilt(Material m, String name, String whatItWillDo, String blockedBy) {
+        return item(m, name, NamedTextColor.DARK_GRAY, List.of(
+            whatItWillDo,
+            "",
+            "NOT BUILT YET",
+            blockedBy));
+    }
+
+    void openMain(Player p) {
+        Inventory inv = Bukkit.createInventory(new MenuHolder("main"), 45,
+            Component.text("Laugh Tale", NamedTextColor.GOLD));
+
+        inv.setItem(10, item(Material.RED_BED, "Homes", NamedTextColor.GREEN, List.of(
+            "Two free, more with Berries.",
+            "Click to list your homes.")));
+
+        inv.setItem(11, item(Material.GOLD_INGOT, "Berries", NamedTextColor.GOLD, List.of(
+            "Your balance and your full ledger.",
+            "Every movement is recorded permanently.")));
+
+        inv.setItem(12, item(Material.COMPASS, "Random Teleport", NamedTextColor.AQUA, List.of(
+            "Sends you to the RESOURCE world.",
+            "That world is deleted every month.",
+            "Mine there, build at home.")));
+
+        inv.setItem(13, item(Material.ENDER_PEARL, "Teleport to a player", NamedTextColor.AQUA,
+            List.of("Asks them first. They must accept.",
+                "Nobody is ever teleported without consent.")));
+
+        inv.setItem(14, item(Material.DIAMOND_SWORD, "Your rank", NamedTextColor.RED, List.of(
+            "Rank comes from PvP and nothing else.",
+            "Mining and building change it by exactly zero.")));
+
+        inv.setItem(15, item(Material.WRITABLE_BOOK, "Rules", NamedTextColor.YELLOW, List.of(
+            "The rules you accepted, and their version.")));
+
+        // --- honestly unbuilt ---
+        inv.setItem(19, notBuilt(Material.CHEST, "Shop",
+            "Buy and sell at dynamic prices.", "Waiting on: the derived price table"));
+        inv.setItem(20, notBuilt(Material.GOLD_BLOCK, "Auction House",
+            "List items for other players to buy.", "Waiting on: Phase 3"));
+        inv.setItem(21, notBuilt(Material.PAPER, "Orders / Bazaar",
+            "Buy and sell orders, matched atomically.", "Waiting on: Phase 3"));
+        inv.setItem(22, notBuilt(Material.PLAYER_HEAD, "Friends",
+            "Add friends and see who is online.", "Waiting on: the friends commands"));
+        inv.setItem(23, notBuilt(Material.ARMOR_STAND, "Cosmetics",
+            "Unlocked by rank. Never bought with money.", "Waiting on: Phase 7"));
+        inv.setItem(24, notBuilt(Material.OAK_SIGN, "Leaderboards",
+            "Season standings and the Hall of Fame.", "Waiting on: Phase 8"));
+        inv.setItem(25, notBuilt(Material.NOTE_BLOCK, "Settings",
+            "Your personal toggles.", "Waiting on: Section 16"));
+
+        if (p.hasPermission("laughtail.status")) {
+            inv.setItem(40, item(Material.COMMAND_BLOCK, "Staff and Owner tools",
+                NamedTextColor.LIGHT_PURPLE, List.of(
+                    "Access grants, seasons, moderation.",
+                    "Only visible because you hold laughtail.status.")));
+        }
+
+        inv.setItem(44, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+        p.openInventory(inv);
+    }
+
+    private void openAdmin(Player p) {
+        Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
+            Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
+
+        inv.setItem(10, item(Material.NAME_TAG, "Access audit", NamedTextColor.GREEN, List.of(
+            "Row 12: does the whitelist match paid grants?",
+            "Checks both directions.")));
+        inv.setItem(11, item(Material.PAPER, "Live grants", NamedTextColor.GREEN, List.of(
+            "Everyone with paid access right now.")));
+        inv.setItem(12, item(Material.CLOCK, "Season status", NamedTextColor.GOLD, List.of(
+            "Current season, state, and the Champion.")));
+        inv.setItem(13, item(Material.REDSTONE_TORCH, "Server status", NamedTextColor.AQUA,
+            List.of("Plugin version, database, world rules.")));
+        inv.setItem(14, item(Material.DIAMOND, "Rating engine", NamedTextColor.RED, List.of(
+            "Appendix B invariants, run live.")));
+
+        inv.setItem(22, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+        p.openInventory(inv);
+    }
+
+    // ---- clicks --------------------------------------------------------------
+
+    @EventHandler
+    public void onClick(InventoryClickEvent e) {
+        if (!(e.getInventory().getHolder() instanceof MenuHolder holder)) return;
+        // Always cancel: this is a display, not a container. Without this a player could take
+        // the buttons out of the menu and keep them.
+        e.setCancelled(true);
+        if (!(e.getWhoClicked() instanceof Player p)) return;
+        ItemStack clicked = e.getCurrentItem();
+        if (clicked == null || clicked.getType() == Material.AIR) return;
+
+        ItemMeta meta = clicked.getItemMeta();
+        if (meta == null || meta.displayName() == null) return;
+        String name = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
+            .plainText().serialize(meta.displayName());
+
+        if (clicked.getType() == Material.BARRIER) { p.closeInventory(); return; }
+
+        // Unbuilt entries are inert BY MARKER, not by name, so renaming a label cannot
+        // accidentally make a dead button live.
+        if (clicked.getType() == Material.CHEST || clicked.getType() == Material.GOLD_BLOCK
+         || clicked.getType() == Material.PAPER && holder.page.equals("main")
+         || clicked.getType() == Material.PLAYER_HEAD
+         || clicked.getType() == Material.ARMOR_STAND
+         || clicked.getType() == Material.OAK_SIGN
+         || clicked.getType() == Material.NOTE_BLOCK) {
+            if (holder.page.equals("main")) {
+                p.sendMessage(Component.text(name + " is not built yet. "
+                    + "The menu says so rather than pretending.", NamedTextColor.DARK_GRAY));
+                return;
+            }
+        }
+
+        if (holder.page.equals("admin")) {
+            switch (name) {
+                case "Access audit"   -> run(p, "access audit");
+                case "Live grants"    -> run(p, "access list");
+                case "Season status"  -> run(p, "season status");
+                case "Server status"  -> run(p, "laughtail status");
+                case "Rating engine"  -> run(p, "laughtail rating");
+                case "Back"           -> openMain(p);
+                default -> { }
+            }
+            return;
+        }
+
+        switch (name) {
+            case "Homes"               -> run(p, "homes");
+            case "Berries"             -> run(p, "berries");
+            case "Random Teleport"     -> { p.closeInventory(); run(p, "rtp"); }
+            case "Teleport to a player" -> {
+                p.closeInventory();
+                p.sendMessage(Component.text("Use /tpa <player>. They must accept.",
+                    NamedTextColor.GRAY));
+            }
+            case "Your rank"           -> run(p, "laughtail rating");
+            case "Rules"               -> { p.closeInventory(); run(p, "rules"); }
+            case "Staff and Owner tools" -> {
+                if (p.hasPermission("laughtail.status")) openAdmin(p);
+            }
+            default -> { }
+        }
+    }
+
+    private void run(Player p, String command) {
+        // Dispatched as the PLAYER, deliberately - so every permission check, every audit row
+        // and every refusal behaves exactly as it would if they had typed it. A menu that runs
+        // commands as console would be a permission bypass wearing a friendly face.
+        plugin.getServer().dispatchCommand(p, command);
+    }
+}

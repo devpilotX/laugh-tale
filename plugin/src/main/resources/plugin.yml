@@ -39,6 +39,10 @@ commands:
   unban:
     description: Overturn a ban.
     usage: /unban <player> [reason]
+  menu:
+    description: The Laugh Tale menu. Everything without typing a command.
+    usage: /menu
+    aliases: [laughtale, lt]
   tpa:
     description: Ask to teleport to a player. They must accept.
     usage: /tpa <player>
