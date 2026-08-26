@@ -29,7 +29,19 @@ Write-Output '=== Paper ==='
 $builds = Invoke-RestMethod -Headers $hdr -TimeoutSec 30 -Uri ("https://fill.papermc.io/v3/projects/paper/versions/{0}/builds" -f $MC)
 $pb = @($builds | Where-Object { $_.channel -eq 'STABLE' })[0]
 $pj = $pb.downloads.'server:default'
-Add-Row 'paper' 'Server software (4.1)' ("{0}-{1}" -f $MC, $pb.id) $pj.name 'sha256' $pj.checksums.sha256 $pj.url 'fill.papermc.io/v3' ("java minimum {0}" -f $pb.java.version.minimum)
+
+# Spec 4.2: "Use the JDK the current Paper build asks for." That lives on the
+# version object, not the build object.
+$javaMin = 'unknown'
+try {
+  $verObj = Invoke-RestMethod -Headers $hdr -TimeoutSec 30 -Uri ("https://fill.papermc.io/v3/projects/paper/versions/{0}" -f $MC)
+  if ($verObj.version.java.version.minimum) { $javaMin = $verObj.version.java.version.minimum }
+  elseif ($verObj.java.version.minimum)     { $javaMin = $verObj.java.version.minimum }
+  elseif ($verObj.version.java.minimum)     { $javaMin = $verObj.version.java.minimum }
+} catch { }
+Write-Output ("  java minimum stated by PaperMC: " + $javaMin)
+
+Add-Row 'paper' 'Server software (4.1)' ("{0}-{1}" -f $MC, $pb.id) $pj.name 'sha256' $pj.checksums.sha256 $pj.url 'fill.papermc.io/v3' ("java_minimum {0}; jar size {1} bytes; built {2}" -f $javaMin, $pj.size, $pb.time)
 
 # ---- GeyserMC family (own API, states sha256) --------------------------------
 Write-Output '=== GeyserMC ==='
@@ -51,7 +63,6 @@ $mod = @(
   @{ s = 'viabackwards';      role = 'Older Java client support (4.3)';     match = 'ViaBackwards' }
   @{ s = 'luckperms';         role = 'Permissions ladder (Section 17)';     match = 'Bukkit' }
   @{ s = 'chunky';            role = 'World pregeneration (Phase 2)';       match = 'Chunky' }
-  @{ s = 'spark';             role = 'MSPT profiling (Law 5, 6.7)';         match = 'bukkit' }
   @{ s = 'grimac';            role = 'Simulation anti-cheat (14.1)';        match = 'grimac|Grim' }
   @{ s = 'simple-voice-chat'; role = 'Proximity voice (Section 13)';        match = 'bukkit' }
 )
@@ -74,6 +85,9 @@ foreach ($m in $mod) {
   if (-not $f) { $f = $pick.files[0] }
 
   $note = if ($pick.version_type -ne 'release') { "channel $($pick.version_type) - publisher does not ship a release channel" } else { '' }
+  if ($m.s -eq 'chunky' -and $pick.version_number -ne '1.5.3') {
+    $note = ("newest Chunky release is 1.5.3 but it does NOT state {0} support; {1} does. Spec 4.2 requires stated support for the exact version." -f $MC, $pick.version_number)
+  }
   Add-Row $m.s $m.role $pick.version_number $f.filename 'sha512' $f.hashes.sha512 $f.url 'api.modrinth.com/v2' $note
 }
 
@@ -94,6 +108,15 @@ $out.Add('# before it is considered accepted. See docs/progress.md deviation D5.
 $out.Add('')
 $out.Add(('minecraft_version: "{0}"' -f $MC))
 $out.Add('architecture_required: "aarch64"')
+$out.Add('')
+$out.Add('# Bundled with the server - deliberately NOT a separate jar.')
+$out.Add('bundled:')
+$out.Add('  - name: "spark"')
+$out.Add('    role: "MSPT and CPU profiling (Law 5, 6.7, rows 19 20 25 60)"')
+$out.Add('    why_not_pinned: "PaperMC docs: Starting with 1.21, Paper bundles the spark profiler."')
+$out.Add('    access: "/spark via the server console; no plugin jar to install"')
+$out.Add('    note: "The running stock server has a leftover plugins/spark config directory but NO spark jar."')
+$out.Add('')
 $out.Add('components:')
 foreach ($r in $rows) {
   $out.Add(('  - name: "{0}"'        -f $r.name))
