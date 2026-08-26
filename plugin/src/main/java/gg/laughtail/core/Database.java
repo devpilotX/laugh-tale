@@ -304,7 +304,6 @@ public final class Database {
     }
 
     // ---- access grants (D-0032: manual, no payment integration) --------------
-
     /**
      * Records a paid access grant. Returns the id, or -1 if the reference is already used.
      *
@@ -599,8 +598,86 @@ public final class Database {
         }
     }
 
-    /** Test helper: gives a player a rating so the season lifecycle can be exercised. */
-    void setRatingForTest(UUID uuid, int season, int rp) throws SQLException {
+    /**
+     * Applies a kill's rating change to both players in ONE transaction, and returns the
+     * before/after values so the combat_events row can record what actually happened.
+     *
+     * Appendix D: "Every write that spans two tables runs in a transaction." This spans two
+     * ROWS of one table, which matters just as much - a crash between the killer's gain and
+     * the victim's loss would create rating out of nothing, and the ledger would never balance.
+     *
+     * Returns int[]{killerBefore, killerAfter, victimBefore, victimAfter, gain}.
+     *
+     * Rows are created at STARTING_CR on first sight rather than requiring a separate
+     * registration step, because a player's first kill is exactly when their rating first
+     * matters and a missing row would silently skip it.
+     */
+    int[] applyKillRating(UUID killer, UUID victim, int season, int priorKillsInWindow,
+                          boolean suppressed) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                int kBefore = ensureRating(c, killer, season);
+                int vBefore = ensureRating(c, victim, season);
+
+                int gain = Rating.gain(kBefore, vBefore, priorKillsInWindow, suppressed);
+                int kAfter = Rating.killerAfter(kBefore, gain);
+                int vAfter = Rating.victimAfter(vBefore, gain);
+
+                if (gain != 0) {
+                    updateRating(c, killer, season, kAfter, true);
+                    updateRating(c, victim, season, vAfter, false);
+                }
+                c.commit();
+                return new int[] { kBefore, kAfter, vBefore, vAfter, gain };
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private int ensureRating(Connection c, UUID uuid, int season) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO combat_ratings (uuid, season_number, current_rp, peak_rp, "
+              + "games_counted, created_at, updated_at) VALUES (?, ?, ?, ?, 0, "
+              + "UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) "
+              + "ON DUPLICATE KEY UPDATE updated_at = updated_at")) {
+            ps.setString(1, uuid.toString());
+            ps.setInt(2, season);
+            ps.setInt(3, Rating.STARTING_CR);
+            ps.setInt(4, Rating.STARTING_CR);
+            ps.executeUpdate();
+        }
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT current_rp FROM combat_ratings WHERE uuid = ? AND season_number = ?")) {
+            ps.setString(1, uuid.toString());
+            ps.setInt(2, season);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : Rating.STARTING_CR;
+            }
+        }
+    }
+
+    private void updateRating(Connection c, UUID uuid, int season, int rp, boolean counted)
+            throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE combat_ratings SET current_rp = ?, "
+              + "peak_rp = GREATEST(peak_rp, ?), "
+              + "games_counted = games_counted + ?, "
+              + "last_change_at = UTC_TIMESTAMP(3), updated_at = UTC_TIMESTAMP(3) "
+              + "WHERE uuid = ? AND season_number = ?")) {
+            ps.setInt(1, rp);
+            ps.setInt(2, rp);
+            ps.setInt(3, counted ? 1 : 0);
+            ps.setString(4, uuid.toString());
+            ps.setInt(5, season);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Test helper: gives a player a rating so the season lifecycle can be exercised. */    void setRatingForTest(UUID uuid, int season, int rp) throws SQLException {
         assertOffMainThread();
         try (Connection c = open();
              PreparedStatement ps = c.prepareStatement(

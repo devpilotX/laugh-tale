@@ -362,7 +362,34 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
                 });
                 return true;
             }
-            if (args[0].equalsIgnoreCase("reload")) {
+            if (args[0].equalsIgnoreCase("rating")) {
+                if (!sender.hasPermission("laughtail.status")) {
+                    sender.sendMessage(Component.text("No permission.", NamedTextColor.RED));
+                    return true;
+                }
+                // Appendix B asks for five invariants to be asserted in tests. Running them
+                // through a command rather than a test harness is deliberate: it means the
+                // maths can be re-verified on the live server after any config change to the
+                // tier thresholds, which 9.3 says will be re-set from measurement after the
+                // first season.
+                java.util.List<String> fails = Rating.selfTest();
+                sender.sendMessage(Component.text("Rating engine - Appendix B with D-0031 rulings",
+                    NamedTextColor.GOLD));
+                for (String l : Rating.examples()) {
+                    sender.sendMessage(Component.text("  " + l, NamedTextColor.GRAY));
+                }
+                if (fails.isEmpty()) {
+                    sender.sendMessage(Component.text(
+                        "  INVARIANTS: all pass (5 from Appendix B, plus P11, P12, P13, repeat curve)",
+                        NamedTextColor.GREEN));
+                } else {
+                    sender.sendMessage(Component.text("  INVARIANTS FAILED:", NamedTextColor.RED));
+                    for (String l : fails) {
+                        sender.sendMessage(Component.text("    " + l, NamedTextColor.RED));
+                    }
+                }
+                return true;
+            }            if (args[0].equalsIgnoreCase("reload")) {
                 if (!sender.hasPermission("laughtail.reload")) {
                     sender.sendMessage(Component.text("No permission.", NamedTextColor.RED));
                     return true;

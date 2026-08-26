@@ -55,12 +55,19 @@ final class CombatTracker implements Listener {
     private final Map<String, Deque<Long>> recentKills = new ConcurrentHashMap<>();
     /** Current killstreak per player. Reset on death. */
     private final Map<UUID, Integer> streaks = new ConcurrentHashMap<>();
+    /** Prior kills on this victim inside the window, set by suppressionReason. */
+    private volatile int lastPriorCount = 0;
 
     // Read from the private config. Defaults here are deliberately NOT the operating
     // values - they are conservative placeholders so the plugin runs if the private file
     // is missing, and the log says loudly when that happens.
-    private long repeatWindowMillis = 3_600_000L;
-    private int repeatBeforeZero = 3;
+    // Appendix B specifies BOTH of these, so they are constants rather than config:
+    // a six-hour window and the curve 1.00 / 0.50 / 0.25 / 0.10 / 0.00. An earlier version
+    // read them from private.yml on the grounds that never-break rule 10 protects detector
+    // thresholds - but rule 10 protects thresholds that are NOT published, and these are
+    // printed in the specification. Inventing different values there also silently
+    // contradicted Appendix B, which is worse than publishing it.
+    private static final long REPEAT_WINDOW_MILLIS = Rating.REPEAT_WINDOW_MS;
     private String ipSalt = "";
     private boolean privateConfigLoaded = false;
 
@@ -70,16 +77,15 @@ final class CombatTracker implements Listener {
         this.stats = stats;
     }
 
-    void configure(long repeatWindowMillis, int repeatBeforeZero, String ipSalt, boolean loaded) {
-        this.repeatWindowMillis = repeatWindowMillis;
-        this.repeatBeforeZero = repeatBeforeZero;
+    void configure(long unusedWindow, int unusedLimit, String ipSalt, boolean loaded) {
+        // The window and curve are Appendix B constants now; only the salt is private.
         this.ipSalt = ipSalt;
         this.privateConfigLoaded = loaded;
         if (!loaded) {
             plugin.getLogger().warning(
-                "Anti-farm thresholds are running on PLACEHOLDER defaults because the private "
-              + "config was not found. Detection works but the numbers are not the operating "
-              + "ones. See never-break rule 10 and docs/private/.");
+                "private.yml was not found, so the IP hash salt is empty. Same-IP detection "
+              + "still works, but unsalted hashes of the IPv4 space are reversible by brute "
+              + "force. The repeat-kill curve is unaffected - it is an Appendix B constant.");
         }
     }
 
@@ -115,12 +121,15 @@ final class CombatTracker implements Listener {
         Deque<Long> q = recentKills.computeIfAbsent(key, k -> new ArrayDeque<>());
         long now = System.currentTimeMillis();
         synchronized (q) {
-            while (!q.isEmpty() && now - q.peekLast() > repeatWindowMillis) q.pollLast();
+            while (!q.isEmpty() && now - q.peekLast() > REPEAT_WINDOW_MILLIS) q.pollLast();
             int recent = q.size();
             q.addFirst(now);
             // Bounded so a long session cannot grow this without limit.
             while (q.size() > 64) q.pollLast();
-            if (recent >= repeatBeforeZero) return "repeat_kill";     // row 31
+            lastPriorCount = recent;
+            // Appendix B zeroes the 5th kill onward; earlier repeats are reduced, not
+            // suppressed, so only a zero multiplier counts as suppression here.
+            if (Rating.repeatMultiplier(recent) == 0.0) return "repeat_kill";   // row 31
         }
         return null;
     }
@@ -163,9 +172,34 @@ final class CombatTracker implements Listener {
         final UUID victimId = victim.getUniqueId();
         final boolean sameIpFinal = sameIp;
 
+        final int priorCount = lastPriorCount;
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             try {
-                db.recordCombatEvent(killerId, victimId, counted ? 0 : 0, 0,
+                int rpKiller = 0, rpVictim = 0;
+                // Rating is applied only for a genuine player-versus-player kill. A death with
+                // no killer, or a self-inflicted one, has no rating consequence at all - which
+                // is what makes acceptance row 30 hold: there is no path from a non-combat
+                // death to a rating change.
+                if (killerId != null && !killerId.equals(victimId)) {
+                    int season = db.activeSeason();
+                    if (season > 0) {
+                        int[] r = db.applyKillRating(killerId, victimId, season,
+                            priorCount, !counted);
+                        rpKiller = r[1] - r[0];
+                        rpVictim = r[3] - r[2];
+                        if (r[4] != 0) {
+                            plugin.getLogger().info("rating: killer " + r[0] + "->" + r[1]
+                                + " victim " + r[2] + "->" + r[3] + " gain " + r[4]
+                                + " repeat#" + priorCount);
+                        }
+                    } else {
+                        // No active season means no ladder to move. Recorded rather than
+                        // silently dropped, because a kill during a gap between seasons is a
+                        // real event that a player may ask about.
+                        plugin.getLogger().fine("kill outside any active season - no rating applied");
+                    }
+                }
+                db.recordCombatEvent(killerId, victimId, rpKiller, rpVictim,
                     reason, sameIpFinal,
                     loc.getWorld() != null ? loc.getWorld().getName() : null,
                     loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
