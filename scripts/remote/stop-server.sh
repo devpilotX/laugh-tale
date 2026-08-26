@@ -3,8 +3,19 @@ D="/var/lib/pelican/volumes/$V"
 L="$D/logs/latest.log"
 
 echo "=== who is online (joined minus left in the current log) ==="
-JOINED=$(sudo -n grep -c 'joined the game' "$L" 2>/dev/null || echo 0)
-LEFT=$(sudo -n grep -c 'left the game' "$L" 2>/dev/null || echo 0)
+# CAREFUL: `grep -c` prints "0" AND exits 1 when there are no matches. So the
+# obvious `$(grep -c ... || echo 0)` captures BOTH grep's "0" and echo's "0",
+# giving "0\n0", which makes the arithmetic below fail with a bash error and
+# leaves the online count garbage - in a guard whose entire job is to avoid
+# kicking players. Take the first line and keep only digits.
+count_lines() {
+  local n
+  n=$(sudo -n grep -c "$1" "$2" 2>/dev/null | head -1 | tr -dc '0-9')
+  [ -z "$n" ] && n=0
+  printf '%s' "$n"
+}
+JOINED=$(count_lines 'joined the game' "$L")
+LEFT=$(count_lines 'left the game' "$L")
 echo "joined events: $JOINED   left events: $LEFT"
 ONLINE=$((JOINED - LEFT))
 echo "estimated online: $ONLINE"

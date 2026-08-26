@@ -17,7 +17,34 @@ $patterns = '\.pem$','\.key$','\.env$','\.sql$','\.jar$','\.log$','^docs/private
             'host\.env\.ps1$','\.dump$',
             '(^|/)(credentials|secrets|token|password)[^/]*\.(txt|json|ya?ml|cfg|ini|conf)$'
 $bad = @()
+
+# The D-0001 carve-out, applied here as well as in .gitignore.
+#
+# The specification's own .gitignore list excludes '*.sql' while the SAME
+# subsection mandates that db/migrations/ be version controlled from the first
+# commit (Appendix D: "Use schema migrations from the first commit"). Both cannot
+# hold literally. Decision D-0001 resolved it in .gitignore; this script encoded
+# the pattern list without the exception, so it started failing the moment the
+# schema was actually written - and it failed the deploy, correctly, rather than
+# quietly passing.
+#
+# The exemption is deliberately narrow: ONLY .sql directly under db/migrations/.
+# A .sql file anywhere else is still a failure, because a stray dump or an export
+# containing player data is exactly what this check exists to catch.
+$exempt = @(
+  @{ rx = '^db/migrations/[^/]+\.sql$'; why = 'schema migration, mandated by Appendix D - decision D-0001' }
+)
+
 foreach ($t in $tracked) {
+  $isExempt = $false
+  foreach ($e in $exempt) {
+    if ($t -match $e.rx) {
+      $isExempt = $true
+      Write-Output ("  exempt: {0}  ({1})" -f $t, $e.why)
+      break
+    }
+  }
+  if ($isExempt) { continue }
   foreach ($p in $patterns) { if ($t -match $p) { $bad += ("{0}  (matched {1})" -f $t, $p) } }
 }
 Write-Output ''
