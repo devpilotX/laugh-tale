@@ -1,5 +1,83 @@
 # LaughTail progress
 
+## Session 4 handoff - 2026-08-27, written before the owner shut down
+
+**The server is running and healthy.** It stays up on the VPS independently of the owner's PC.
+
+### State at handoff
+
+| Thing | State |
+| --- | --- |
+| Commits | 82, all committed, working tree clean |
+| Server | Paper 26.2-119, clean boot, 0 ERROR lines |
+| Season | **Season 1**, active, ends 2026-09-25 |
+| Chronicle | Chapter 1 "The Rumour" active, 4 chapters locked behind it |
+| Shop | 777 items, 50% spread, arbitrage audit PASS |
+| Tests | 8 suites, 0 failures |
+| Acceptance | 81 rows: 9 pass, 8 partial, 7 built-not-tested, 57 not started |
+| Backups | Recent and successful, restore drill PASSED with 0 failures |
+
+### Built this session
+
+* Roleplay: six Paths to level 50, four Houses, a five-chapter Chronicle, in-character chat, and a
+  GUI page. Law 1 enforced **structurally** - no column anywhere in the roleplay schema can hold a
+  combat or economic bonus, verified by test.
+* Automatic season rollover with warnings, refusing rather than inventing a Champion.
+* Every public command reachable from `/menu` - 14 had no GUI route, now zero.
+* Two Word documents, both generated: the command book and the server handbook.
+* `docs/MIGRATION.md` - the runbook for moving to a bigger VPS.
+* Shop rewritten: 40 items to 777, spread 12% to 50%, band +/-40% to +/-20%, plus an automatic price
+  repair pass that lowers any price a recipe could profit from.
+* Sidebar rebuilt twice for size and legibility.
+
+### Bugs found and fixed this session, worth remembering
+
+Several were only found because something checked mechanically rather than by reading:
+
+1. **The restore drill had silently stopped working** - three separate faults, each stopping it early
+   without a clear failure. It is the only evidence the backups restore. A test that no longer tests
+   anything looks identical to one that passes.
+2. **Chronicle seeding raced the season scheduler.** The story silently did not exist after a reset -
+   and it would have failed **every month** at rollover, with no symptom except a story that stopped.
+3. **`lt` was an alias for both `/laughtail` and `/menu`.** Bukkit resolves that arbitrarily.
+4. **220 money printers** when the catalogue was expanded. The audit caught them and closed the shop.
+5. **The audit and the price repair disagreed** because the audit still used the old +/-40% band after
+   V7 narrowed it - so the shop stayed closed for a reason that was not real. The band is now one
+   constant used by both.
+6. **Storage blocks priced by rarity** made a diamond worth 43 instead of 90, because nine diamonds
+   were worth more than a diamond block. Blocks are now priced as nine of their contents.
+7. **Row 25's thread guard caught my own bug** - the repair pass wrote prices from the main thread.
+
+### What to do next, in order
+
+1. **Push to a git remote (OA-02).** 82 commits exist on one PC. This is the cheapest serious risk to
+   close and it blocks nothing else.
+2. **Land claims (rows 45, 46).** Nothing currently stops a player breaking another's build. This is
+   the largest gap that will actually cost players on day one.
+3. **Auction house.** Schema exists in V5; commands and GUI do not. Needed for enchanted and named
+   items, which the bazaar deliberately cannot handle.
+4. **Chat filter and flood control (row 48).**
+5. **Absorb Multiverse** into the core plugin - it is pinned to a **pre-release**, which is the second
+   largest version risk after anti-cheat. Reasoning in `docs/plugin-consolidation.md`.
+6. **Settings page**, using the existing `preferences` table.
+
+### Blocked on the owner, not on work
+
+* **OA-32 anti-cheat.** Tested twice on 26.2, failed twice. Wait, launch without it, or return to
+  1.21.x. Every option costs something. **This is the largest thing between here and paying players.**
+* **OA-06 UDP ports.** Bedrock and voice chat are listening but unreachable - only 25565 is published.
+* **Q-41 memory.** No honest player cap without a load test; no load test plan without a budget answer.
+* **OA-31 roleplay direction.** The Second Ladder is built and working; anything beyond it needs the
+  owner to describe an evening of roleplay rather than a feature list.
+* **Four acceptance rows need a second player**: 33 (combat logging), 40 (tier refusal in game), 29
+  (adversarial bazaar), 30 (two hours of mining changing rank by zero).
+
+### If you resume and something looks wrong
+
+Trust reality over these notes. The three boot self-tests are the fastest check - the log should show
+the row 25 guard refusing, the order book conserving value, and the arbitrage audit passing with 0
+cycles. If the shop refuses to trade, the audit failed and the reason is in the log.
+
 ## Session 3 - the shop, the HUD, and the GUI
 
 Done and verified this session:

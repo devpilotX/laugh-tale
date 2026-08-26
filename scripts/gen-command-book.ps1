@@ -180,9 +180,9 @@ Add-Table @(
     @('/sell hand','Sell everything of the type you are holding'),
     @('/sell all','Sell every sellable item in your inventory')
 ) @(2600,6400)
-Add-Note 'Prices move with trade, inside a band of plus or minus 40% of a base price. Buying pushes a price up, selling pushes it down, and prices drift back toward normal at 5% an hour.'
+Add-Note 'Prices move with trade, inside a band of plus or minus 20% of a base price. Buying pushes a price up, selling pushes it down, and prices drift back toward normal at 5% an hour.'
 Add-Note 'You can sell at most 3600 Berries worth per category per day. That limit is what stops one player flooding the market and crashing a price for everyone.'
-Add-Note 'Buying something and selling it straight back always loses 12%. That is deliberate and it is checked automatically: every recipe on the server is audited on every restart for any way to turn Berries into more Berries, and if one is found the shop closes itself.'
+Add-Note 'The shop sells at the listed price and buys back at HALF of it, so something listed at 200 pays 100 when you sell one. Buying and selling straight back therefore loses half its value. That is deliberate and it is checked automatically: every recipe on the server is audited on every restart for any way to turn Berries into more Berries, and if one is found the shop closes itself.'
 
 Add-Heading 'The bazaar - trading with other players' 2
 Add-Table @(
