@@ -708,3 +708,44 @@ What I am doing meanwhile: the parts of Phase 4 that do not need the ranking mat
      the season lifecycle, the reset job and its idempotency, the archive, and the
      Champion mechanism. All of it is testable without a single rating point.
 ```
+
+## OA-31 - roleplay needs one paragraph from the owner before anything can be built
+
+**What is blocked.** The roleplay system. Asked for twice, recorded as D-0033, still undesigned.
+
+**Why I have not guessed.** "Roleplay" describes at least five different products and they contradict
+each other: custom professions and skills; in-character chat with radius and radio; player-run towns
+with law and taxes; quest and story content with NPCs; or hard-RP where breaking character is
+punishable.
+
+Two of those five directly contradict this server's founding rules. **Professions that grant advantage
+break Law 1's total equality.** **Player-run towns with taxes create a second economy** alongside the
+Berry ledger that the arbitrage audit depends on - and a second economy is the same class of mistake as
+the shard shop that was refused in D-0035.
+
+Building the wrong one is worse than building nothing, because roleplay touches identity, chat,
+progression and land - the four things hardest to change afterwards.
+
+**What I need.** One paragraph describing what a player DOES during an evening of roleplay on this
+server. Not a feature list - a description of an evening. That answer decides the schema, and the
+schema decides everything after it.
+
+**What I will do meanwhile.** Continue with the auction house, claims, chat protection and the tested
+gaps. None of them depend on this answer.
+
+## OA-32 - anti-cheat is the launch blocker and needs a decision, not more engineering
+
+**Status.** Row 50 requires flight and reach cheats to be caught and logged. GrimAC was installed and
+tested twice on Minecraft 26.2 and failed both times with `NMS_ITEM_STACK_CLASS is null`. The version
+is too new for any anti-cheat to support yet.
+
+**The three options, with their real costs.**
+
+1. **Wait for support.** Launch is delayed by however long that takes, which nobody can predict.
+2. **Launch without it.** Cheaters on a server whose entire value is a fair PvP ladder. This is the
+   worst option for this specific product, and I would argue against it.
+3. **Return to Minecraft 1.21.x**, where anti-cheat works. This is what made the owner's own movement
+   unplayable and caused the move to 26.2 in the first place (D-0028). It would need the setback
+   problem re-diagnosed rather than assumed solved.
+
+**I cannot decide this** - every option trades away something the owner cares about.
