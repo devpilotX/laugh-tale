@@ -70,17 +70,22 @@ $logFile = Join-Path $logDir 'remote-commands.log'
 $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
 
 # ---- run ---------------------------------------------------------------------
-$payloadUnix = ($payload -replace "`r`n", "`n")
-$tmp = Join-Path $env:TEMP ('lt-remote-' + [guid]::NewGuid().ToString('N') + '.sh')
-[System.IO.File]::WriteAllText($tmp, "set -o pipefail`n" + $payloadUnix)
+# Normalise every line-ending form to LF, then transport as base64.
+#
+# Why base64: piping a string to a native command makes PowerShell re-encode it
+# and append a platform newline, which arrives at bash as $'\r' and fails with a
+# message that points at the wrong line. Base64 removes line endings from the
+# transport problem entirely - bash decodes exactly the bytes we encoded.
+$payloadUnix = (($payload -split "\r\n|\r|\n") -join "`n") + "`n"
+$script = "set -o pipefail`n" + $payloadUnix
+$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
 
-try {
-  Get-Content -LiteralPath $tmp -Raw |
-    & ssh -i $LT_SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 $LT_SSH_DEST 'bash -s' 2>&1
-  $code = $LASTEXITCODE
-} finally {
-  Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-}
+if ($b64.Length -gt 100000) { throw "Payload too large for base64 transport ($($b64.Length) chars). Split the script." }
+
+$remoteCmd = "echo $b64 | base64 -d | bash -s"
+
+& ssh -i $LT_SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 $LT_SSH_DEST $remoteCmd 2>&1
+$code = $LASTEXITCODE
 
 Add-Content -LiteralPath $logFile -Value ("{0}`tlevel={1}`texit={2}`treason={3}`t{4}" -f $stamp, $level, $code, $Reason, $label)
 Write-Output ("`nremote exit code: {0}   (logged to logs/remote-commands.log)" -f $code)
