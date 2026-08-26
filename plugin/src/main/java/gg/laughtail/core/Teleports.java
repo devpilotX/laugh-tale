@@ -164,8 +164,9 @@ final class Teleports {
             return true;
         }
         final World target = resource;
-        p.sendMessage(Component.text("Finding a safe spot in the resource world...",
-            NamedTextColor.GRAY));
+        p.sendMessage(Component.text(
+            "Searching the resource world for safe ground. This can take a few seconds - the "
+          + "server may have to generate that part of the map first.", NamedTextColor.GRAY));
 
         attemptRtp(p, target, 0);
         return true;
@@ -208,7 +209,8 @@ final class Teleports {
                 return;
             }
             final Location startedAt = p.getLocation();
-            p.sendMessage(Component.text("Found one. Teleporting in "
+            p.sendMessage(Component.text("Found safe ground after "
+                + (attempt + 1) + (attempt == 0 ? " try" : " tries") + ". Teleporting in "
                 + (WARMUP_MILLIS / 1000) + "s - do not move.", NamedTextColor.GRAY));
             plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
                 if (!p.isOnline()) return;

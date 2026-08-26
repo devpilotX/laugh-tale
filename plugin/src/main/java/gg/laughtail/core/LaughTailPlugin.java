@@ -43,6 +43,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Economy economy;
     private Homes homes;
     private Teleports teleports;
+    private ResourceWorldGuard resourceGuard;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -80,6 +81,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.economy = new Economy(this, database);
         this.homes = new Homes(this, database);
         this.teleports = new Teleports(this);
+        this.resourceGuard = new ResourceWorldGuard(this);
+        getServer().getPluginManager().registerEvents(resourceGuard, this);
+        resourceGuard.start();
         getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
