@@ -44,12 +44,30 @@ echo "last start command: $CMD"
 echo "=== eula ==="
 sudo -n cat "$D/eula.txt" 2>/dev/null | grep -v '^#' || echo "(no eula.txt)"
 
-echo "=== truncate the log so this boot is unambiguous ==="
-# Keeping the old log would make grep counts below meaningless.
+echo "=== archive the log so this boot is unambiguous ==="
+# The previous version copied to a single pre-laughtail-boot.log and truncated,
+# which OVERWROTE that copy on every restart. It destroyed the record of the owner's
+# first real join - the log showed nothing, while playerdata proved it had happened.
+# Evidence that only survives until the next deploy is not evidence. Archive with a
+# timestamp instead, and keep the last ten.
 if sudo -n test -f "$L"; then
-  sudo -n cp -p "$L" "$D/logs/pre-laughtail-boot.log"
+  ARCH="$D/logs/archived-$(date -u +%Y%m%dT%H%M%SZ).log"
+  sudo -n cp -p "$L" "$ARCH"
   sudo -n truncate -s 0 "$L"
-  echo "previous log copied to logs/pre-laughtail-boot.log and truncated"
+  echo "previous log archived to $(basename "$ARCH") and truncated"
+  # Keep ten. NOTE: never glob inside the volume - "$D/logs"/archived-*.log is
+  # expanded by the calling shell, which runs as ubuntu and cannot traverse the
+  # volume, so it stays literal, ls fails, and under pipefail the whole start aborts
+  # with a status that says nothing about logs. Fifth instance of this class in this
+  # project: list under sudo, then filter.
+  COUNT=$( { sudo -n ls -1 "$D/logs" || true; } | grep -c '^archived-.*\.log$' || true)
+  [ -z "$COUNT" ] && COUNT=0
+  if [ "$COUNT" -gt 10 ]; then
+    { sudo -n ls -1t "$D/logs" || true; } | grep '^archived-.*\.log$' | tail -n +11 | while read -r old; do
+      sudo -n rm -f "$D/logs/$old"
+      echo "  pruned $old"
+    done
+  fi
 fi
 
 echo "=== starting via the Panel so Wings records it as intentional ==="

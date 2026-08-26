@@ -80,12 +80,31 @@ $payloadUnix = (($payload -split "\r\n|\r|\n") -join "`n") + "`n"
 $script = "set -o pipefail`n" + $payloadUnix
 $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($script))
 
-if ($b64.Length -gt 100000) { throw "Payload too large for base64 transport ($($b64.Length) chars). Split the script." }
-
-$remoteCmd = "echo $b64 | base64 -d | bash -s"
-
-& ssh -i $LT_SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 $LT_SSH_DEST $remoteCmd 2>&1
-$code = $LASTEXITCODE
+# The base64 is streamed over ssh's STDIN, not embedded in the command line.
+#
+# It used to be embedded, and that imposed a hidden ceiling: Windows limits a command
+# line to about 32,000 characters, so any script whose base64 exceeded roughly 24 KB
+# failed with "The filename or extension is too long" - a message that says nothing
+# about size. The plugin build script (49 KB of base64, carrying six source files)
+# was the first thing large enough to hit it.
+#
+# Streaming has no such limit. ASCII output encoding is forced because base64 is
+# ASCII and PowerShell would otherwise hand the native process UTF-16.
+$prevEncoding = [Console]::OutputEncoding
+$prevOutVar = $OutputEncoding
+try {
+  $OutputEncoding = [Text.Encoding]::ASCII
+  [Console]::OutputEncoding = [Text.Encoding]::ASCII
+  # `tr -d '\r'` before decoding: PowerShell terminates the piped string with CRLF,
+  # and GNU base64 rejects the carriage return with the unhelpful "invalid input".
+  # Ironic, since base64 was chosen in the first place to keep line endings out of
+  # the transport - it just moved the problem from the payload to the envelope.
+  $b64 | & ssh -i $LT_SSH_KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 $LT_SSH_DEST "tr -d '\r' | base64 -d | bash -s" 2>&1
+  $code = $LASTEXITCODE
+} finally {
+  $OutputEncoding = $prevOutVar
+  [Console]::OutputEncoding = $prevEncoding
+}
 
 Add-Content -LiteralPath $logFile -Value ("{0}`tlevel={1}`texit={2}`treason={3}`t{4}" -f $stamp, $level, $code, $Reason, $label)
 Write-Output ("`nremote exit code: {0}   (logged to logs/remote-commands.log)" -f $code)

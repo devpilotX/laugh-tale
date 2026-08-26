@@ -465,3 +465,47 @@ Rule 4 requires **25% or 768 MB**. It was failing both tests, and the reassuring
 **Verified:** applier set 5 keys and reported the 6th already correct; server booted clean in 57 s with all eight plugins and zero ERROR; `check-paper-drift.sh` reports `drift=0` **after** the boot, so Paper preserved the values rather than rewriting them.
 
 **A spark limitation, recorded so it is not rediscovered.** With `spark.enabled` true, `spark health` now replies "Generating server health report..." where it previously said "The spark profiler is currently disabled" - so the command is registered and running. But the report itself is delivered asynchronously to the command sender, and an RCON sender is transient, so the report never arrives over RCON. Two client strategies were tried - draining all packets, then holding the connection open for 20 s - and neither retrieves it. This is a spark/RCON interaction, not a configuration fault. **The working channel for spark reports is the Panel console**, which the owner has. `/tps` and `/mspt` remain the scriptable path and are what the D2 baseline uses.
+
+
+---
+
+## D-0026 | 2026-08-26 | I printed a database password into a transcript, and what changed as a result
+
+**What happened.** `plugin/src/main/resources/config.yml` carried the placeholder token in its *header comment* - the comment explained "the placeholder below is the literal string `__PRESERVE__`". The deploy script replaced **every** occurrence of that token in the file, so the real database password was substituted into the comment as well as into the `password:` key. The output was then displayed through a `sed` that redacted only lines matching `^\s*password:`. The copy in the comment sailed straight past it and was printed in full.
+
+**This is the second secret exposure in this project** (D-0019 was the first, a whole-file `cat`). Two different causes, one shared shape: **a redaction filter that has to be right about every line will eventually be wrong about one.**
+
+**What I did about it, immediately:**
+
+1. **Rotated the credential.** `scripts/remote/rotate-db-app-password.sh` generated a new 32-character value on the host, applied it with `ALTER USER`, verified the **new** password authenticates, and verified the **old** password is now **rejected** - a rotation that leaves the old credential working is not a rotation. The exposed value is dead. Nothing external depended on it: the `laughtail` user is reachable only from the `pelican_nw` Docker network and is used only by this plugin.
+2. **Anchored the substitution.** It now replaces the password only where it appears as the value of the `password:` key, exactly once, and **aborts** if the count is not exactly one afterwards. A token mentioned in prose is now inert.
+3. **Stopped printing the file at all.** The deploy verifies by *property* - line count, host, schema, user, rules version, password *length* - and never displays content. This is the substantive change: verifying properties is safer than displaying content and trusting a filter.
+4. **Removed the token from the comment**, because the cheapest defence is not to repeat it in prose.
+
+**The general rule I should have been following, now written down:** never print a file that contains a secret, redacted or otherwise. Print facts *about* it. A redaction is a denylist, and denylists fail quietly in the one case nobody thought of.
+
+**Residual risk, stated plainly:** the old password appeared in one agent transcript and is now invalid everywhere. It was never committed to git. The root password was not exposed. No player data, payment data or panel credential was involved.
+
+---
+
+## D-0027 | 2026-08-26 | The LaughTail core plugin exists, built on the host in a container
+
+**Built from source in this repository** rather than downloaded - never-break rule 9 is about pinning third-party jars; this one we own. `plugin/` holds a six-file Maven project producing `LaughTail-0.1.0.jar`, 764 KB.
+
+**Compiled inside a throwaway `maven:3.9.9-eclipse-temurin-21` container on the VPS.** Same reasoning as D-0023 for MariaDB: never-break rule 13 and 33.2 item 4 say do not install host packages mid-build without a snapshot, and OA-03 means none exists. Nothing is installed on the host - no JDK, no Maven. The container is capped at 640 MiB because the box has roughly 300 MB spare (B3) and an unbounded Maven JVM could OOM the host and take the game server with it.
+
+**Targets Java 21, not 25.** The server runs Temurin 25, but Paper 1.21.11 targets 21, and compiling to 21 means the jar runs on both. Targeting 25 would tie the plugin to this exact runtime for nothing.
+
+**Scope at 0.1.0 is deliberately small and complete** rather than broad and half-working: player registration keyed on UUID, the rules gate with the accepted version stored, `/laughtail status`, and `/laughtail reload` - which is what never-break rule 7 says to use instead of vanilla `/reload`. Berries, rank, seasons and the watchdog are not here and are not pretended to be.
+
+**Three real problems solved along the way, none of which were visible from the design:**
+
+1. **The game container could not reach the database.** MariaDB publishes 3306 on the *host's* 127.0.0.1 so it is invisible externally (D-0023), but the game server runs in a container on `pelican_nw` - and a container's loopback is its own. Nothing in the config file would have revealed this; the plugin would simply have timed out. Fixed by attaching the database container to `pelican_nw` and addressing it at `172.18.0.3`. It is still published nowhere reachable from outside, so acceptance row 5 is unaffected. The deploy now **proves** reachability with `/dev/tcp` from inside the game container before writing any config.
+2. **`No suitable driver found`** after the driver was relocated. Shading rewrites the driver *classes* but not `META-INF/services/java.sql.Driver`, which still named `org.mariadb.jdbc.Driver` - so `DriverManager` looked up a class that no longer existed and reported what sounds like a network fault but is a packaging one. Fixed twice over: `ServicesResourceTransformer` relocates the service file, **and** the code instantiates the driver directly so correctness does not depend on service discovery at all.
+3. **The transport had a hidden 24 KB ceiling.** `remote.ps1` embedded the base64 payload in the ssh command line, and Windows caps a command line near 32,000 characters. The plugin build script - 49 KB of base64 carrying six source files - was the first thing large enough to hit it, and the error, "The filename or extension is too long", says nothing about size. The payload now streams over stdin, with `tr -d '\r'` on the remote side because PowerShell terminates the stream with CRLF and GNU `base64` rejects the carriage return.
+
+**The design constraint that shaped `Database.java` is acceptance row 25:** no database call on the main thread. Every method asserts it is off the main thread and **throws** if it is not, rather than quietly costing tick time - Law 8, fail loud rather than slow. Every statement is parameterised; a player name is attacker-controlled input.
+
+**One honest limitation:** connections are opened per operation rather than pooled. That is fine for a handful of writes per join and 24 players, and it will need revisiting before Phase 3's order book, which is write-heavy and latency-sensitive. Noted rather than glossed.
+
+**Verified:** loads on aarch64 as the 9th plugin, `Database reachable, migration V1 present.`, zero ERROR lines, and `/laughtail status` reports version, rules version and database state over RCON.

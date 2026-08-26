@@ -1,0 +1,41 @@
+name: LaughTail
+version: '${project.version}'
+main: gg.laughtail.core.LaughTailPlugin
+api-version: '1.21'
+author: LaughTail SMP
+description: The LaughTail core. Access, rules gate, player registry.
+
+# folia-supported is deliberately absent: this plugin is not Folia-safe and saying
+# otherwise would let it load on a server it cannot run correctly on.
+
+commands:
+  laughtail:
+    description: LaughTail administration. Never use vanilla /reload (never-break rule 7).
+    usage: /laughtail <status|reload>
+    aliases: [lt]
+  rules:
+    description: Read the rules, and accept them.
+    usage: /rules [accept]
+
+permissions:
+  # These mirror server/permissions.yml. LuckPerms is the source of truth for who
+  # holds them; this block only declares they exist and their default.
+  #
+  # Every default is 'op' or 'false', never 'true'. A permission that defaults to
+  # true is granted to everyone the moment the plugin loads, which would silently
+  # bypass the Section 17 ladder that was so carefully built.
+  laughtail.player.basic:
+    description: Baseline player access.
+    default: true          # the one deliberate exception: every paying player has it
+  laughtail.rules.accept:
+    description: Accept the rules.
+    default: true          # a new player must be able to accept, or the gate traps them
+  laughtail.reload:
+    description: Reload LaughTail config. 17.2 grants this to Admin; reloading the SERVER is 17.3 and denied.
+    default: op
+  laughtail.status:
+    description: View LaughTail status including database connectivity.
+    default: op
+  laughtail.rules.bypass:
+    description: Bypass the rules gate. Console and Owner only - never staff.
+    default: false

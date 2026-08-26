@@ -166,6 +166,19 @@ Should-Allow  'grep -c reload /var/log/syslog'
 
 
 Write-Output ''
+Write-Output 'GROUP 16  recursive delete must fail closed on a variable target'
+# The DROP rule already refused variable targets; rm -rf allowed them, which failed
+# OPEN - the worse direction. A static guard cannot know what $SRC expands to.
+Should-Refuse 'rm -rf "$SRC/target"'                            'variable target'
+Should-Refuse 'rm -rf ${BUILD}/out'                             'braced variable target'
+Should-Refuse 'rm -rf "$D/plugins"'                             'variable inside the volume path'
+Should-Allow  'rm -rf /home/ubuntu/laughtail-plugin/target'
+Should-Allow  'rm -rf /tmp/lt-scratch'
+Should-Allow  'rm -rf /home/ubuntu/laughtail-scratch/restore-drill'
+Should-Refuse 'rm -rf /home/ubuntu'                             'still refused - not a permitted root'
+Should-Refuse 'rm -rf /var/lib/pelican'                          'parent of the volumes dir'
+
+Write-Output ''
 Write-Output ("PASS {0}   FAIL {1}" -f $pass, $fail)
 if ($fail -eq 0) { Write-Output 'GUARD TESTS PASS (pre-flight 33.6 item 13)'; exit 0 }
 else { Write-Output 'GUARD TESTS FAILED'; exit 1 }

@@ -1,0 +1,44 @@
+# LaughTail core configuration.
+#
+# THE PASSWORD IS NOT IN THIS FILE AND MUST NEVER BE. It is written into the
+# deployed copy on the host by scripts/remote/deploy-plugin-config.sh, which reads
+# it from /home/ubuntu/laughtail-db/secrets/app_password - root-only, never printed,
+# never committed (never-break rule 5, decision D-0014's pattern).
+#
+# NOTE FOR ANYONE EDITING THIS FILE: do not write the placeholder token into a
+# comment. An earlier version of this header quoted it, the deploy script replaced
+# EVERY occurrence, and the real password was substituted into the comment and then
+# printed past a redaction that only masked the "password:" line. See D-0026. The
+# substitution is now anchored to the password key alone, but the cheapest defence
+# is simply not to repeat the token in prose.
+
+database:
+  # 127.0.0.1 because the db container publishes only on loopback (D-0023) and the
+  # game container reaches the host through the docker bridge gateway. The deploy
+  # script resolves the correct address for this host rather than guessing.
+  host: '__DB_HOST__'
+  port: 3306
+  schema: laughtail
+  user: laughtail
+  password: '__PRESERVE__'
+
+rules:
+  # Bump this version whenever the text changes. Every player who accepted an older
+  # version is re-gated automatically - that is the entire reason acceptance row 17
+  # stores a version rather than a boolean.
+  #
+  # '0-draft' is deliberate and honest: the real rules text is owner action OA-13,
+  # which also covers Terms, Privacy and Refund wording. The GATE is built and
+  # tested; the words are not mine to write.
+  version: '0-draft'
+  text:
+    - 'These rules are a DRAFT placeholder (owner action OA-13).'
+    - ''
+    - '1. No cheating. No hacked clients, no exploits, no duplication.'
+    - '2. No griefing outside claimed combat. Rank comes from PvP only.'
+    - '3. One account per person. Alt accounts do not earn rating.'
+    - '4. No real-money trading of anything in game.'
+    - '5. Treat other players decently. Harassment ends access.'
+    - ''
+    - 'The published version of these rules will be identical on the website,'
+    - 'in game and in Discord (acceptance row 18).'

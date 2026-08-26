@@ -16,7 +16,12 @@ Set-StrictMode -Version Latest
 $script:GuardAllowedDeleteRoots = @(
   '/var/lib/pelican/volumes/',   # dev server volume only, narrowed below
   '/tmp/',
-  '/home/ubuntu/laughtail-scratch/'
+  '/home/ubuntu/laughtail-scratch/',
+  # Plugin build directory. Everything in it is either generated output or source
+  # staged from the repository by build-plugin.sh, so it is fully reproducible and
+  # holds nothing that is not already in git. Added when the plugin build needed to
+  # clear stale compiler output; deliberately narrow, not a general /home/ubuntu grant.
+  '/home/ubuntu/laughtail-plugin/'
 )
 
 # The production server must never be touched from a script (never-break rule 1).
@@ -37,7 +42,12 @@ function Get-NormalisedCommand {
   $c = $c -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', ' '   # control chars
   $c = $c -replace '[''"`]', ''                            # quote characters
   $c = $c -replace '\\(?=\S)', ''                          # backslash escapes
-  $c = $c -replace '\$\{[^}]*\}', 'VAR'                    # ${...} expansions
+  # Braced expansions keep their $ sigil rather than becoming the word VAR. The
+  # previous form produced "VAR", which the final ToLowerInvariant() turned into
+  # "var" - indistinguishable from a real /var/lib path, so a check for variable
+  # targets either missed ${BUILD} or falsely flagged /var/lib/pelican. Keeping the
+  # sigil makes "is this a variable" answerable with one character.
+  $c = $c -replace '\$\{[^}]*\}', '$$var'
   $c = $c -replace '\$\(', '('                             # $( ) substitution
   $c = $c -replace '\s+', ' '
   return $c.Trim().ToLowerInvariant()
@@ -94,6 +104,19 @@ function Assert-CommandAllowed {
     if (-not ($recursive -and $force)) { continue }
 
     foreach ($target in $targets) {
+      # Fail closed on a target we cannot resolve. A shell variable is opaque to a
+      # static guard, so `rm -rf "$SOMEDIR/target"` could be anything at runtime.
+      # The DROP DATABASE rule already refuses variable targets for exactly this
+      # reason; allowing them here was an inconsistency that failed OPEN, which is
+      # the worse direction. Name destructive targets literally.
+      # One character decides it: a surviving $ or backtick means the target is a
+      # shell expansion. Get-NormalisedCommand deliberately keeps the sigil on
+      # braced forms so ${BUILD} and $BUILD are both caught, while a literal path
+      # like /var/lib/pelican/volumes/... is not.
+      if ($target -match '[$`]') {
+        throw ("GUARD REFUSED (never-break rule 8): recursive force delete whose target is a variable.`n  command: {0}`n  target : {1}`n  A static guard cannot know what a variable expands to. Write the path literally." -f $Command, $target)
+      }
+
       $ok = $false
       foreach ($root in $script:GuardAllowedDeleteRoots) {
         if ($target.StartsWith($root.ToLowerInvariant())) { $ok = $true; break }

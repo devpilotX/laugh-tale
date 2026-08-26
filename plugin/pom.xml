@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaughTail core plugin.
+
+  This is the plugin Sections 3 to 16 live inside. Everything the server does that
+  is not vanilla Minecraft happens here, so it is built from source in this
+  repository rather than downloaded - never-break rule 9 is about pinning third
+  party jars; this one we own.
+
+  BUILD ENVIRONMENT. Compiled inside a throwaway `maven` container on the VPS, not
+  with host packages. Same reasoning as decision D-0023 for MariaDB: never-break
+  rule 13 and spec 33.2 item 4 say do not install host packages mid-build without a
+  snapshot, and OA-03 means no snapshot exists. A container needs nothing on the
+  host and leaves nothing behind.
+
+  JAVA 21, not 25. The server runs Temurin 25, but Paper 1.21.11 targets Java 21 and
+  compiling to 21 means the jar runs on both. Targeting 25 would tie the plugin to
+  this exact runtime for no benefit.
+
+  THE MARIADB DRIVER IS SHADED IN, deliberately. Paper's plugin.yml `libraries:`
+  mechanism would keep the jar small but downloads from Maven Central on first load,
+  which makes startup depend on the network and makes the installed bytes something
+  other than the bytes that were built. Shading is deterministic. The cost is about
+  half a megabyte.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>gg.laughtail</groupId>
+  <artifactId>laughtail-core</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+  <name>LaughTail</name>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Pinned. Never a floating version - spec 4.2. -->
+    <paper.api.version>1.21.11-R0.1-SNAPSHOT</paper.api.version>
+    <mariadb.driver.version>3.5.2</mariadb.driver.version>
+  </properties>
+
+  <repositories>
+    <repository>
+      <id>papermc</id>
+      <url>https://repo.papermc.io/repository/maven-public/</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.papermc.paper</groupId>
+      <artifactId>paper-api</artifactId>
+      <version>${paper.api.version}</version>
+      <!-- provided: the server supplies it at runtime and it must NOT be shaded. -->
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mariadb.jdbc</groupId>
+      <artifactId>mariadb-java-client</artifactId>
+      <version>${mariadb.driver.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>LaughTail-${project.version}</finalName>
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>true</filtering>
+      </resource>
+    </resources>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.3</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <relocations>
+                <!-- Relocated so this plugin's driver cannot collide with a driver
+                     another plugin shades. Two copies of the same class in one
+                     class loader is a real and confusing failure. -->
+                <relocation>
+                  <pattern>org.mariadb.jdbc</pattern>
+                  <shadedPattern>gg.laughtail.libs.mariadb</shadedPattern>
+                </relocation>
+              </relocations>
+              <transformers>
+                <!--
+                  Without this, relocation breaks JDBC discovery. The driver jar
+                  ships META-INF/services/java.sql.Driver naming
+                  org.mariadb.jdbc.Driver, and relocation moves the CLASS but leaves
+                  that text file pointing at the old name - so DriverManager finds a
+                  service entry for a class that no longer exists and reports
+                  "No suitable driver found", which sounds like a connection problem
+                  and is actually a packaging one.
+                -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>module-info.class</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
