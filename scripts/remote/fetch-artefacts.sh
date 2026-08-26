@@ -149,6 +149,26 @@ else
   fi
 fi
 
+# ---- multiverse-core 5.8.1-pre.3 ----
+EXPECT="09dc1ccc254abb77de431480ec5c65e3eb1d5c1891f925650f0a0397b0cccb8dfd72450b2f6925bbb37e08f8629c6daaa41ac9eba74d2ffa2eb09d6d30f40ef0"
+FILE="multiverse-core-5.8.1-pre.3.jar"
+if [ -f "$FILE" ] && [ "$(sha512sum "$FILE" | cut -d" " -f1)" = "$EXPECT" ]; then
+  echo "  cached+verified multiverse-core  $FILE"
+else
+  echo "  downloading multiverse-core  $FILE"
+  curl -sSL --retry 3 --retry-delay 2 -o "$FILE" "https://cdn.modrinth.com/data/3wmN97b8/versions/6a8asKk9/multiverse-core-5.8.1-pre.3.jar"
+  ACTUAL="$(sha512sum "$FILE" | cut -d" " -f1)"
+  if [ "$ACTUAL" = "$EXPECT" ]; then
+    echo "  OK   multiverse-core  sha512 verified"
+  else
+    echo "  FAIL multiverse-core  sha512 MISMATCH"
+    echo "       expected $EXPECT"
+    echo "       actual   $ACTUAL"
+    rm -f "$FILE"
+    FAIL=$((FAIL+1))
+  fi
+fi
+
 # ---- grimac 2.3.74-961fa54 ----
 EXPECT="bf9be1194eb45afe1dec6bd8e98d078dacf41539025c8aabe24d31337cbea86625774e30842568b47f34ca174472c724c7876cc30793945e7408b03609672655"
 FILE="grimac-bukkit-2.3.74-961fa54.jar"

@@ -126,6 +126,35 @@ components:
     checksum_source: "api.modrinth.com/v2"
     arm64_load_proof: "PASS 2026-08-26 03:14-03:15 UTC - observed Enabling on aarch64, Paper 1.21.11-132 / Temurin 25.0.4, Done (83.5s), zero ERROR or SEVERE. Evidence: scripts/remote/start-server-and-verify.sh"
     notes: "1.5.3 now, because it states 26.2. The earlier 1.4.40 pin existed only because 1.5.3 did not state 1.21.11 - the version move resolves that inversion."
+  - name: "multiverse-core"
+    role: "Multiple worlds (7.1): the resource world and the arena"
+    version: "5.8.1-pre.3"
+    file: "multiverse-core-5.8.1-pre.3.jar"
+    checksum_algo: "sha512"
+    checksum: "09dc1ccc254abb77de431480ec5c65e3eb1d5c1891f925650f0a0397b0cccb8dfd72450b2f6925bbb37e08f8629c6daaa41ac9eba74d2ffa2eb09d6d30f40ef0"
+    url: "https://cdn.modrinth.com/data/3wmN97b8/versions/6a8asKk9/multiverse-core-5.8.1-pre.3.jar"
+    checksum_source: "api.modrinth.com/v2"
+    release_channel: "BETA"
+    arm64_load_proof: "pending"
+    why_this_plugin: >
+      7.1 requires five worlds and Paper creates only three. Something has to create and
+      manage the resource world and the arena, and 7.4 calls the resource world "the
+      highest-value-per-line-of-code feature in this entire document".
+      Multiverse-Core is the boring, well-supported option AGENTS.md's standing bias asks
+      for: 758,491 downloads against 799 for the nearest alternative that even builds for
+      this version. Surveyed my-worlds, hyperverse, phantomworlds and worldmanager - none
+      states 26.2.
+    why_beta_is_accepted_here_but_not_for_grimac: >
+      Deliberate, not inconsistent. The question is what happens when the build is wrong.
+      A world manager that misbehaves fails VISIBLY - the world does not load, or a
+      command errors, and someone sees it immediately. GrimAC's alpha failed INVISIBLY:
+      it loaded, its packet layer was dead, and the server looked protected while it was
+      not. Beta is acceptable where failure announces itself and unacceptable where
+      failure is silent. Also relevant: a "pre" release for a Minecraft version released
+      days ago is normal for a mature plugin, whereas GrimAC's problem was a broken
+      reflection layer rather than an unfinished feature.
+      Pinned to an exact version and checksum either way.
+
   - name: "grimac"
     role: "Simulation anti-cheat (14.1)"
     version: "2.3.74-961fa54"

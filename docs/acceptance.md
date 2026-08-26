@@ -63,7 +63,7 @@ Five rows carry a caveat recorded in `docs/questions.md`: row **14** cannot pass
 | **44** | Teleport guards | Warmup, combat block, cooldown, and back-after-PvP-death block all verified | Test log | 5 | Not started | - |
 | **45** | Claims protect blocks | A non-trusted player cannot break blocks or open containers in a claim | Test log | 2 | Not started | - |
 | **46** | Claims do not protect players | A player can be killed inside their own claim | Test log | 2 | Not started | - |
-| **47** | Fire and flood | Fire and lava do not cross a protected boundary; fireTick is off | Test log | 2 | Not started | - |
+| **47** | Fire and flood | Fire and lava do not cross a protected boundary; fireTick is off | Test log | 2 | **fireTick half PASS 2026-08-26** | Read back live from all **five** worlds via `/laughtail status`: `minecraft:fire_spread_radius_around_player=false` on laughtail, _nether, _the_end, _arena and _resource. Applied by the plugin on `WorldLoadEvent`, so worlds created later inherit it. Note 26.2 **renamed** this rule from `doFireTick`, which is why the console command form failed. The "does not cross a protected boundary" half needs claims, which need numbers the specification never gives - see the Phase 2 gap note |
 | **48** | Chat flood | 200 messages per second results in an auto-mute with no MSPT impact | Log plus spark | 6 | Not started | - |
 | **49** | Packet abuse | A packet-abuse suite does not crash or degrade the server | Test log | 1 | Not started | - |
 | **50** | Anti-cheat | Test flight and test reach cheats are both caught and logged with evidence | Alert log | 1 | Not started | - |

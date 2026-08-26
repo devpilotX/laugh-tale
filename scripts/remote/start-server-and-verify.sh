@@ -127,7 +127,7 @@ echo "=== D5 GATE: every INSTALLED manifest plugin must appear as Enabling ==="
 # a gate that always reports a failure stops being read. Its exclusion is recorded in
 # the manifest, not hidden here.
 MISSING=0
-for P in Geyser-Spigot floodgate ViaVersion ViaBackwards LuckPerms Chunky voicechat LaughTail; do
+for P in Geyser-Spigot floodgate ViaVersion ViaBackwards LuckPerms Chunky voicechat LaughTail Multiverse-Core; do
   LINE=$(sudo -n grep -iE "Enabling .*${P}" "$L" 2>/dev/null | head -1 || true)
   if [ -n "$LINE" ]; then
     echo "  LOADED  $P -> $LINE"

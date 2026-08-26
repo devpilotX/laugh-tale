@@ -54,7 +54,7 @@ echo "=== install the manifest plugins ==="
 # Stating support and having a working packet layer are different things. Tested rather
 # than assumed, twice. Row 50 stays unclaimable. See OA-27 and the manifest entry.
 for f in Geyser-Spigot.jar floodgate-spigot.jar ViaVersion-5.11.0.jar ViaBackwards-5.11.0.jar \
-         LuckPerms-Bukkit-5.5.71.jar Chunky-Bukkit-1.5.3.jar \
+         LuckPerms-Bukkit-5.5.71.jar Chunky-Bukkit-1.5.3.jar multiverse-core-5.8.1-pre.3.jar \
          voicechat-bukkit-2.6.21.jar; do
   sudo -n cp "$S/$f" "$D/plugins/$f"
   sudo -n chown $OWN "$D/plugins/$f"

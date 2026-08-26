@@ -54,6 +54,28 @@ final class WorldRules implements Listener {
         this.plugin = plugin;
     }
 
+    /**
+     * The 7.1 border table, as DIAMETERS - which is what the specification's table
+     * states and what Minecraft's WorldBorder#setSize expects. Reading that table as a
+     * radius would double every world; the overworld would become 12,000 blocks, which
+     * this disk cannot hold and Chunky would spend days pregenerating.
+     *
+     * Keyed on world name. A world not listed here is left alone rather than given a
+     * default: silently imposing a border on an unrecognised world is worse than having
+     * none, because it would be invisible until a player walked into it.
+     */
+    private static final Map<String, Double> BORDERS = new LinkedHashMap<>();
+    static {
+        BORDERS.put("laughtail", 6000.0);            // Overworld. "Never reset."
+        BORDERS.put("laughtail_nether", 2000.0);     // Nether
+        BORDERS.put("laughtail_the_end", 3000.0);    // End, dragon, Season Finale
+        BORDERS.put("laughtail_resource", 3000.0);   // Resets monthly (7.4)
+        BORDERS.put("laughtail_arena", 512.0);       // 7.1 says "small, flat"; 512 is a
+                                                     // deliberate reading of "small" and
+                                                     // is a Phase 7 tuning candidate
+                                                     // once the war format is built.
+    }
+
     /** Applies to every already-loaded world. Called once on enable. */
     void applyToAll() {
         for (World w : plugin.getServer().getWorlds()) {
@@ -85,6 +107,25 @@ final class WorldRules implements Listener {
         } else {
             plugin.getLogger().info("World '" + w.getName()
                 + "': all Section 7.2 gamerules already correct");
+        }
+
+        // Border, from the 7.1 table. Compared before writing so a restart does not
+        // re-announce work it did not do.
+        Double want = BORDERS.get(w.getName());
+        if (want == null) {
+            plugin.getLogger().warning("World '" + w.getName()
+                + "' has no border in the Section 7.1 table - leaving it alone rather than "
+                + "guessing. Add it to WorldRules.BORDERS if it is meant to be bordered.");
+            return;
+        }
+        double have = w.getWorldBorder().getSize();
+        if (Math.abs(have - want) > 0.5) {
+            w.getWorldBorder().setSize(want);
+            plugin.getLogger().info("World '" + w.getName() + "': border "
+                + (long) have + " -> " + want.longValue() + " (7.1)");
+        } else {
+            plugin.getLogger().info("World '" + w.getName() + "': border already "
+                + want.longValue());
         }
     }
 
