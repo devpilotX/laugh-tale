@@ -23,7 +23,8 @@ $files = @(
   'src/main/resources/config.yml',
   'src/main/java/gg/laughtail/core/LaughTailPlugin.java',
   'src/main/java/gg/laughtail/core/Database.java',
-  'src/main/java/gg/laughtail/core/RulesGate.java'
+  'src/main/java/gg/laughtail/core/RulesGate.java',
+  'src/main/java/gg/laughtail/core/WorldRules.java'
 )
 
 foreach ($f in $files) {

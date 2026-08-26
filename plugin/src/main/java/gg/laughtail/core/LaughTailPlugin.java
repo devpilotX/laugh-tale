@@ -35,6 +35,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
 
     private Database database;
     private RulesGate rulesGate;
+    private WorldRules worldRules;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -44,8 +45,16 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         loadSettings();
 
         this.rulesGate = new RulesGate(this);
+        this.worldRules = new WorldRules(this);
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getPluginManager().registerEvents(rulesGate, this);
+        getServer().getPluginManager().registerEvents(worldRules, this);
+
+        // Section 7.2. Applied here rather than over RCON because a console /gamerule
+        // reaches only the default world and `execute in <dim> run gamerule` is rejected
+        // by the 26.2 parser. Also re-applied on WorldLoadEvent, so the resource world
+        // (7.4) and arena (7.1) inherit these rules when they are eventually created.
+        worldRules.applyToAll();
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
         // would block startup on a network timeout, and acceptance row 25 forbids
@@ -196,6 +205,10 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
                 sender.sendMessage(Component.text("LaughTail " + getPluginMeta().getVersion(),
                     NamedTextColor.GOLD));
                 sender.sendMessage(Component.text("  rules version: " + rulesVersion, NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("  worlds and Section 7.2 rules:", NamedTextColor.GRAY));
+                for (String line : worldRules.describe().split("\n")) {
+                    if (!line.isBlank()) sender.sendMessage(Component.text(line, NamedTextColor.DARK_GRAY));
+                }
                 sender.sendMessage(Component.text("  database: "
                     + (database.isHealthy() ? "reachable" : "NOT REACHABLE"),
                     database.isHealthy() ? NamedTextColor.GREEN : NamedTextColor.RED));
