@@ -681,3 +681,57 @@ That is a better posture regardless. It means the permission set is legible from
 * A new **operator sanity** check asserts that the `owner` group resolves **true** for the ten nodes required to run the server at all — status, reload, season, access grant and revoke, ban, history, unban, rules bypass, audit read. It was written before the fix was applied and correctly reported `laughtail.status owner=None FAIL   <-- the Owner cannot use this`, then passed after. A check that has only ever been seen passing has not been tested.
 
 **One honest limitation of the analyser.** It reported the node as `None` (undefined) rather than `false`, because `effective()` treats only `* = true` as a grant and does not model `* = false` as a denial for undefined nodes. Both readings produce the correct verdict — unusable either way, and the sanity check fails on both — but the analyser's *explanation* is less precise than LuckPerms' actual behaviour. Worth knowing before trusting its wording on a future puzzle.
+
+
+---
+
+## D-0035 | 2026-08-26 | The DonutSMP-style feature set: built in-plugin, not assembled from plugins
+
+The owner listed the feature set they want, in the technical terms used by servers that have it: chest-GUI menu, homes, auction house, bazaar/order book, TPA, leaderboards, RTP and an RTP queue, friends, a shard shop, pay, a stats GUI, multi-line nametags, and a Lunar Apollo client button.
+
+### One item conflicts with a design law and needs a ruling
+
+**"Shard Shop → custom currency shop" would be a SECOND currency.** The specification is explicit and repeated: one currency, because dual currencies hyperinflate, and it is listed among the structural failures LaughTail exists to fix. `README.md` states it as a headline: "One currency, dynamic prices in a bounded band."
+
+A second currency is not a feature addition, it is a reversal of a founding decision. So it is **not** being built, and this is recorded rather than silently dropped.
+
+**What can be built instead, which gets the same player experience without the currency:** a shop *section* gated on something other than money - rank tier (Section 10 already does exactly this, eight tiers), Champion status, or season achievement. That gives the "special shop with exclusive stock" feeling that a shard shop provides, while the only thing anyone earns and spends remains Berries. If the owner specifically wants a *second earned resource*, that is a real product decision and should be taken deliberately against Law 1 rather than as a side effect of copying a menu layout.
+
+### Build in our plugin, do not install seven plugins
+
+The obvious route is DeluxeMenus + EssentialsX + HuskHomes + AuctionHouse + PlaceholderAPI + LeaderHeads + a friends plugin + Vault. AGENTS.md's standing bias does prefer "the boring, well-supported plugin over the clever custom one", and that bias is right in general. Here it loses, for four specific reasons:
+
+**1. A second source of truth for money would break the ledger.** Vault and EssentialsX economy keep their own balance store. D-0032 and V3 make `transactions` the source of truth and `balances` a cache, precisely so the Phase 3 arbitrage audit can see every movement. Bolting on Vault means two systems both believe they know a player's balance, and the audit can only see one of them. That is not a integration difficulty, it is a correctness failure.
+
+**2. Acceptance row 40 cannot be satisfied by a generic shop.** "A Tier 1 player cannot buy a Tier 8 item by any means, including a modified client." That requires the purchase check to sit server-side inside the same system that knows the player's rank. A generic shop plugin gates on a permission node, which means the gate is only as good as whatever syncs that node - and a sync gap is a purchasable advantage.
+
+**3. Memory.** `baselines.md` B3 records ~500 MB of host headroom with nobody online, and Q-41 already concludes this box cannot hold the specification's own 24-player heap alongside the Panel. Seven plugins is seven more class loaders, seven config surfaces and seven upgrade paths, on a box that is already the binding constraint. One plugin that does the job is cheaper in every direction.
+
+**4. Never-break rule 9 costs multiply.** Every plugin needs a pinned version, a publisher checksum, and an aarch64 load proof, and every one of them can break on a Minecraft version bump - which this project has already lived through once this session, and which cost GrimAC entirely.
+
+**The exceptions, where installing IS right:**
+
+* **Multi-line nametags** need TAB or Apollo. Rendering text above a player's head in more than one line is a client-facing trick that is genuinely hard to reproduce and has no bearing on the ledger. Install it.
+* **Lunar Apollo** is client integration by definition - a server cannot fake it. Worth doing, and worth noting it only benefits players on that client, so nothing may depend on it.
+* **PlaceholderAPI** if and only if something else needs it. It is a dependency, not a feature.
+
+### What the specification already covers, so is not new work
+
+Most of the list is already specified, which is worth saying because it means these are not additions but the existing plan under different names:
+
+| Owner's term | Already in the specification |
+| --- | --- |
+| Homes, `/sethome` | Section 15: up to 20, rename, home-to-home, slots bought with Berries |
+| Auction | Section 8: auction house with listing slots (P9) |
+| Quick Buy / Orders / Sell | Section 8: the order book with **atomic matching** |
+| Teleport / TPA | Section 15: teleports with warmup, cooldown and combat guards |
+| Leaderboards | Section 18: through a read-only database user |
+| Stats window | Section 9.8: the full stat list, already in V2 |
+| Pay | Built - `/pay` with the P10 tax |
+| Shop | Section 10: eight rank-gated tiers |
+
+**Genuinely new, and reasonable:** the chest-GUI menu as the front door to all of it, RTP with a queue, and friends. None conflicts with anything; all three are UI and convenience rather than economy, which is why they are safe to add.
+
+### Order of work
+
+The GUI is last, not first. A menu is a *view*, and building the view before the things it shows produces a menu full of buttons that do nothing - which looks like progress and is not. So: homes, then TPA and RTP, then the shop, then the order book and auction, then the GUI that fronts all of them, then nametags and Apollo.
