@@ -81,25 +81,47 @@ print('rcon: authenticated (password never displayed)')
 
 for cmd in sys.argv[3:]:
     s.sendall(pkt(2, 2, cmd))
-    time.sleep(0.4)
-    _, resp = read_pkt(s)
-    clean = re.sub(r'\xa7.', '', resp or '')
+    # Drain ALL response packets, not just the first. The RCON protocol splits a
+    # reply longer than 4096 bytes across several packets, and spark's output is
+    # multi-line - reading one packet returned an empty string for `spark health`
+    # while short replies like `tps` happened to fit and looked fine.
+    parts = []
+    deadline = time.time() + 20
+    s.settimeout(3.0)
+    while time.time() < deadline:
+        try:
+            _, resp = read_pkt(s)
+        except socket.timeout:
+            # The socket went quiet. For most commands that is the end of the
+            # reply. Deliberately no early break on a short packet: spark answers
+            # immediately with "Generating server health report..." and sends the
+            # actual report seconds later on the SAME connection, so breaking on
+            # the first short packet threw the report away.
+            break
+        if resp is None:
+            break
+        parts.append(resp)
+    s.settimeout(20)
+    clean = re.sub(r'\xa7.', '', ''.join(parts))
     print('=== %s ===' % cmd)
     print(clean.strip() if clean.strip() else '(no output)')
 s.close()
 PYEOF
 
 echo "=== baseline measurement over RCON ==="
-# spark is bundled with Paper but its profiler is disabled by default and reports
-# "The spark profiler is currently disabled" for every subcommand. Paper's own
-# /tps and /mspt give exactly what deviation D2 needs - tick rate and tick
-# duration percentiles - with nothing to enable and nothing to install.
+# Paper's own /tps and /mspt are the primary reading: they need nothing enabled and
+# they are what deviation D2 was captured with originally.
+#
+# `spark health` is included as well now that spark.enabled is true in
+# paper-global.yml (server/paper-tuning.yml). Before that change every spark
+# subcommand answered "The spark profiler is currently disabled".
 sudo -n python3 /tmp/lt-rcon.py \
   "/var/lib/pelican/volumes/$V/server.properties" \
   "$CIP" \
   "tps" \
   "mspt" \
-  "list"
+  "list" \
+  "spark health"
 
 rm -f /tmp/lt-rcon.py
 

@@ -430,3 +430,38 @@ Rule 4 requires **25% or 768 MB**. It was failing both tests, and the reassuring
 * **Refuses:** with the recorded checksum corrupted to `deadbeef...`, the runner printed both hashes and exited **3**, applying nothing. Then restored and re-verified. A guard that has never been observed refusing anything is an assumption, so it was made to refuse once, reversibly.
 
 **One bug worth recording, because it is a whole class.** The first version of the SQL helper piped output through `grep`, which makes the pipeline's exit status *grep's*. A `CREATE TABLE` produces no output, grep found nothing, exited 1, and `set -e` aborted the run on a statement that had actually succeeded. Output is now captured and filtered with `sed` so the real exit status survives - which the row 36 test depends on, since it must distinguish success from a constraint violation.
+
+
+---
+
+## D-0025 | 2026-08-26 | Paper config is managed as a documented subset of keys, not as whole files
+
+**The obvious reading of Section 29** - keep `paper-global.yml`, `paper-world-defaults.yml`, `spigot.yml` and `bukkit.yml` in the repository and deploy them - is wrong here, for three measured reasons:
+
+1. **Paper adds, renames and moves keys between versions.** A repository copy would go stale silently, and on upgrade the stale file would *win* over Paper's new baseline, re-introducing old defaults. Some of these keys already moved between the version that generated this volume (26.2) and the pinned 1.21.11.
+2. **Paper rewrites these files at boot and on config migration**, so a byte-for-byte model produces permanent false drift - the same effect measured for `server.properties` in D-0015.
+3. **A subset is auditable and a whole file is not.** Six deliberate keys with reasons can be reviewed; four hundred keys copied from a default file hide which ones were actually decisions.
+
+**So `server/paper-tuning.yml` is a registry**: file, key path, value, and *why*. Everything not listed is Paper's business.
+
+**The applier refuses to create a key that does not already exist.** This is the important safety property. Paper ignores an unknown key without any error, so a typo'd or renamed path would look successfully applied and do nothing at all. The applier aborts and tells you to re-derive paths with `paper-config-paths.sh`.
+
+**What was actually changed, and why each one:**
+
+| File | Key | From | To | Reason |
+| --- | --- | --- | --- | --- |
+| paper-global | `spark.enabled` | false | **true** | 6.7 names spark as the measurement toolchain. Bundled with Paper but off by default |
+| paper-global | `player-auto-save.rate` | -1 | **5000** | 6.4 stagger requirement - see below |
+| paper-global | `player-auto-save.max-per-tick` | -1 | **5** | spreads player writes instead of doing them in one tick |
+| spigot | `ticks-per.hopper-transfer` | 8 | **16** | 6.4 states these exact numbers |
+| spigot | `ticks-per.hopper-check` | 8 | **16** | 6.4 states these exact numbers |
+
+**The autosave collision was a real defect, not tidying.** 6.4 says "never let plugin saves and world saves land on the same tick". Chunk autosave runs at 6000 ticks, and `player-auto-save.rate` was `-1`, which *inherits* `bukkit.yml`'s `ticks-per.autosave` - also 6000. So both fired on the same tick every five minutes. 5000 against 6000 coincides every 30,000 ticks (25 minutes) instead.
+
+**Section 6.4 turned out to be partly obsolete, and that is worth recording** rather than blindly "fixing" things that are already right. Verified already true in Paper 1.21.11 by reading the live files: `hopper.disable-move-event` true, `misc.redstone-implementation` `ALTERNATE_CURRENT` (6.4's "Paper's optimised option"), `misc.update-pathfinding-on-block-update` false, `per-player-mob-spawns` true, `merge-radius` already 4.0/6.0 versus Spigot's 2.5/3.0. That spec text was written against an older Paper.
+
+**What I deliberately did NOT change, and why.** 6.4 also advises reducing entity activation and tracking ranges and tuning mob spawn limits down. Measured idle MSPT is **0.2 ms against a 25 ms budget**. There is no CPU shortage to fix, and reducing activation ranges trades visible gameplay fidelity - mobs freeze while a player can still see them - for CPU that is not scarce. Law 5 and 6.8 both put measurement before tuning, so those values are listed in `server/paper-tuning.yml` as Phase 6 candidates with their current values, to be set from the load test rather than from a blog post. The one honest counter-argument is memory rather than CPU, and that belongs to Q-41 and the load test too.
+
+**Verified:** applier set 5 keys and reported the 6th already correct; server booted clean in 57 s with all eight plugins and zero ERROR; `check-paper-drift.sh` reports `drift=0` **after** the boot, so Paper preserved the values rather than rewriting them.
+
+**A spark limitation, recorded so it is not rediscovered.** With `spark.enabled` true, `spark health` now replies "Generating server health report..." where it previously said "The spark profiler is currently disabled" - so the command is registered and running. But the report itself is delivered asynchronously to the command sender, and an RCON sender is transient, so the report never arrives over RCON. Two client strategies were tried - draining all packets, then holding the connection open for 20 s - and neither retrieves it. This is a spark/RCON interaction, not a configuration fault. **The working channel for spark reports is the Panel console**, which the owner has. `/tps` and `/mspt` remain the scriptable path and are what the D2 baseline uses.
