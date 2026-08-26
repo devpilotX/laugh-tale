@@ -39,6 +39,19 @@ commands:
   unban:
     description: Overturn a ban.
     usage: /unban <player> [reason]
+  balance:
+    description: Your Berries balance.
+    usage: /balance [player]
+    aliases: [bal]
+  pay:
+    description: Pay another player. Transfers over 5000 carry a 5 percent tax (P10).
+    usage: /pay <player> <amount>
+  baltop:
+    description: The richest players.
+    usage: /baltop
+  berries:
+    description: Your Berry ledger. Every movement, permanently recorded.
+    usage: /berries [player]
   access:
     description: Grant, revoke and audit paid access. The whitelist IS the paywall (17.3).
     usage: /access <grant|revoke|list|audit>

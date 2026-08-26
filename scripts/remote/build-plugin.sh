@@ -213,6 +213,19 @@ commands:
   unban:
     description: Overturn a ban.
     usage: /unban <player> [reason]
+  balance:
+    description: Your Berries balance.
+    usage: /balance [player]
+    aliases: [bal]
+  pay:
+    description: Pay another player. Transfers over 5000 carry a 5 percent tax (P10).
+    usage: /pay <player> <amount>
+  baltop:
+    description: The richest players.
+    usage: /baltop
+  berries:
+    description: Your Berry ledger. Every movement, permanently recorded.
+    usage: /berries [player]
   access:
     description: Grant, revoke and audit paid access. The whitelist IS the paywall (17.3).
     usage: /access <grant|revoke|list|audit>
@@ -339,6 +352,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private CombatTracker combatTracker;
     private Moderation moderation;
     private AccessGrants accessGrants;
+    private Economy economy;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -373,6 +387,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         // fail validation - an audit that records only successes is a record of intentions.
         this.moderation = new Moderation(this, database);
         this.accessGrants = new AccessGrants(this, database);
+        this.economy = new Economy(this, database);
         getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
@@ -503,6 +518,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
 
         if (moderation.handle(sender, name, args)) return true;
         if (name.equals("access")) return accessGrants.handle(sender, args);
+        if (economy.handle(sender, name, args)) return true;
 
         if (name.equals("rules")) {
             if (!(sender instanceof Player p)) {
@@ -1016,6 +1032,236 @@ public final class Database {
              PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM staff_audit");
              ResultSet rs = ps.executeQuery()) {
             return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
+    // ---- economy (V3) --------------------------------------------------------
+
+    enum Outcome { OK, INSUFFICIENT, NO_SENDER_ACCOUNT }
+
+    record TransferResult(Outcome outcome, long senderBalance, long receiverBalance) { }
+
+    long balance(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT berries FROM balances WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0L;
+            }
+        }
+    }
+
+    /**
+     * Moves Berries between two players, atomically, with the ledger written in the same
+     * transaction.
+     *
+     * THE LOCK ORDER IS DELIBERATE. Both rows are locked with SELECT ... FOR UPDATE, and always
+     * in ascending UUID order regardless of who is paying whom. Locking in the order the
+     * command happens to arrive would let two simultaneous transfers between the same pair
+     * deadlock - A locks itself and waits for B while B locks itself and waits for A. Ordering
+     * the locks makes that impossible rather than merely unlikely.
+     *
+     * The tax is REMOVED from circulation rather than paid to anyone. It is a sink, which is
+     * what 8.x wants - a tax paid to an admin account is not a sink, it is a transfer.
+     */
+    TransferResult transfer(UUID from, UUID to, long amount, long tax) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, from);
+                ensureBalanceRow(c, to);
+
+                // Ascending UUID order, not command order. See the note above.
+                UUID first = from.compareTo(to) <= 0 ? from : to;
+                UUID second = from.compareTo(to) <= 0 ? to : from;
+                lockBalance(c, first);
+                lockBalance(c, second);
+
+                long fromBal = readLocked(c, from);
+                if (fromBal < amount) {
+                    c.rollback();
+                    return new TransferResult(Outcome.INSUFFICIENT, fromBal, 0L);
+                }
+
+                long net = amount - tax;
+                long newFrom = fromBal - amount;
+                long toBal = readLocked(c, to);
+                long newTo = toBal + net;
+
+                writeBalance(c, from, newFrom, 0, amount);
+                writeBalance(c, to, newTo, net, 0);
+
+                ledger(c, from, -amount, newFrom, "transfer_out", to, null, null,
+                    "paid " + net + " to counterparty" + (tax > 0 ? ", " + tax + " tax" : ""));
+                ledger(c, to, net, newTo, "transfer_in", from, null, null,
+                    "received from counterparty");
+                if (tax > 0) {
+                    // Recorded as its own row so the sink is visible in the ledger. A tax that
+                    // only shows up as a smaller transfer is invisible to the audit.
+                    ledger(c, from, 0, newFrom, "transfer_tax", to, null, null,
+                        tax + " removed from circulation (P10, transfer over "
+                        + Economy.TRANSFER_TAX_THRESHOLD + ")");
+                }
+
+                c.commit();
+                return new TransferResult(Outcome.OK, newFrom, newTo);
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private void ensureBalanceRow(Connection c, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO balances (uuid, berries, last_modified, created_at) "
+              + "VALUES (?, 0, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) "
+              + "ON DUPLICATE KEY UPDATE last_modified = last_modified")) {
+            ps.setString(1, uuid.toString());
+            ps.executeUpdate();
+        }
+    }
+
+    private void lockBalance(Connection c, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT berries FROM balances WHERE uuid = ? FOR UPDATE")) {
+            ps.setString(1, uuid.toString());
+            ps.executeQuery();
+        }
+    }
+
+    private long readLocked(Connection c, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT berries FROM balances WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0L;
+            }
+        }
+    }
+
+    private void writeBalance(Connection c, UUID uuid, long newBalance, long in, long out)
+            throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE balances SET berries = ?, lifetime_in = lifetime_in + ?, "
+              + "lifetime_out = lifetime_out + ?, last_modified = UTC_TIMESTAMP(3) "
+              + "WHERE uuid = ?")) {
+            ps.setLong(1, newBalance);
+            ps.setLong(2, in);
+            ps.setLong(3, out);
+            ps.setString(4, uuid.toString());
+            ps.executeUpdate();
+        }
+    }
+
+    private void ledger(Connection c, UUID uuid, long delta, long after, String type,
+                        UUID counterparty, String item, Integer qty, String reason)
+            throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO transactions (uuid, delta, balance_after, type, counterparty, "
+              + "item, quantity, reason, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
+              + "UTC_TIMESTAMP(3))")) {
+            ps.setString(1, uuid.toString());
+            ps.setLong(2, delta);
+            ps.setLong(3, after);
+            ps.setString(4, type);
+            if (counterparty != null) ps.setString(5, counterparty.toString());
+            else ps.setNull(5, java.sql.Types.CHAR);
+            if (item != null) ps.setString(6, item); else ps.setNull(6, java.sql.Types.VARCHAR);
+            if (qty != null) ps.setInt(7, qty); else ps.setNull(7, java.sql.Types.INTEGER);
+            if (reason != null) ps.setString(8, reason); else ps.setNull(8, java.sql.Types.VARCHAR);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Admin grant or take. Used by /berries give and by rewards. Always ledgered. */
+    long adjustBalance(UUID uuid, long delta, String type, String reason) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, uuid);
+                lockBalance(c, uuid);
+                long bal = readLocked(c, uuid);
+                long next = bal + delta;
+                if (next < 0) { c.rollback(); return -1L; }
+                writeBalance(c, uuid, next, Math.max(0, delta), Math.max(0, -delta));
+                ledger(c, uuid, delta, next, type, null, null, null, reason);
+                c.commit();
+                return next;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    java.util.List<String> richList(int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT p.current_name, b.berries FROM balances b "
+               + "JOIN players p ON p.uuid = b.uuid WHERE b.berries > 0 "
+               + "ORDER BY b.berries DESC LIMIT ?")) {
+            ps.setInt(1, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                int i = 1;
+                while (rs.next()) {
+                    out.add((i++) + ". " + rs.getString(1) + "  " + rs.getLong(2));
+                }
+            }
+        }
+        return out;
+    }
+
+    java.util.List<String> ledgerFor(UUID uuid, int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT occurred_at, delta, balance_after, type, IFNULL(reason,'') "
+               + "FROM transactions WHERE uuid = ? ORDER BY id DESC LIMIT ?")) {
+            ps.setString(1, uuid.toString());
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long d = rs.getLong(2);
+                    out.add(rs.getString(1) + "  " + (d >= 0 ? "+" : "") + d
+                        + "  -> " + rs.getLong(3) + "  [" + rs.getString(4) + "] "
+                        + rs.getString(5));
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Test helper: verifies the ledger is self-consistent for one player. */
+    String verifyLedger(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT id, delta, balance_after FROM transactions WHERE uuid = ? "
+               + "AND type <> 'transfer_tax' ORDER BY id ASC")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                long running = 0;
+                while (rs.next()) {
+                    running += rs.getLong(2);
+                    long recorded = rs.getLong(3);
+                    if (running != recorded) {
+                        return "MISMATCH at transaction " + rs.getLong(1)
+                             + ": running " + running + " but row says " + recorded;
+                    }
+                }
+                long actual = balance(uuid);
+                return running == actual
+                    ? "consistent: ledger sums to " + running + " and matches the balance"
+                    : "MISMATCH: ledger sums to " + running + " but balance is " + actual;
+            }
         }
     }
 
@@ -3188,6 +3434,227 @@ final class Rating {
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Rating_java
+
+# ---- src/main/java/gg/laughtail/core/Economy.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Economy.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Economy_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+
+import java.sql.SQLException;
+import java.util.List;
+import java.util.UUID;
+import java.util.logging.Level;
+
+/**
+ * Berries. The single currency.
+ *
+ * THE LEDGER IS THE SOURCE OF TRUTH AND THE BALANCE IS A CACHE. Every movement writes a
+ * `transactions` row in the SAME database transaction that changes the balance, and records
+ * the resulting balance on the row. Two consequences follow, and both are the point:
+ *
+ *   - The Phase 3 arbitrage audit can see every movement. An audit that cannot see a movement
+ *     cannot find the loop that creates money, and a positive-yield loop is the one failure
+ *     that ends an economy outright.
+ *   - The ledger is self-checking. Because each row carries `balance_after`, corruption can be
+ *     found by scanning consecutive rows rather than by replaying every transaction from zero.
+ *
+ * THE TRANSFER TAX IS BOTH A SINK AND A DETECTOR (P10). 5% above 5,000 Berries. The tax is the
+ * sink; the threshold is the detector - bulk movement between accounts is how a suspended
+ * player moves value to an alt and how real-money trading settles in game, so a transfer over
+ * the threshold is deliberately made *notable* in the ledger rather than merely charged for.
+ *
+ * NEGATIVE BALANCES ARE IMPOSSIBLE, enforced in three places on purpose: the column is signed
+ * so an underflow fails rather than wrapping to a vast positive number, a CHECK constraint
+ * rejects it at the database, and the transfer reads the balance inside the transaction with
+ * FOR UPDATE so two simultaneous transfers cannot both see the same funds. Any one of those
+ * alone would be a bug away from a duplication exploit.
+ */
+final class Economy {
+
+    /** P10. Both values are decisions from D-0031, not guesses. */
+    static final double TRANSFER_TAX_RATE = 0.05;
+    static final long TRANSFER_TAX_THRESHOLD = 5_000L;
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+
+    Economy(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+    }
+
+    /** Tax on a transfer. Zero at or below the threshold. */
+    static long taxOn(long amount) {
+        if (amount <= TRANSFER_TAX_THRESHOLD) return 0L;
+        return Math.round(amount * TRANSFER_TAX_RATE);
+    }
+
+    boolean handle(CommandSender sender, String cmd, String[] args) {
+        switch (cmd) {
+            case "balance": return balance(sender, args);
+            case "pay":     return pay(sender, args);
+            case "baltop":  return baltop(sender);
+            case "berries": return ledger(sender, args);
+            default:        return false;
+        }
+    }
+
+    private boolean balance(CommandSender sender, String[] args) {
+        final String who = args.length > 0 ? args[0] : sender.getName();
+        final boolean other = args.length > 0 && !who.equalsIgnoreCase(sender.getName());
+        if (other && !sender.hasPermission("laughtail.staff.chat")) {
+            // 9.8 makes stats public, but a balance is not a stat - it is a target. Viewing
+            // someone else's is staff-only until the owner decides otherwise.
+            sender.sendMessage(Component.text("You can only check your own balance.",
+                NamedTextColor.RED));
+            return true;
+        }
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                UUID id = db.uuidByName(who);
+                if (id == null) {
+                    reply(sender, Component.text("Unknown player.", NamedTextColor.RED));
+                    return;
+                }
+                long b = db.balance(id);
+                reply(sender, Component.text(who + " has " + b + " Berries",
+                    NamedTextColor.GOLD));
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "balance failed: " + e.getMessage());
+                reply(sender, Component.text("Could not read the balance.", NamedTextColor.RED));
+            }
+        });
+        return true;
+    }
+
+    private boolean pay(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player from)) {
+            sender.sendMessage(Component.text("Only a player can pay.", NamedTextColor.RED));
+            return true;
+        }
+        if (args.length < 2) {
+            sender.sendMessage(Component.text("Usage: /pay <player> <amount>", NamedTextColor.GRAY));
+            return true;
+        }
+        final long amount;
+        try {
+            amount = Long.parseLong(args[1]);
+        } catch (NumberFormatException e) {
+            sender.sendMessage(Component.text("'" + args[1] + "' is not a whole number of Berries.",
+                NamedTextColor.RED));
+            return true;
+        }
+        if (amount <= 0) {
+            sender.sendMessage(Component.text("Amount must be positive.", NamedTextColor.RED));
+            return true;
+        }
+        final String toName = args[0];
+        if (toName.equalsIgnoreCase(from.getName())) {
+            // Not merely pointless: a self-transfer would let a player generate tax-free
+            // ledger noise to bury a real transfer in.
+            sender.sendMessage(Component.text("You cannot pay yourself.", NamedTextColor.RED));
+            return true;
+        }
+
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                UUID to = db.uuidByName(toName);
+                if (to == null) {
+                    reply(sender, Component.text("No player called '" + toName
+                        + "' has joined, so they have no balance to pay into.", NamedTextColor.RED));
+                    return;
+                }
+                long tax = taxOn(amount);
+                Database.TransferResult r = db.transfer(from.getUniqueId(), to, amount, tax);
+                switch (r.outcome()) {
+                    case OK -> reply(sender, Component.text("Paid " + (amount - tax)
+                        + " Berries to " + toName
+                        + (tax > 0 ? " (" + tax + " tax on a transfer over "
+                            + TRANSFER_TAX_THRESHOLD + ")" : "")
+                        + ". You now have " + r.senderBalance() + ".", NamedTextColor.GREEN));
+                    case INSUFFICIENT -> reply(sender, Component.text(
+                        "You have " + r.senderBalance() + " Berries and need " + amount + ".",
+                        NamedTextColor.RED));
+                    case NO_SENDER_ACCOUNT -> reply(sender, Component.text(
+                        "You have no Berries yet.", NamedTextColor.RED));
+                }
+                if (r.outcome() == Database.Outcome.OK) {
+                    Player online = plugin.getServer().getPlayerExact(toName);
+                    if (online != null) {
+                        plugin.getServer().getScheduler().runTask(plugin, () ->
+                            online.sendMessage(Component.text("You received " + (amount - tax)
+                                + " Berries from " + from.getName(), NamedTextColor.GREEN)));
+                    }
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "transfer failed: " + e.getMessage());
+                reply(sender, Component.text(
+                    "The transfer failed and NOTHING was moved. Your balance is unchanged.",
+                    NamedTextColor.RED));
+            }
+        });
+        return true;
+    }
+
+    private boolean baltop(CommandSender sender) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                List<String> rows = db.richList(10);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    sender.sendMessage(Component.text("Richest players", NamedTextColor.GOLD));
+                    if (rows.isEmpty()) {
+                        sender.sendMessage(Component.text("  nobody has any Berries yet",
+                            NamedTextColor.GRAY));
+                    }
+                    for (String r : rows) {
+                        sender.sendMessage(Component.text("  " + r, NamedTextColor.GRAY));
+                    }
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "baltop failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    /** /berries - the player's own ledger. Transparency is part of the fairness reputation. */
+    private boolean ledger(CommandSender sender, String[] args) {
+        final String who = (args.length > 0 && sender.hasPermission("laughtail.staff.chat"))
+            ? args[0] : sender.getName();
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                UUID id = db.uuidByName(who);
+                if (id == null) {
+                    reply(sender, Component.text("Unknown player.", NamedTextColor.RED));
+                    return;
+                }
+                List<String> rows = db.ledgerFor(id, 15);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    sender.sendMessage(Component.text("Berry ledger for " + who
+                        + " (" + rows.size() + " most recent)", NamedTextColor.GOLD));
+                    if (rows.isEmpty()) {
+                        sender.sendMessage(Component.text("  no movements yet", NamedTextColor.GRAY));
+                    }
+                    for (String r : rows) {
+                        sender.sendMessage(Component.text("  " + r, NamedTextColor.GRAY));
+                    }
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "ledger failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private void reply(CommandSender sender, Component msg) {
+        plugin.getServer().getScheduler().runTask(plugin, () -> sender.sendMessage(msg));
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Economy_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do

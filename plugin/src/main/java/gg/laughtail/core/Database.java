@@ -303,6 +303,236 @@ public final class Database {
         }
     }
 
+    // ---- economy (V3) --------------------------------------------------------
+
+    enum Outcome { OK, INSUFFICIENT, NO_SENDER_ACCOUNT }
+
+    record TransferResult(Outcome outcome, long senderBalance, long receiverBalance) { }
+
+    long balance(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT berries FROM balances WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0L;
+            }
+        }
+    }
+
+    /**
+     * Moves Berries between two players, atomically, with the ledger written in the same
+     * transaction.
+     *
+     * THE LOCK ORDER IS DELIBERATE. Both rows are locked with SELECT ... FOR UPDATE, and always
+     * in ascending UUID order regardless of who is paying whom. Locking in the order the
+     * command happens to arrive would let two simultaneous transfers between the same pair
+     * deadlock - A locks itself and waits for B while B locks itself and waits for A. Ordering
+     * the locks makes that impossible rather than merely unlikely.
+     *
+     * The tax is REMOVED from circulation rather than paid to anyone. It is a sink, which is
+     * what 8.x wants - a tax paid to an admin account is not a sink, it is a transfer.
+     */
+    TransferResult transfer(UUID from, UUID to, long amount, long tax) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, from);
+                ensureBalanceRow(c, to);
+
+                // Ascending UUID order, not command order. See the note above.
+                UUID first = from.compareTo(to) <= 0 ? from : to;
+                UUID second = from.compareTo(to) <= 0 ? to : from;
+                lockBalance(c, first);
+                lockBalance(c, second);
+
+                long fromBal = readLocked(c, from);
+                if (fromBal < amount) {
+                    c.rollback();
+                    return new TransferResult(Outcome.INSUFFICIENT, fromBal, 0L);
+                }
+
+                long net = amount - tax;
+                long newFrom = fromBal - amount;
+                long toBal = readLocked(c, to);
+                long newTo = toBal + net;
+
+                writeBalance(c, from, newFrom, 0, amount);
+                writeBalance(c, to, newTo, net, 0);
+
+                ledger(c, from, -amount, newFrom, "transfer_out", to, null, null,
+                    "paid " + net + " to counterparty" + (tax > 0 ? ", " + tax + " tax" : ""));
+                ledger(c, to, net, newTo, "transfer_in", from, null, null,
+                    "received from counterparty");
+                if (tax > 0) {
+                    // Recorded as its own row so the sink is visible in the ledger. A tax that
+                    // only shows up as a smaller transfer is invisible to the audit.
+                    ledger(c, from, 0, newFrom, "transfer_tax", to, null, null,
+                        tax + " removed from circulation (P10, transfer over "
+                        + Economy.TRANSFER_TAX_THRESHOLD + ")");
+                }
+
+                c.commit();
+                return new TransferResult(Outcome.OK, newFrom, newTo);
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private void ensureBalanceRow(Connection c, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO balances (uuid, berries, last_modified, created_at) "
+              + "VALUES (?, 0, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) "
+              + "ON DUPLICATE KEY UPDATE last_modified = last_modified")) {
+            ps.setString(1, uuid.toString());
+            ps.executeUpdate();
+        }
+    }
+
+    private void lockBalance(Connection c, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT berries FROM balances WHERE uuid = ? FOR UPDATE")) {
+            ps.setString(1, uuid.toString());
+            ps.executeQuery();
+        }
+    }
+
+    private long readLocked(Connection c, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT berries FROM balances WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0L;
+            }
+        }
+    }
+
+    private void writeBalance(Connection c, UUID uuid, long newBalance, long in, long out)
+            throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE balances SET berries = ?, lifetime_in = lifetime_in + ?, "
+              + "lifetime_out = lifetime_out + ?, last_modified = UTC_TIMESTAMP(3) "
+              + "WHERE uuid = ?")) {
+            ps.setLong(1, newBalance);
+            ps.setLong(2, in);
+            ps.setLong(3, out);
+            ps.setString(4, uuid.toString());
+            ps.executeUpdate();
+        }
+    }
+
+    private void ledger(Connection c, UUID uuid, long delta, long after, String type,
+                        UUID counterparty, String item, Integer qty, String reason)
+            throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO transactions (uuid, delta, balance_after, type, counterparty, "
+              + "item, quantity, reason, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
+              + "UTC_TIMESTAMP(3))")) {
+            ps.setString(1, uuid.toString());
+            ps.setLong(2, delta);
+            ps.setLong(3, after);
+            ps.setString(4, type);
+            if (counterparty != null) ps.setString(5, counterparty.toString());
+            else ps.setNull(5, java.sql.Types.CHAR);
+            if (item != null) ps.setString(6, item); else ps.setNull(6, java.sql.Types.VARCHAR);
+            if (qty != null) ps.setInt(7, qty); else ps.setNull(7, java.sql.Types.INTEGER);
+            if (reason != null) ps.setString(8, reason); else ps.setNull(8, java.sql.Types.VARCHAR);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Admin grant or take. Used by /berries give and by rewards. Always ledgered. */
+    long adjustBalance(UUID uuid, long delta, String type, String reason) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, uuid);
+                lockBalance(c, uuid);
+                long bal = readLocked(c, uuid);
+                long next = bal + delta;
+                if (next < 0) { c.rollback(); return -1L; }
+                writeBalance(c, uuid, next, Math.max(0, delta), Math.max(0, -delta));
+                ledger(c, uuid, delta, next, type, null, null, null, reason);
+                c.commit();
+                return next;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    java.util.List<String> richList(int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT p.current_name, b.berries FROM balances b "
+               + "JOIN players p ON p.uuid = b.uuid WHERE b.berries > 0 "
+               + "ORDER BY b.berries DESC LIMIT ?")) {
+            ps.setInt(1, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                int i = 1;
+                while (rs.next()) {
+                    out.add((i++) + ". " + rs.getString(1) + "  " + rs.getLong(2));
+                }
+            }
+        }
+        return out;
+    }
+
+    java.util.List<String> ledgerFor(UUID uuid, int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT occurred_at, delta, balance_after, type, IFNULL(reason,'') "
+               + "FROM transactions WHERE uuid = ? ORDER BY id DESC LIMIT ?")) {
+            ps.setString(1, uuid.toString());
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long d = rs.getLong(2);
+                    out.add(rs.getString(1) + "  " + (d >= 0 ? "+" : "") + d
+                        + "  -> " + rs.getLong(3) + "  [" + rs.getString(4) + "] "
+                        + rs.getString(5));
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Test helper: verifies the ledger is self-consistent for one player. */
+    String verifyLedger(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT id, delta, balance_after FROM transactions WHERE uuid = ? "
+               + "AND type <> 'transfer_tax' ORDER BY id ASC")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                long running = 0;
+                while (rs.next()) {
+                    running += rs.getLong(2);
+                    long recorded = rs.getLong(3);
+                    if (running != recorded) {
+                        return "MISMATCH at transaction " + rs.getLong(1)
+                             + ": running " + running + " but row says " + recorded;
+                    }
+                }
+                long actual = balance(uuid);
+                return running == actual
+                    ? "consistent: ledger sums to " + running + " and matches the balance"
+                    : "MISMATCH: ledger sums to " + running + " but balance is " + actual;
+            }
+        }
+    }
+
     // ---- access grants (D-0032: manual, no payment integration) --------------
     /**
      * Records a paid access grant. Returns the id, or -1 if the reference is already used.

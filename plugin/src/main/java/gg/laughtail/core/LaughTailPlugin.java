@@ -40,6 +40,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private CombatTracker combatTracker;
     private Moderation moderation;
     private AccessGrants accessGrants;
+    private Economy economy;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -74,6 +75,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         // fail validation - an audit that records only successes is a record of intentions.
         this.moderation = new Moderation(this, database);
         this.accessGrants = new AccessGrants(this, database);
+        this.economy = new Economy(this, database);
         getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
@@ -204,6 +206,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
 
         if (moderation.handle(sender, name, args)) return true;
         if (name.equals("access")) return accessGrants.handle(sender, args);
+        if (economy.handle(sender, name, args)) return true;
 
         if (name.equals("rules")) {
             if (!(sender instanceof Player p)) {
