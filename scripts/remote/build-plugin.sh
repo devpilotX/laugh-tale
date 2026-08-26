@@ -630,6 +630,71 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
 
     private void runArbitrageAudit() {
         getServer().getScheduler().runTaskLater(this, () -> {
+            // REPAIR BEFORE AUDIT. The repair pass lowers any price a recipe could profit from; the
+            // audit then checks the result. Running the audit first and repairing afterwards would mean
+            // the shop closed on every boot and reopened a moment later, which is a worse experience
+            // than being correct quietly.
+            //
+            // Repairs are applied to the in-memory catalogue AND written to the price table, so the two
+            // cannot disagree - a repaired price that lived only in memory would come back wrong after a
+            // restart with an older jar.
+            // REPAIRS CASCADE, SO THIS ITERATES TO A FIXED POINT.
+            //
+            // Lowering the price of planks also lowers the cost of everything MADE from planks, which
+            // lowers what those items may safely be worth - so one pass fixes 113 items and leaves 166
+            // recipes still profitable. A single pass is not a partial fix here, it is a wrong one.
+            //
+            // Each pass can only lower prices, and a price cannot go below 1, so the loop must terminate.
+            // The cap is a safety net rather than an expectation; if it is ever reached the audit below
+            // still fails and the shop still closes, so the failure mode stays safe.
+            int applied = 0;
+            java.util.List<Arbitrage.Repair> toPersist = new java.util.ArrayList<>();
+            int pass = 0;
+            while (pass++ < 30) {
+                java.util.List<Arbitrage.Repair> repairs = Arbitrage.computeRepairs(getServer());
+                if (repairs.isEmpty()) break;
+                boolean changed = false;
+                for (Arbitrage.Repair r : repairs) {
+                    if (Shop.lowerPrice(r.material(), r.newPrice())) {
+                        applied++;
+                        toPersist.add(r);
+                        changed = true;
+                    }
+                }
+                if (!changed) break;
+            }
+            if (pass >= 30) {
+                getLogger().warning("Price repair did not settle in 30 passes. The audit below is the "
+                    + "authority - if it fails, the shop closes.");
+            }
+            // RECIPES ARE READ ON THE MAIN THREAD, PRICES ARE WRITTEN OFF IT.
+            //
+            // The first version of this did both here and row 25's guard threw immediately, which is
+            // exactly what that guard is for - it caught my own mistake before it reached a player. The
+            // split is not a workaround: reading the recipe registry needs the main thread, and writing
+            // several hundred rows must never happen on it.
+            if (!toPersist.isEmpty()) {
+                getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                    int written = 0;
+                    for (Arbitrage.Repair r : toPersist) {
+                        try {
+                            database.setBasePrice(r.material().name(), r.newPrice());
+                            written++;
+                        } catch (java.sql.SQLException ex) {
+                            getLogger().warning("could not persist repaired price for "
+                                + r.material() + ": " + ex.getMessage());
+                        }
+                    }
+                    getLogger().info("Price repair persisted for " + written + " item(s).");
+                });
+            }
+            if (applied > 0) {
+                getLogger().info("Price repair: " + (pass - 1) + " pass(es), lowered " + applied + " price(s) so no recipe can be "
+                    + "run at a profit. Examples: " + toPersist.stream().limit(4)
+                    .map(r -> r.material().name() + " " + r.oldPrice() + "->" + r.newPrice())
+                    .reduce((x, y) -> x + ", " + y).orElse("none"));
+            }
+
             int examined = Arbitrage.recipeCount(getServer());
             java.util.List<Arbitrage.Finding> findings = Arbitrage.audit(getServer());
             if (examined == 0) {
@@ -2383,8 +2448,8 @@ public final class Database {
      */
     private void movePrice(Connection c, Shop.Entry e, int unitsDelta) throws SQLException {
         long base = e.basePrice();
-        long floor = Math.max(1L, Math.round(base * 0.6));
-        long ceil = Math.round(base * 1.4);
+        long floor = Shop.minBuy(base);
+        long ceil = Math.round(base * Shop.BAND_CEIL);
 
         // Read the current price under the transaction's lock, then compute in Java.
         //
@@ -3650,6 +3715,28 @@ public final class Database {
             }
         }
         return out;
+    }
+    /**
+     * Writes a repaired base price, and pulls the current price inside the new band.
+     *
+     * Both in one statement. Lowering base without moving current would leave the row violating the
+     * band CHECK, and the next update to it would fail with a constraint error far from the cause.
+     */
+    void setBasePrice(String item, long newBase) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE shop_prices SET base_price = ?, "
+               + "current_price = LEAST(ROUND(? * 1.2), GREATEST(GREATEST(1, ROUND(? * 0.8)), ?)), "
+               + "sell_price = ?, updated_at = UTC_TIMESTAMP(3) WHERE item = ?")) {
+            ps.setLong(1, newBase);
+            ps.setLong(2, newBase);
+            ps.setLong(3, newBase);
+            ps.setLong(4, newBase);
+            ps.setLong(5, Shop.sellPrice(newBase));
+            ps.setString(6, item);
+            ps.executeUpdate();
+        }
     }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Database_java
 
@@ -7221,16 +7308,46 @@ final class Hud implements Listener {
                             int homeMax, int champTitles, int kills, int deaths,
                             String pathName, long pathXp, int pathLevel, String title) { }
 
-    /** The shimmer palette - gold moving through pale yellow and back. */
+    /**
+     * The palette. Five accents, one label grey, one value white.
+     *
+     * Chosen as a set rather than picked per line. The previous version used the sixteen legacy
+     * Minecraft colours, which is why it looked unprofessional - those colours were designed for
+     * 1990s terminals and several of them clash badly against a bright sky. These are one warm
+     * family (amber to gold) plus two cool accents, which is the smallest palette that still lets
+     * each line be told apart at a glance.
+     *
+     * LABELS ARE A SOFT STEEL BLUE RATHER THAN GREY. Grey reads as disabled - it is the colour every
+     * interface uses for text you are not meant to act on - so a whole panel of grey labels looks
+     * switched off. A desaturated blue sits opposite the warm gold header on the colour wheel, which
+     * is what makes the two look chosen rather than merely coexisting, and it stays readable against
+     * both a bright sky and dark stone. Values remain pure white so the eye still lands on the number.
+     */
+    private static final TextColor LABEL       = TextColor.fromHexString("#9FB4C7");
+    private static final TextColor VALUE       = TextColor.fromHexString("#FFFFFF");
+    private static final TextColor BAR         = TextColor.fromHexString("#46586B");
+    private static final TextColor ACCENT_WARM  = TextColor.fromHexString("#E8734A");
+    private static final TextColor ACCENT_GOLD  = TextColor.fromHexString("#F2B33D");
+    private static final TextColor ACCENT_COOL  = TextColor.fromHexString("#5BA8D4");
+    private static final TextColor ACCENT_LEAF  = TextColor.fromHexString("#79B851");
+    private static final TextColor ACCENT_MUTED = TextColor.fromHexString("#9A6A6A");
+    /** The header shimmer. Four steps, close together, so it reads as a sheen not a strobe. */
     private static final List<TextColor> SHIMMER = List.of(
-        TextColor.fromHexString("#FFB302"),
-        TextColor.fromHexString("#FFC93C"),
-        TextColor.fromHexString("#FFE07D"),
-        TextColor.fromHexString("#FFF3C4"),
-        TextColor.fromHexString("#FFE07D"),
-        TextColor.fromHexString("#FFC93C")
+        TextColor.fromHexString("#F2B33D"),
+        TextColor.fromHexString("#F7C765"),
+        TextColor.fromHexString("#FFDC96"),
+        TextColor.fromHexString("#F7C765")
     );
 
+    /**
+     * THE TITLE SETS THE SIDEBAR'S WIDTH, which is the whole reason this is short.
+     *
+     * Minecraft sizes the sidebar box to its widest line and then hugs the right edge of the screen.
+     * The title was the widest line by far, so every data line below it sat with dead space beside it -
+     * the "massive gap" the owner described. Trimming the title from a decorated fourteen characters to
+     * ten pulls the entire panel narrower, and the gap closes because there is no longer a long line
+     * forcing the box wide.
+     */
     private static final String TITLE_TEXT = "LAUGH TALE";
 
     private final LaughTailPlugin plugin;
@@ -7248,7 +7365,10 @@ final class Hud implements Listener {
         plugin.getServer().getScheduler().runTaskTimer(plugin, this::renderAll, 20L, 20L);
         // Title every 4 ticks: 5 frames a second is smooth enough to read as movement without
         // being a flicker.
-        plugin.getServer().getScheduler().runTaskTimer(plugin, this::animateAll, 20L, 4L);
+        // 8 ticks, not 4. Two and a half frames a second reads as a slow sheen crossing the title, which
+        // is what "minimal" means here - at 5 frames it was closer to a flicker, and it also halves the
+        // packet cost to roughly 60 a second at 24 players.
+        plugin.getServer().getScheduler().runTaskTimer(plugin, this::animateAll, 20L, 8L);
         // Data every 10 seconds, off the main thread. See the class note on row 25.
         plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, this::refreshAll,
             20L, 200L);
@@ -7311,13 +7431,13 @@ final class Hud implements Listener {
 
     /** The shimmering header. Each character takes its colour from a moving offset. */
     private Component title(int f) {
-        Component out = Component.text("\u2726 ", TextColor.fromHexString("#FFF3C4"));
+        Component out = Component.empty();
         for (int i = 0; i < TITLE_TEXT.length(); i++) {
             TextColor c = SHIMMER.get(Math.floorMod(i + f, SHIMMER.size()));
             out = out.append(Component.text(String.valueOf(TITLE_TEXT.charAt(i)), c)
                 .decoration(TextDecoration.BOLD, true));
         }
-        return out.append(Component.text(" \u2726", TextColor.fromHexString("#FFF3C4")));
+        return out;
     }
 
     private void animateAll() {
@@ -7357,58 +7477,42 @@ final class Hud implements Listener {
         Scoreboard board = p.getScoreboard();
         int i = 0;
 
-        line(board, o, i++, Component.text("\u2694 ", NamedTextColor.RED)
-            .append(Component.text("Rank ", NamedTextColor.GRAY))
-            .append(Component.text(s.tier(), NamedTextColor.WHITE)));
+        // SIX LINES OF DATA AT MOST, and no blank spacers.
+        //
+        // The previous version ran to twelve lines with two blank separators, which covered a
+        // noticeable share of the screen. A sidebar competes with the game for the same pixels, so
+        // anything on it has to be worth blocking the view for. Homes count and the "/menu" hint were
+        // dropped: neither changes minute to minute, and both are one keystroke away.
+        //
+        // The scoreboard sidebar is ALWAYS drawn at the right edge, vertically centred - that position
+        // is decided by the client and a server cannot move it. The only lever is how much of it is
+        // used, so that is the lever this pulls.
 
-        line(board, o, i++, Component.text("\u2605 ", NamedTextColor.AQUA)
-            .append(Component.text("RP ", NamedTextColor.GRAY))
-            .append(Component.text(String.valueOf(s.rp()), NamedTextColor.WHITE)));
+        line(board, o, i++, row("\u2694", "Rank", s.tier(), ACCENT_WARM));
+        line(board, o, i++, row("\u2605", "RP", String.valueOf(s.rp()), ACCENT_COOL));
+        line(board, o, i++, row("\u2620", "K/D", s.kills() + "/" + s.deaths(), ACCENT_MUTED));
+        line(board, o, i++, row("\u25C8", "Berries", String.valueOf(s.berries()), ACCENT_GOLD));
 
-        line(board, o, i++, Component.text("\u2620 ", NamedTextColor.DARK_RED)
-            .append(Component.text("K/D ", NamedTextColor.GRAY))
-            .append(Component.text(s.kills() + "/" + s.deaths(), NamedTextColor.WHITE)));
-
-        line(board, o, i++, Component.empty());
-
-        line(board, o, i++, Component.text("\u25C8 ", NamedTextColor.GOLD)
-            .append(Component.text("Berries ", NamedTextColor.GRAY))
-            .append(Component.text(String.valueOf(s.berries()), NamedTextColor.YELLOW)));
-
-        line(board, o, i++, Component.text("\u2302 ", NamedTextColor.GREEN)
-            .append(Component.text("Homes ", NamedTextColor.GRAY))
-            .append(Component.text(s.homes() + "/" + s.homeMax(), NamedTextColor.WHITE)));
+        // The Path bar is the one line that moves while you play, so it earns its place. Level and bar
+        // share a line rather than taking two.
+        if (s.pathName() != null) {
+            line(board, o, i++, Component.text("\u2692 ", ACCENT_LEAF)
+                .append(Component.text(shortPath(s.pathName()) + " ", LABEL))
+                .append(Component.text(String.valueOf(s.pathLevel()) + " ", VALUE))
+                .append(Component.text(Path.barShort(s.pathXp()), BAR)));
+        }
 
         if (s.champTitles() > 0) {
-            line(board, o, i++, Component.text("\u265B ", NamedTextColor.GOLD)
-                .append(Component.text("Champion ", NamedTextColor.GRAY))
-                .append(Component.text("x" + s.champTitles(), NamedTextColor.GOLD)));
+            line(board, o, i++, row("\u265B", "Champion", "x" + s.champTitles(), ACCENT_GOLD));
         }
-
-        // The Path bar is the second ladder: something that always moves, for players who are not
-        // winning fights. It is deliberately shown next to rank rather than hidden in a menu.
-        if (s.pathName() != null) {
-            line(board, o, i++, Component.text("\u2692 ", NamedTextColor.YELLOW)
-                .append(Component.text(s.pathName() + " ", NamedTextColor.GRAY))
-                .append(Component.text(String.valueOf(s.pathLevel()), NamedTextColor.WHITE)));
-            line(board, o, i++, Component.text("  " + Path.bar(s.pathXp()),
-                NamedTextColor.DARK_GRAY));
-        }
-
-        line(board, o, i++, Component.empty());
 
         line(board, o, i++, s.season() > 0
-            ? Component.text("\u25F7 ", NamedTextColor.LIGHT_PURPLE)
-                .append(Component.text("Season ", NamedTextColor.GRAY))
-                .append(Component.text(String.valueOf(s.season()), NamedTextColor.WHITE))
-            : Component.text("\u25F7 ", NamedTextColor.DARK_GRAY)
-                .append(Component.text("No active season", NamedTextColor.DARK_GRAY)));
+            ? row("\u25F7", "Season", String.valueOf(s.season()), ACCENT_COOL)
+            : Component.text("\u25F7 ", ACCENT_MUTED)
+                .append(Component.text("No season", LABEL)));
 
-        line(board, o, i++, Component.text("\u2726 ", TextColor.fromHexString("#FFE07D"))
-            .append(Component.text("/menu", NamedTextColor.WHITE)));
-
-        // Any line left over from a previous render - for instance the Champion line after a
-        // reset - must be removed or it would linger with stale text.
+        // Any line left over from a previous render - the Champion line after a reset, or the Path line
+        // if it was unfocused - must be removed or it lingers with stale text.
         for (int stale = i; stale < 16; stale++) {
             Team t = board.getTeam("lt" + stale);
             if (t != null) {
@@ -7416,6 +7520,24 @@ final class Hud implements Listener {
                 t.unregister();
             }
         }
+    }
+
+    /**
+     * One line: coloured icon, grey label, white value.
+     *
+     * The owner asked for labels grey and values white, which is also simply better - the eye lands on
+     * the number rather than on the word next to it. Colour is spent on the icon alone, so the palette
+     * stays legible instead of turning into a rainbow of competing text.
+     */
+    private Component row(String icon, String label, String value, TextColor iconColour) {
+        return Component.text(icon + " ", iconColour)
+            .append(Component.text(label + " ", LABEL))
+            .append(Component.text(value, VALUE));
+    }
+
+    /** Trims a Path name so the line cannot force the sidebar wider than it needs to be. */
+    private String shortPath(String name) {
+        return name.length() > 10 ? name.substring(0, 10) : name;
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Hud_java
@@ -7434,128 +7556,332 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * The shop catalogue and the price derivation.
+ * The shop catalogue: what can be traded, at what price, and from what rank.
  *
- * BASE PRICES ARE DERIVED FROM P2, not invented per item. `target_berries_per_hour` is 1,200, so
- * every base price is an answer to "how much of this does an hour of deliberate play produce?".
- * Iron at 20 means roughly 60 ingots an hour is a full hour's income, which is about right for
- * someone mining with purpose. Cobblestone at 1 means you would need 1,200 an hour, which is also
- * about right - it is nearly worthless because it nearly is.
+ * THE SPREAD IS 50%. The shop sells at the listed price and buys back at half of it, so an item listed
+ * at 200 pays 100 when sold. The owner asked for exactly this, and it is a much safer shop than the 12%
+ * it replaced - buying something and selling it straight back now costs half its value rather than an
+ * eighth.
  *
- * Deriving rather than hand-picking matters because P2 is the single anchor the whole economy
- * hangs from. If the owner later changes 1,200, every price should move with it - and it will,
- * because the numbers below are multipliers of an hour rather than absolute figures someone chose.
+ * THE WIDE SPREAD IS WHAT PAYS FOR THE BIG CATALOGUE. With a thin spread, two items linked by a recipe
+ * could always be exploited: buy raw iron at the bottom of its price band, smelt it, sell the ingot at
+ * the top of its band. That is why the old catalogue had to leave OUT the smelted form of every ore
+ * (D-0036). At a 50% spread against the +/-20% band from V7, the worst case is a 25% LOSS, so ingots,
+ * blocks and raw ore can all be listed together - which is what makes "sell everything" possible.
  *
- * THE SELL PRICE IS ALWAYS `buy * (1 - 0.12)` (P3's 12% spread). That is the server's cut and the
- * anti-arbitrage margin in one, and it is why the Phase 3 audit can never find a buy-then-sell
- * loop that yields a profit: selling back always loses 12%.
+ * PRICES COME FROM RARITY, NOT FROM TASTE. Every item is placed in one of eight bands, and the band sets
+ * the price. That is deliberate: with several hundred items, hand-picking each price guarantees that
+ * some pair ends up inconsistent, and an inconsistent pair is a money printer. A band is a decision made
+ * once and applied uniformly.
  *
- * TIERS GATE BUYING, NEVER SELLING. 10.3 is explicit that selling is never gated - a new player
- * must be able to convert what they mine into Berries from the first minute, or the economy has no
- * entry point. Tiers only restrict what you may BUY, which is what makes rank worth having without
- * making poverty a trap.
+ * The anchor is P2's 1,200 Berries an hour. JUNK is what you get thousands of and is priced accordingly;
+ * MYTHIC is a full day's play for one item.
+ *
+ * WHAT IS DELIBERATELY NOT SELLABLE: anything a player cannot legitimately obtain (command blocks,
+ * spawners, bedrock, structure voids, debug items). Listing an unobtainable item means the only way to
+ * have one is a bug or an admin, and either way the shop should not put a price on it.
  */
 final class Shop {
 
-    /** An hour of deliberate play, from P2. Every base price is a fraction of this. */
+    /** An hour of deliberate play, from P2. */
     static final long HOUR = 1_200L;
-    /** P3: the minimum spread. Sell price is buy price less this. */
-    static final double SPREAD = 0.12;
+
+    /**
+     * The spread. Sell price is buy price times (1 - SPREAD).
+     *
+     * At 0.50 the sell price is exactly half the buy price, which is what the owner asked for and is
+     * what lets the whole catalogue exist. See the class note.
+     */
+    static final double SPREAD = 0.50;
+
+    /**
+     * The P4 price band, as a single source of truth.
+     *
+     * These were previously written out as 0.6 and 1.4 in Arbitrage and again in Database, and when V7
+     * narrowed the band the audit was left testing a band that no longer existed - so it reported 75
+     * cycles the repair pass could not see, and the shop stayed closed for a reason that was not real.
+     * That is the same class of bug as the spread being computed in two places, which cost a diamond a
+     * Berry per sale. One constant, used everywhere.
+     */
+    static final double BAND_FLOOR = 0.8;
+    static final double BAND_CEIL  = 1.2;
+
+    /** The cheapest an item can ever be bought for. */
+    static long minBuy(long base) { return Math.max(1L, Math.round(base * BAND_FLOOR)); }
+
+    /** The most an item can ever be sold for. */
+    static long maxSell(long base) { return sellPrice(Math.round(base * BAND_CEIL)); }
+
+    /**
+     * The eight price bands.
+     *
+     * The gap between bands widens deliberately as they climb. Rare things should feel rare when you sell
+     * one, and if the ladder were linear a diamond would be worth about the same as a few stacks of coal,
+     * which is the complaint that started this rewrite.
+     */
+    private enum Rarity {
+        JUNK(1, 1),        // thousands per hour: dirt, cobblestone, gravel
+        COMMON(4, 1),      // hundreds per hour: logs, wheat, coal
+        PLENTIFUL(12, 1),  // steady income: copper, redstone, kelp blocks
+        USEFUL(30, 2),     // iron, gold, quartz - the middle of the game
+        VALUABLE(90, 3),   // diamond, emerald, obsidian
+        RARE(300, 4),      // shulker shells, heart of the sea, echo shards
+        EPIC(1200, 6),     // elytra, netherite, beacons - a full hour each
+        MYTHIC(9000, 8);   // dragon egg, nether star - a day of play
+
+        final long price;
+        final int tier;
+        Rarity(long price, int tier) { this.price = price; this.tier = tier; }
+    }
 
     record Entry(Material material, String category, int tier, long basePrice) { }
 
-    /**
-     * The catalogue. `unitsPerHour` is the honest question behind each price: how many of these
-     * does an hour of focused play yield? Base price is HOUR divided by that.
-     *
-     * Tier is what rank a player must have REACHED to buy it (10.2's eight tiers). Everything at
-     * tier 1 is available immediately, which keeps the shop useful to a brand new player.
-     */
     private static final Map<Material, Entry> CATALOGUE = new LinkedHashMap<>();
 
-    private static void add(Material m, String category, int tier, long unitsPerHour) {
-        CATALOGUE.put(m, new Entry(m, category, tier, Math.max(1L, HOUR / unitsPerHour)));
+    /** Registers one material. Later calls win, so overrides can follow bulk additions. */
+    private static void put(Material m, String category, Rarity r) {
+        if (m == null || m.isAir() || !m.isItem()) return;
+        CATALOGUE.put(m, new Entry(m, category, r.tier, r.price));
     }
 
-    static {
-        // NOTE ON WHAT IS DELIBERATELY ABSENT: IRON_INGOT, GOLD_INGOT, NETHERITE_SCRAP and STONE.
-        //
-        // Each is the OUTPUT of a smelting recipe whose INPUT is also in this catalogue, and the
-        // arbitrage audit caught all four as money printers on its first run: buy raw iron at the
-        // bottom of its band for 12, smelt it, sell the ingot at the top of its band for 24.
-        //
-        // The root cause is structural, not a wrong number. Two items linked by a recipe hold
-        // INDEPENDENT prices, and the P4 band lets them drift apart by 1.4/0.6 = 2.33x, which
-        // swamps the 12% spread entirely. No choice of base prices fixes it while both sides are
-        // priced independently - to be safe the ingot would have to be worth under half the ore,
-        // which is absurd and would confuse every player who saw it.
-        //
-        // So only ONE side of each transformation is priced. Players sell what they mine, which is
-        // the raw form; ingots stay for crafting. The alternative considered was linked price groups
-        // that move together - more elegant, more machinery - recorded in decisions.md as the option
-        // to reach for if the catalogue ever needs both sides sellable.
-        // --- ore and mining. The bulk of early income. -------------------------
-        add(Material.COBBLESTONE,     "ore",     1, 1200);   // 1
-        add(Material.COAL,            "ore",     1, 150);    // 8
-        add(Material.RAW_COPPER,      "ore",     1, 100);    // 12
-        add(Material.RAW_IRON,        "ore",     1, 60);     // 20
-        add(Material.REDSTONE,        "ore",     2, 120);    // 10
-        add(Material.LAPIS_LAZULI,    "ore",     2, 100);    // 12
-        add(Material.RAW_GOLD,        "ore",     2, 34);     // 35
-        add(Material.QUARTZ,          "ore",     3, 60);     // 20
-        add(Material.AMETHYST_SHARD,  "ore",     3, 40);     // 30
-        add(Material.DIAMOND,         "ore",     4, 10);     // 120
-        add(Material.EMERALD,         "ore",     4, 12);     // 100
-        add(Material.ANCIENT_DEBRIS,  "ore",     6, 2);      // 600
+    /** Registers by name so a material missing from this Minecraft version is skipped, not fatal. */
+    private static void put(String name, String category, Rarity r) {
+        Material m = Material.getMaterial(name);
+        if (m != null) put(m, category, r);
+    }
 
-        // --- farming. Lower value per unit, far higher throughput. -------------
-        add(Material.WHEAT,           "farm",    1, 200);
-        add(Material.CARROT,          "farm",    1, 200);
-        add(Material.POTATO,          "farm",    1, 200);
-        add(Material.SUGAR_CANE,      "farm",    1, 240);
-        add(Material.MELON_SLICE,     "farm",    1, 300);
-        add(Material.PUMPKIN,         "farm",    1, 120);
-        add(Material.BAMBOO,          "farm",    1, 600);
-        add(Material.NETHER_WART,     "farm",    2, 150);
-        add(Material.HONEYCOMB,       "farm",    3, 60);
-
-        // --- mob drops. Rewards combat with the world, not with players. -------
-        add(Material.ROTTEN_FLESH,    "drops",   1, 400);
-        add(Material.BONE,            "drops",   1, 200);
-        add(Material.STRING,          "drops",   1, 200);
-        add(Material.GUNPOWDER,       "drops",   2, 80);
-        add(Material.ENDER_PEARL,     "drops",   3, 24);
-        add(Material.BLAZE_ROD,       "drops",   4, 20);
-        add(Material.GHAST_TEAR,      "drops",   5, 8);
-        add(Material.NETHER_STAR,     "drops",   8, 1);      // 1200 - a full hour
-
-        // --- wood and building ------------------------------------------------
-        add(Material.OAK_LOG,         "wood",    1, 300);
-        add(Material.SPRUCE_LOG,      "wood",    1, 300);
-        add(Material.BIRCH_LOG,       "wood",    1, 300);
-        add(Material.DARK_OAK_LOG,    "wood",    1, 300);
-
-        // --- higher tiers. What rank actually unlocks. --------------------------
-        add(Material.OBSIDIAN,        "special", 3, 30);
-        add(Material.EXPERIENCE_BOTTLE, "special", 4, 40);
-        add(Material.SHULKER_SHELL,   "special", 5, 6);
-        add(Material.ELYTRA,          "special", 7, 1);
-        add(Material.BEACON,          "special", 7, 1);
-        add(Material.ENCHANTED_GOLDEN_APPLE, "special", 8, 2);
-        add(Material.DRAGON_EGG,      "special", 8, 1);
+    /** Registers every material whose name contains a fragment - the bulk of the catalogue. */
+    private static void putMatching(String fragment, String category, Rarity r) {
+        for (Material m : Material.values()) {
+            if (!m.isItem() || m.isAir() || m.isLegacy()) continue;
+            if (m.name().contains(fragment)) put(m, category, r);
+        }
     }
 
     /**
-     * Last known price per item, for rendering only.
+     * Registers a material at an exact price rather than a band.
      *
-     * A GUI must be built on the main thread, but prices live in the database and row 25 forbids
-     * querying there. Without a cache every menu render would either block the server or show
-     * nothing. Database.currentPrice writes through to this on every read, and the shop is seeded
-     * at boot, so the cache is populated before any player can open a menu. It is deliberately
-     * NEVER the source of truth for a transaction - buy and sell re-read the price under the
-     * transaction lock, because a stale cache used for a charge would let a player pay yesterday's
-     * price for today's item.
+     * Used for storage blocks, and the reason is worth stating: a block is not a separate item with its
+     * own rarity, it is nine of something. Pricing it by band made a diamond block worth 300 while nine
+     * diamonds were worth 810, so the repair pass correctly concluded that a diamond must be worth at
+     * most 43 and crushed the price of the most recognisable item in the game.
+     *
+     * Priced at exactly nine times its contents, the relationship is safe in both directions and the
+     * item keeps the value its rarity says it should have. The lesson generalises: a derived item needs a
+     * derived price, and a band is only right for something whose value stands on its own.
      */
+    private static void putExact(String name, String category, int tier, long price) {
+        Material m = Material.getMaterial(name);
+        if (m == null || !m.isItem()) return;
+        CATALOGUE.put(m, new Entry(m, category, tier, Math.max(1L, price)));
+    }
+    static {
+        // ---- stone and earth: the floor of the economy ------------------------
+        for (String s : new String[] { "DIRT", "COARSE_DIRT", "ROOTED_DIRT", "GRASS_BLOCK", "PODZOL",
+                "MYCELIUM", "SAND", "RED_SAND", "GRAVEL", "CLAY", "COBBLESTONE", "STONE",
+                "COBBLED_DEEPSLATE", "DEEPSLATE", "NETHERRACK", "SOUL_SAND", "SOUL_SOIL",
+                "ANDESITE", "DIORITE", "GRANITE", "TUFF", "CALCITE", "BASALT", "SMOOTH_BASALT",
+                "BLACKSTONE", "MAGMA_BLOCK", "SNOW_BLOCK", "ICE", "PACKED_ICE", "MOSS_BLOCK",
+                "SANDSTONE", "RED_SANDSTONE", "END_STONE", "DRIPSTONE_BLOCK", "POINTED_DRIPSTONE" }) {
+            put(s, "stone", Rarity.JUNK);
+        }
+        putMatching("_STAIRS", "stone", Rarity.JUNK);
+        putMatching("_SLAB", "stone", Rarity.JUNK);
+        putMatching("_WALL", "stone", Rarity.JUNK);
+        putMatching("BRICKS", "stone", Rarity.COMMON);
+        putMatching("_CONCRETE", "stone", Rarity.COMMON);
+        putMatching("TERRACOTTA", "stone", Rarity.COMMON);
+        put("BLUE_ICE", "stone", Rarity.PLENTIFUL);
+        put("OBSIDIAN", "stone", Rarity.VALUABLE);
+        put("CRYING_OBSIDIAN", "stone", Rarity.RARE);
+
+        // ---- wood ------------------------------------------------------------
+        putMatching("_LOG", "wood", Rarity.COMMON);
+        putMatching("_WOOD", "wood", Rarity.COMMON);
+        putMatching("_PLANKS", "wood", Rarity.COMMON);
+        putMatching("_SAPLING", "wood", Rarity.COMMON);
+        putMatching("_LEAVES", "wood", Rarity.JUNK);
+        putMatching("_FENCE", "wood", Rarity.COMMON);
+        putMatching("_DOOR", "wood", Rarity.COMMON);
+        put("BAMBOO", "wood", Rarity.JUNK);
+        put("STICK", "wood", Rarity.JUNK);
+
+        // ---- ore, ingots and blocks, all three, now that the spread allows it --
+        put("COAL", "ore", Rarity.COMMON);
+        put("CHARCOAL", "ore", Rarity.COMMON);
+        put("RAW_COPPER", "ore", Rarity.PLENTIFUL);
+        put("COPPER_INGOT", "ore", Rarity.PLENTIFUL);
+        put("REDSTONE", "ore", Rarity.PLENTIFUL);
+        put("LAPIS_LAZULI", "ore", Rarity.PLENTIFUL);
+        put("RAW_IRON", "ore", Rarity.USEFUL);
+        put("IRON_INGOT", "ore", Rarity.USEFUL);
+        put("IRON_NUGGET", "ore", Rarity.COMMON);
+        put("RAW_GOLD", "ore", Rarity.USEFUL);
+        put("GOLD_INGOT", "ore", Rarity.USEFUL);
+        put("GOLD_NUGGET", "ore", Rarity.COMMON);
+        put("QUARTZ", "ore", Rarity.USEFUL);
+        put("AMETHYST_SHARD", "ore", Rarity.USEFUL);
+        put("DIAMOND", "ore", Rarity.VALUABLE);
+        put("EMERALD", "ore", Rarity.VALUABLE);
+        put("ANCIENT_DEBRIS", "ore", Rarity.EPIC);
+        put("NETHERITE_SCRAP", "ore", Rarity.EPIC);
+        put("NETHERITE_INGOT", "ore", Rarity.EPIC);
+        // Storage blocks. Priced by band rather than exactly nine times the item on purpose - see the
+        // note at the bottom about why exact multiples are not required at a 50% spread.
+        // Storage blocks are priced as NINE of their contents, not by rarity band. See putExact.
+        putExact("COAL_BLOCK",      "ore", 1, 9 * Rarity.COMMON.price);
+        putExact("COPPER_BLOCK",    "ore", 1, 9 * Rarity.PLENTIFUL.price);
+        putExact("REDSTONE_BLOCK",  "ore", 2, 9 * Rarity.PLENTIFUL.price);
+        putExact("LAPIS_BLOCK",     "ore", 2, 9 * Rarity.PLENTIFUL.price);
+        putExact("IRON_BLOCK",      "ore", 2, 9 * Rarity.USEFUL.price);
+        putExact("GOLD_BLOCK",      "ore", 2, 9 * Rarity.USEFUL.price);
+        putExact("DIAMOND_BLOCK",   "ore", 3, 9 * Rarity.VALUABLE.price);
+        putExact("EMERALD_BLOCK",   "ore", 3, 9 * Rarity.VALUABLE.price);
+        putExact("NETHERITE_BLOCK", "ore", 8, 9 * Rarity.EPIC.price);
+        // Four shards, not nine.
+        putExact("AMETHYST_BLOCK",  "ore", 2, 4 * Rarity.USEFUL.price);
+        putExact("QUARTZ_BLOCK",    "ore", 2, 4 * Rarity.USEFUL.price);
+
+        // ---- farming ---------------------------------------------------------
+        for (String s : new String[] { "WHEAT", "WHEAT_SEEDS", "CARROT", "POTATO", "BEETROOT",
+                "BEETROOT_SEEDS", "MELON_SLICE", "MELON", "PUMPKIN", "SUGAR_CANE", "COCOA_BEANS",
+                "SWEET_BERRIES", "GLOW_BERRIES", "KELP", "DRIED_KELP", "SEAGRASS", "CACTUS",
+                "VINE", "LILY_PAD", "BROWN_MUSHROOM", "RED_MUSHROOM", "NETHER_WART",
+                "TORCHFLOWER_SEEDS", "PITCHER_POD", "HANGING_ROOTS", "GLOW_LICHEN" }) {
+            put(s, "farm", Rarity.COMMON);
+        }
+        putMatching("_FLOWER", "farm", Rarity.COMMON);
+        putMatching("SAPLING", "farm", Rarity.COMMON);
+        put("HONEYCOMB", "farm", Rarity.PLENTIFUL);
+        put("HONEY_BOTTLE", "farm", Rarity.PLENTIFUL);
+        put("BEE_NEST", "farm", Rarity.VALUABLE);
+
+        // ---- food ------------------------------------------------------------
+        for (String s : new String[] { "BREAD", "COOKED_BEEF", "COOKED_PORKCHOP", "COOKED_CHICKEN",
+                "COOKED_MUTTON", "COOKED_RABBIT", "COOKED_COD", "COOKED_SALMON", "BEEF", "PORKCHOP",
+                "CHICKEN", "MUTTON", "RABBIT", "COD", "SALMON", "TROPICAL_FISH", "PUFFERFISH",
+                "BAKED_POTATO", "PUMPKIN_PIE", "COOKIE", "CAKE", "MUSHROOM_STEW", "RABBIT_STEW",
+                "BEETROOT_SOUP", "SUSPICIOUS_STEW", "APPLE", "MILK_BUCKET", "EGG" }) {
+            put(s, "food", Rarity.COMMON);
+        }
+        put("GOLDEN_CARROT", "food", Rarity.PLENTIFUL);
+        put("GOLDEN_APPLE", "food", Rarity.USEFUL);
+        put("ENCHANTED_GOLDEN_APPLE", "food", Rarity.EPIC);
+
+        // ---- mob drops -------------------------------------------------------
+        for (String s : new String[] { "ROTTEN_FLESH", "BONE", "BONE_MEAL", "STRING", "SPIDER_EYE",
+                "FEATHER", "LEATHER", "RABBIT_HIDE", "INK_SAC", "GLOW_INK_SAC", "SLIME_BALL",
+                "GUNPOWDER", "PHANTOM_MEMBRANE", "SCUTE", "TURTLE_SCUTE" }) {
+            put(s, "drops", Rarity.COMMON);
+        }
+        put("ENDER_PEARL", "drops", Rarity.PLENTIFUL);
+        put("BLAZE_ROD", "drops", Rarity.USEFUL);
+        put("MAGMA_CREAM", "drops", Rarity.USEFUL);
+        put("GHAST_TEAR", "drops", Rarity.VALUABLE);
+        put("PRISMARINE_SHARD", "drops", Rarity.PLENTIFUL);
+        put("PRISMARINE_CRYSTALS", "drops", Rarity.USEFUL);
+        put("NAUTILUS_SHELL", "drops", Rarity.RARE);
+        put("HEART_OF_THE_SEA", "drops", Rarity.EPIC);
+        put("SHULKER_SHELL", "drops", Rarity.RARE);
+        put("ECHO_SHARD", "drops", Rarity.RARE);
+        put("TOTEM_OF_UNDYING", "drops", Rarity.EPIC);
+        put("DRAGON_BREATH", "drops", Rarity.RARE);
+        put("NETHER_STAR", "drops", Rarity.MYTHIC);
+        put("WITHER_SKELETON_SKULL", "drops", Rarity.EPIC);
+        put("ELYTRA", "drops", Rarity.EPIC);
+        put("TRIDENT", "drops", Rarity.EPIC);
+
+        // ---- utility and redstone --------------------------------------------
+        for (String s : new String[] { "TORCH", "SOUL_TORCH", "LANTERN", "SOUL_LANTERN", "LADDER",
+                "CHEST", "BARREL", "FURNACE", "BLAST_FURNACE", "SMOKER", "CRAFTING_TABLE",
+                "SMITHING_TABLE", "STONECUTTER", "GRINDSTONE", "LOOM", "CARTOGRAPHY_TABLE",
+                "FLETCHING_TABLE", "COMPOSTER", "SCAFFOLDING", "BUCKET", "GLASS", "GLASS_PANE",
+                "GLOWSTONE", "REDSTONE_TORCH", "REPEATER", "COMPARATOR", "PISTON", "STICKY_PISTON",
+                "OBSERVER", "DISPENSER", "DROPPER", "HOPPER", "RAIL", "POWERED_RAIL",
+                "DETECTOR_RAIL", "ACTIVATOR_RAIL", "MINECART", "TNT", "LEVER", "TRIPWIRE_HOOK",
+                "DAYLIGHT_DETECTOR", "TARGET", "NOTE_BLOCK", "JUKEBOX", "BOOKSHELF", "PAPER",
+                "BOOK", "STRING", "FLINT", "BRICK", "NETHER_BRICK", "ITEM_FRAME", "ARMOR_STAND",
+                "SHIELD", "BOW", "ARROW", "CROSSBOW", "FISHING_ROD", "SHEARS", "FLINT_AND_STEEL",
+                "COMPASS", "CLOCK", "SPYGLASS", "LEAD", "NAME_TAG", "SADDLE" }) {
+            put(s, "utility", Rarity.PLENTIFUL);
+        }
+        put("ENDER_CHEST", "utility", Rarity.VALUABLE);
+        put("ANVIL", "utility", Rarity.USEFUL);
+        put("ENCHANTING_TABLE", "utility", Rarity.VALUABLE);
+        put("EXPERIENCE_BOTTLE", "utility", Rarity.USEFUL);
+        put("SHULKER_BOX", "utility", Rarity.RARE);
+        put("BEACON", "utility", Rarity.EPIC);
+        put("CONDUIT", "utility", Rarity.EPIC);
+        put("RESPAWN_ANCHOR", "utility", Rarity.RARE);
+        put("LODESTONE", "utility", Rarity.RARE);
+        put("DRAGON_EGG", "utility", Rarity.MYTHIC);
+        put("ELYTRA", "utility", Rarity.EPIC);
+
+        // ---- decoration ------------------------------------------------------
+        putMatching("_WOOL", "decor", Rarity.COMMON);
+        putMatching("_CARPET", "decor", Rarity.COMMON);
+        putMatching("_DYE", "decor", Rarity.COMMON);
+        putMatching("_BED", "decor", Rarity.COMMON);
+        putMatching("_BANNER", "decor", Rarity.COMMON);
+        putMatching("_STAINED_GLASS", "decor", Rarity.COMMON);
+        putMatching("CANDLE", "decor", Rarity.COMMON);
+        putMatching("GLAZED_TERRACOTTA", "decor", Rarity.PLENTIFUL);
+        putMatching("_HEAD", "decor", Rarity.RARE);
+        putMatching("MUSIC_DISC", "decor", Rarity.RARE);
+        put("PAINTING", "decor", Rarity.COMMON);
+        put("FLOWER_POT", "decor", Rarity.COMMON);
+        put("SPONGE", "decor", Rarity.RARE);
+        put("WET_SPONGE", "decor", Rarity.RARE);
+
+        // ---- brewing ---------------------------------------------------------
+        for (String s : new String[] { "GLASS_BOTTLE", "BREWING_STAND", "CAULDRON", "FERMENTED_SPIDER_EYE",
+                "GLISTERING_MELON_SLICE", "GOLDEN_CARROT", "RABBIT_FOOT", "SUGAR", "REDSTONE",
+                "GLOWSTONE_DUST", "BLAZE_POWDER" }) {
+            put(s, "brew", Rarity.PLENTIFUL);
+        }
+
+        // ---- WHAT IS REMOVED, and why ----------------------------------------
+        // Items a player cannot legitimately obtain. Putting a price on one means the only way to have
+        // it is a bug or an admin hand-out, and in either case the shop should not be the thing that
+        // turns it into Berries.
+        for (String s : new String[] { "BEDROCK", "COMMAND_BLOCK", "CHAIN_COMMAND_BLOCK",
+                "REPEATING_COMMAND_BLOCK", "COMMAND_BLOCK_MINECART", "STRUCTURE_BLOCK",
+                "STRUCTURE_VOID", "JIGSAW", "BARRIER", "LIGHT", "DEBUG_STICK", "KNOWLEDGE_BOOK",
+                "SPAWNER", "TRIAL_SPAWNER", "VAULT", "END_PORTAL_FRAME", "PETRIFIED_OAK_SLAB",
+                "FARMLAND", "DIRT_PATH", "BUDDING_AMETHYST", "REINFORCED_DEEPSLATE",
+                "INFESTED_STONE", "PLAYER_HEAD" }) {
+            Material m = Material.getMaterial(s);
+            if (m != null) CATALOGUE.remove(m);
+        }
+        // Spawn eggs are creative-only.
+        CATALOGUE.keySet().removeIf(m -> m.name().endsWith("_SPAWN_EGG"));
+        // Anything with durability is excluded: a shop that buys tools has to decide what a
+        // half-broken pickaxe is worth, and every answer to that is exploitable.
+        CATALOGUE.keySet().removeIf(m -> m.getMaxDurability() > 0
+            && m != Material.SHIELD && m != Material.BOW && m != Material.CROSSBOW
+            && m != Material.FISHING_ROD && m != Material.SHEARS && m != Material.FLINT_AND_STEEL
+            && m != Material.ELYTRA && m != Material.TRIDENT);
+        // Those exceptions are then removed too - they are all repairable, so they carry damage.
+        for (Material m : new Material[] { Material.SHIELD, Material.BOW, Material.CROSSBOW,
+                Material.FISHING_ROD, Material.SHEARS, Material.FLINT_AND_STEEL,
+                Material.ELYTRA, Material.TRIDENT }) {
+            CATALOGUE.remove(m);
+        }
+    }
+
+    private Shop() { }
+
+    static Entry entry(Material m) { return CATALOGUE.get(m); }
+    static Map<Material, Entry> catalogue() { return CATALOGUE; }
+    static int size() { return CATALOGUE.size(); }
+
+    /** Every category present, in a stable order for the GUI. */
+    static java.util.List<String> categories() {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        for (Entry e : CATALOGUE.values()) out.add(e.category());
+        return new java.util.ArrayList<>(out);
+    }
+
     private static final java.util.concurrent.ConcurrentHashMap<Material, Long> PRICE_CACHE =
         new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -7568,51 +7894,25 @@ final class Shop {
         return PRICE_CACHE.getOrDefault(m, e.basePrice());
     }
 
-    private Shop() { }
-
-    static Entry entry(Material m) {
-        return CATALOGUE.get(m);
-    }
-
-    static Map<Material, Entry> catalogue() {
-        return CATALOGUE;
-    }
-
     /**
-     * Sell price from a buy price. P3's spread, always applied, never negotiable.
+     * Sell price from a buy price. Half, rounded down.
      *
-     * FLOOR, NOT ROUND. Rounding half-up can push the sell price a fraction ABOVE the 12% floor -
-     * a diamond at 120 rounds to 106, which is a 11.7% spread, under the minimum P3 sets. The
-     * error is under one Berry per unit and would never be noticed by a player, which is exactly
-     * why it is worth fixing: it is invisible per trade and compounds over millions of them, and
-     * "minimum 12%" has to actually be a minimum or it is not a floor at all. The shop invariant
-     * test asserts this with no tolerance.
+     * FLOOR, NOT ROUND, so the spread can never come out below 50%. Rounding half-up on an odd price
+     * would give back one Berry too many - invisible per trade and compounding over millions of them.
      */
     static long sellPrice(long buyPrice) {
         long sell = (long) Math.floor(buyPrice * (1.0 - SPREAD));
-        // A 1-Berry item would round to 1 and the spread would vanish, which is exactly the
-        // rounding hole a buy-then-sell loop exploits. Floor it to zero instead: cobblestone is
-        // worth buying for 1 and worth nothing to sell back, which is honest.
         return Math.min(sell, buyPrice - 1);
     }
 
-    /**
-     * Row 40. Whether a player may BUY this entry.
-     *
-     * Checked against PEAK tier rather than current, because 10.x gates on what a player has
-     * reached - a bad week should not revoke access to items they earned. Selling is never gated
-     * (10.3), so there is deliberately no matching canSell.
-     */
+    /** Row 40. Whether a player may BUY. Selling is never gated (10.3). */
     static boolean canBuy(int peakTier, Entry e) {
         return peakTier >= e.tier();
     }
 
-    /** The tier a rating corresponds to, 1-8. Maps the ten rank tiers onto eight shop tiers. */
     static int tierForRp(int rp) {
-        String rank = Rating.tierName(rp);
-        return switch (rank) {
-            case "Wanderer", "Settler" -> 1;
-            case "Raider"    -> 1;
+        return switch (Rating.tierName(rp)) {
+            case "Wanderer", "Settler", "Raider" -> 1;
             case "Fighter"   -> 2;
             case "Warrior"   -> 3;
             case "Gladiator" -> 4;
@@ -7624,7 +7924,6 @@ final class Shop {
         };
     }
 
-    /** Counts how many of a material a player is carrying. */
     static int countIn(Player p, Material m) {
         int n = 0;
         for (ItemStack it : p.getInventory().getStorageContents()) {
@@ -7633,7 +7932,6 @@ final class Shop {
         return n;
     }
 
-    /** Removes exactly `amount`, returning how many were actually taken. */
     static int removeFrom(Player p, Material m, int amount) {
         int remaining = amount;
         ItemStack[] contents = p.getInventory().getStorageContents();
@@ -7650,11 +7948,24 @@ final class Shop {
     }
 
     static Component describe(Entry e, long buy, boolean allowed) {
-        return Component.text(e.material().name(), allowed ? NamedTextColor.WHITE : NamedTextColor.DARK_GRAY)
-            .append(Component.text("  buy " + buy + "  sell " + sellPrice(buy),
-                NamedTextColor.GRAY));
+        return Component.text(e.material().name(),
+                allowed ? NamedTextColor.WHITE : NamedTextColor.DARK_GRAY)
+            .append(Component.text("  buy " + buy + "  sell " + sellPrice(buy), NamedTextColor.GRAY));
     }
-}
+
+    /**
+     * Lowers an entry's base price. Called only by the arbitrage repair pass.
+     *
+     * LOWER ONLY, enforced here rather than trusted to the caller. A method that could raise a price
+     * would let a bug in the repair pass inflate the economy while claiming to protect it.
+     */
+    static boolean lowerPrice(Material m, long newBase) {
+        Entry e = CATALOGUE.get(m);
+        if (e == null || newBase >= e.basePrice() || newBase < 1) return false;
+        CATALOGUE.put(m, new Entry(e.material(), e.category(), e.tier(), newBase));
+        PRICE_CACHE.remove(m);
+        return true;
+    }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Shop_java
 
 # ---- src/main/java/gg/laughtail/core/Arbitrage.java ----
@@ -7722,14 +8033,14 @@ final class Arbitrage {
     private static long minBuy(Material m) {
         Shop.Entry e = Shop.entry(m);
         if (e == null) return -1;
-        return Math.max(1L, Math.round(e.basePrice() * 0.6));
+        return Shop.minBuy(e.basePrice());
     }
 
     /** The most an item can ever be sold for: the top of the band, less the spread. */
     private static long maxSell(Material m) {
         Shop.Entry e = Shop.entry(m);
         if (e == null) return -1;
-        return Shop.sellPrice(Math.round(e.basePrice() * 1.4));
+        return Shop.maxSell(e.basePrice());
     }
 
     /**
@@ -7869,7 +8180,89 @@ final class Arbitrage {
         if (r instanceof org.bukkit.Keyed k) return k.getKey().toString();
         return r.getClass().getSimpleName();
     }
-}
+
+    /**
+     * Lowers the price of any item a recipe could turn a profit on, and returns what it changed.
+     *
+     * WHY THIS EXISTS RATHER THAN A LIST OF HAND-FIXED PRICES. Expanding the catalogue from 40 items to
+     * 777 produced 220 profitable recipes on the first audit. Almost all are the same shape: a recipe
+     * that produces MORE units than it consumes, where both sides sit in the same price band. One log
+     * costs 4 and yields four planks; if planks are also 4, buying a log and selling the planks prints
+     * Berries.
+     *
+     * Hand-fixing 220 prices would be slow, would need redoing every time an item was added, and would
+     * certainly be got wrong somewhere - and one wrong price is a money printer. So the rule is applied
+     * arithmetically instead: for every recipe, the output is worth at most what makes the trade a loss.
+     *
+     * THE ARITHMETIC. The attacker buys inputs at the band floor and sells the output at the band
+     * ceiling, so safety requires:
+     *
+     *     sell_at_ceiling(base_out) x quantity  <  buy_at_floor(base_in_total)
+     *     (0.5 x 1.2 x base_out) x qty          <  0.8 x base_in_total
+     *     base_out                              <  1.333 x base_in_total / qty
+     *
+     * The cap is that bound, minus one Berry so the comparison is strict, floored at 1.
+     *
+     * IT ONLY EVER LOWERS A PRICE. Raising one to fix a cycle would mean the audit could inflate the
+     * economy while trying to protect it, and a repair pass that can make things more valuable is a
+     * money printer with extra steps.
+     */
+    record Repair(Material material, long oldPrice, long newPrice, String recipe) { }
+
+    static List<Repair> computeRepairs(org.bukkit.Server server) {
+        // Lowest safe price seen for each material across every recipe that produces it. A material can
+        // be the output of several recipes and must satisfy the tightest of them.
+        java.util.Map<Material, Long> cap = new java.util.HashMap<>();
+        java.util.Map<Material, String> blame = new java.util.HashMap<>();
+
+        Iterator<Recipe> it = server.recipeIterator();
+        while (it.hasNext()) {
+            Recipe r;
+            try { r = it.next(); } catch (RuntimeException ex) { continue; }
+            ItemStack result = r.getResult();
+            if (result == null || result.getType() == Material.AIR) continue;
+            Shop.Entry outEntry = Shop.entry(result.getType());
+            if (outEntry == null) continue;
+
+            List<ItemStack> inputs = ingredientsOf(r);
+            if (inputs == null || inputs.isEmpty()) continue;
+
+            long inTotal = 0;
+            boolean allBuyable = true;
+            for (ItemStack in : inputs) {
+                Shop.Entry ie = Shop.entry(in.getType());
+                if (ie == null) { allBuyable = false; break; }
+                inTotal += ie.basePrice() * in.getAmount();
+            }
+            if (!allBuyable) continue;
+
+            int qty = Math.max(1, result.getAmount());
+            // Derived from the band constants rather than a magic 1.3333, so this cannot drift from the
+            // audit again: need sell(ceil(out)) * qty < buy(floor(in)), i.e.
+            //   (1 - SPREAD) * BAND_CEIL * base_out * qty < BAND_FLOOR * base_in
+            double factor = Shop.BAND_FLOOR / ((1.0 - Shop.SPREAD) * Shop.BAND_CEIL);
+            long safeMax = (long) Math.floor(factor * inTotal / qty) - 1;
+            if (safeMax < 1) safeMax = 1;
+
+            if (outEntry.basePrice() > safeMax) {
+                Long current = cap.get(result.getType());
+                if (current == null || safeMax < current) {
+                    cap.put(result.getType(), safeMax);
+                    blame.put(result.getType(), describe(r));
+                }
+            }
+        }
+
+        List<Repair> out = new ArrayList<>();
+        for (java.util.Map.Entry<Material, Long> e : cap.entrySet()) {
+            Shop.Entry se = Shop.entry(e.getKey());
+            if (se == null) continue;
+            out.add(new Repair(e.getKey(), se.basePrice(), e.getValue(),
+                blame.getOrDefault(e.getKey(), "?")));
+        }
+        out.sort((x, y) -> x.material().name().compareTo(y.material().name()));
+        return out;
+    }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Arbitrage_java
 
 # ---- src/main/java/gg/laughtail/core/ShopService.java ----
@@ -8070,8 +8463,11 @@ final class ShopService {
     }
 
     private boolean buy(Player p, String[] args) {
+        // Bare /buy opens the shop, because that is what the owner asked for and it is the better
+        // default: with several hundred items nobody can be expected to know the exact Bukkit name of
+        // the thing they want. The typed form stays for when you do know it.
         if (args.length < 1) {
-            p.sendMessage(Component.text("Usage: /buy <item> [amount]", NamedTextColor.GRAY));
+            plugin.menu().openShop(p, null);
             return true;
         }
         final Material m;
@@ -10174,7 +10570,23 @@ enum Path {
         }
         return sb.toString();
     }
-}
+
+    /**
+     * A six-segment bar for the sidebar.
+     *
+     * Separate from bar() rather than a parameter, because the two have different jobs. In chat there is
+     * room for ten segments and the extra resolution is useful. On the sidebar the longest line decides
+     * how wide the whole panel is, and a ten-segment bar was making it the widest line - so the panel
+     * grew to accommodate a level of precision nobody reads at a glance.
+     */
+    static String barShort(long xp) {
+        int filled = (int) Math.round(progress(xp) * 6);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 6; i++) {
+            sb.append(i < filled ? '\u2588' : '\u2591');
+        }
+        return sb.toString();
+    }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Path_java
 
 # ---- src/main/java/gg/laughtail/core/Roleplay.java ----

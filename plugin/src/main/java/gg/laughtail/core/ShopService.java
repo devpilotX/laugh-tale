@@ -194,8 +194,11 @@ final class ShopService {
     }
 
     private boolean buy(Player p, String[] args) {
+        // Bare /buy opens the shop, because that is what the owner asked for and it is the better
+        // default: with several hundred items nobody can be expected to know the exact Bukkit name of
+        // the thing they want. The typed form stays for when you do know it.
         if (args.length < 1) {
-            p.sendMessage(Component.text("Usage: /buy <item> [amount]", NamedTextColor.GRAY));
+            plugin.menu().openShop(p, null);
             return true;
         }
         final Material m;

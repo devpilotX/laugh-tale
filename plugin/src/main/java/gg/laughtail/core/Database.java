@@ -1236,8 +1236,8 @@ public final class Database {
      */
     private void movePrice(Connection c, Shop.Entry e, int unitsDelta) throws SQLException {
         long base = e.basePrice();
-        long floor = Math.max(1L, Math.round(base * 0.6));
-        long ceil = Math.round(base * 1.4);
+        long floor = Shop.minBuy(base);
+        long ceil = Math.round(base * Shop.BAND_CEIL);
 
         // Read the current price under the transaction's lock, then compute in Java.
         //
@@ -2503,4 +2503,26 @@ public final class Database {
             }
         }
         return out;
+    }
+    /**
+     * Writes a repaired base price, and pulls the current price inside the new band.
+     *
+     * Both in one statement. Lowering base without moving current would leave the row violating the
+     * band CHECK, and the next update to it would fail with a constraint error far from the cause.
+     */
+    void setBasePrice(String item, long newBase) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE shop_prices SET base_price = ?, "
+               + "current_price = LEAST(ROUND(? * 1.2), GREATEST(GREATEST(1, ROUND(? * 0.8)), ?)), "
+               + "sell_price = ?, updated_at = UTC_TIMESTAMP(3) WHERE item = ?")) {
+            ps.setLong(1, newBase);
+            ps.setLong(2, newBase);
+            ps.setLong(3, newBase);
+            ps.setLong(4, newBase);
+            ps.setLong(5, Shop.sellPrice(newBase));
+            ps.setString(6, item);
+            ps.executeUpdate();
+        }
     }}

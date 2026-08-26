@@ -239,6 +239,71 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
 
     private void runArbitrageAudit() {
         getServer().getScheduler().runTaskLater(this, () -> {
+            // REPAIR BEFORE AUDIT. The repair pass lowers any price a recipe could profit from; the
+            // audit then checks the result. Running the audit first and repairing afterwards would mean
+            // the shop closed on every boot and reopened a moment later, which is a worse experience
+            // than being correct quietly.
+            //
+            // Repairs are applied to the in-memory catalogue AND written to the price table, so the two
+            // cannot disagree - a repaired price that lived only in memory would come back wrong after a
+            // restart with an older jar.
+            // REPAIRS CASCADE, SO THIS ITERATES TO A FIXED POINT.
+            //
+            // Lowering the price of planks also lowers the cost of everything MADE from planks, which
+            // lowers what those items may safely be worth - so one pass fixes 113 items and leaves 166
+            // recipes still profitable. A single pass is not a partial fix here, it is a wrong one.
+            //
+            // Each pass can only lower prices, and a price cannot go below 1, so the loop must terminate.
+            // The cap is a safety net rather than an expectation; if it is ever reached the audit below
+            // still fails and the shop still closes, so the failure mode stays safe.
+            int applied = 0;
+            java.util.List<Arbitrage.Repair> toPersist = new java.util.ArrayList<>();
+            int pass = 0;
+            while (pass++ < 30) {
+                java.util.List<Arbitrage.Repair> repairs = Arbitrage.computeRepairs(getServer());
+                if (repairs.isEmpty()) break;
+                boolean changed = false;
+                for (Arbitrage.Repair r : repairs) {
+                    if (Shop.lowerPrice(r.material(), r.newPrice())) {
+                        applied++;
+                        toPersist.add(r);
+                        changed = true;
+                    }
+                }
+                if (!changed) break;
+            }
+            if (pass >= 30) {
+                getLogger().warning("Price repair did not settle in 30 passes. The audit below is the "
+                    + "authority - if it fails, the shop closes.");
+            }
+            // RECIPES ARE READ ON THE MAIN THREAD, PRICES ARE WRITTEN OFF IT.
+            //
+            // The first version of this did both here and row 25's guard threw immediately, which is
+            // exactly what that guard is for - it caught my own mistake before it reached a player. The
+            // split is not a workaround: reading the recipe registry needs the main thread, and writing
+            // several hundred rows must never happen on it.
+            if (!toPersist.isEmpty()) {
+                getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                    int written = 0;
+                    for (Arbitrage.Repair r : toPersist) {
+                        try {
+                            database.setBasePrice(r.material().name(), r.newPrice());
+                            written++;
+                        } catch (java.sql.SQLException ex) {
+                            getLogger().warning("could not persist repaired price for "
+                                + r.material() + ": " + ex.getMessage());
+                        }
+                    }
+                    getLogger().info("Price repair persisted for " + written + " item(s).");
+                });
+            }
+            if (applied > 0) {
+                getLogger().info("Price repair: " + (pass - 1) + " pass(es), lowered " + applied + " price(s) so no recipe can be "
+                    + "run at a profit. Examples: " + toPersist.stream().limit(4)
+                    .map(r -> r.material().name() + " " + r.oldPrice() + "->" + r.newPrice())
+                    .reduce((x, y) -> x + ", " + y).orElse("none"));
+            }
+
             int examined = Arbitrage.recipeCount(getServer());
             java.util.List<Arbitrage.Finding> findings = Arbitrage.audit(getServer());
             if (examined == 0) {
