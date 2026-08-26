@@ -462,3 +462,56 @@ Related: `"$D/plugins"/*.jar` is expanded by the calling shell and fails the sam
 2. `paper-world-defaults.yml` and `bukkit.yml` into the managed registry, if Phase 6 justifies the entity-range changes currently deferred under Law 5.
 3. **Phase 1 is blocked on owner input** - OA-10 store, OA-12 price, OA-13 legal text, OA-16 Discord. But its schema is already in place, so LuckPerms permission work and the rules-gate table can start early.
 4. **Q-41 must be answered before Phase 6.** Host memory available is now **473 MB** and has fallen with each required component. Spec 22.3's ~2.5 GB heap for 24 players cannot coexist with never-break rule 4 on this box. That is arithmetic, not opinion.
+
+
+---
+
+## Session 2, fourth block - the core plugin, Minecraft 26.2, and Phase 2
+
+### The single most important thing to know
+
+**The server moved from Minecraft 1.21.11 to 26.2** (D-0028), because the version pin was the cause of an unplayable server rather than a conservative choice. The owner connects with 26.2; ViaVersion translated every packet; GrimAC predicts movement *from* packets and set the player back. Matching the server to the client generation removed the translation entirely.
+
+**There is no anti-cheat.** GrimAC was tested twice and rejected twice, on different evidence each time - first the translation problem on 1.21.11, then on 26.2 where it loads and its packet layer dies (`NMS_ITEM_STACK_CLASS is null`). Acceptance **row 50 is unclaimable and has never been claimed**. On a server whose product is PvP fairness this is the top pre-launch blocker. **OA-27.**
+
+### What now exists that did not
+
+| Thing | State |
+| --- | --- |
+| **LaughTail core plugin** | Built from source on the host in a throwaway maven container. 0.1.0, 7 source files. Player registration on UUID, the rules gate with version stored (row 17), Section 7.2 gamerule enforcement, `/laughtail status`, `/laughtail reload` |
+| **Minecraft 26.2** | Paper 26.2-119, API `26.2.build.119-stable`, plugin compiled for **Java 25** |
+| **Five worlds** | `laughtail` 6000, `_nether` 2000, `_the_end` 3000, `_resource` 3000, `_arena` 512 (flat). Multiverse-Core 5.8.1-pre.3 |
+| **Section 7.2 rules** | keep_inventory false, fire spread false, mob griefing false, natural regen true - on all five, enforced on `WorldLoadEvent` |
+| **Owner account** | Now in the `owner` LuckPerms group with `laughtail.rules.bypass`. It had been left in `default` |
+
+### Things that will bite the next person
+
+**`sudo` never applies to the shell's own redirection or globs.** Seven instances this session. `sudo wc -l < file`, `sudo gzip -t < file`, bare `[ -f ]` inside the volume, `"$D/plugins"/*.jar`, `ls -1d "$D"/laughtail*`. The bare `[ -f ]` form is the dangerous one: it returns **false** for a file that exists and the script takes the wrong branch silently.
+
+**`grep -c` exits 1 on zero matches.** Under `pipefail` plus `set -e` that kills the script on a *clean* log. Three instances.
+
+**26.2 renamed the gamerules.** `doFireTick` is now `minecraft:fire_spread_radius_around_player`; `naturalRegeneration` is `minecraft:natural_health_regeneration`. Console commands using the old names return "Incorrect argument for command". Bukkit's `GameRule` constants still map correctly - which is why enforcing rules through the plugin is right by construction, not by luck.
+
+**Minecraft 26.x requires Java 25.** `class file has wrong version 69.0, should be 65.0`. A release-21 compile reports *every symbol as missing* rather than naming the version. maven-shade-plugin needed 3.6.2 for the same reason.
+
+**Never print a file containing a secret, redacted or not.** D-0026: a placeholder token quoted in a comment got substituted with the real password, and a `sed` that masked only `password:` lines let it through. Print facts *about* the file instead. The credential was rotated and verified dead.
+
+### Where Phase 2 actually stands
+
+Done: five worlds, borders, gamerules. **Not** done, each for a stated reason:
+
+* **Claims (7.3)** - the specification gives no accrual rate, starting allowance, minimum claim size or reclamation threshold. Rows 45 and 46 blocked on a **spec gap**, not on effort.
+* **Pregeneration (6.5)** - hours of sustained CPU on a **burstable** instance (OA-05) and several GB on a disk with ~6.5 GB free (OA-04).
+* **Resource-world reset (7.4)** - needs the script that "names the world explicitly and refuses to run against the main world". The world now exists, so this is buildable next.
+* **Spawn (7.5)** - a build, not a config.
+
+### Next, in order, for whoever picks this up
+
+1. **V2 migration**: `combat_ratings`, `combat_events`, `stats`, `punishments`, `staff_audit`. Pure schema, no blockers.
+2. **Resource-world reset script** (7.4) with the explicit-name refusal, plus a backup immediately before.
+3. **Combat tagging and stats** in the plugin. Note the Elo constants themselves are blocked: **Q-11 to Q-13** record three internal contradictions in Appendix B.
+4. **Do not run Phase 6** until **Q-41** (memory) and **OA-05** (burstable) are answered. Host memory available is ~560 MB with nobody online.
+
+### Owner actions that block whole phases
+
+**OA-02** no git remote - 42 commits exist on one PC. **OA-03** no host snapshot. **OA-10/12/13** store, price, legal text - Phase 1's paywall cannot start. **OA-16** Discord webhook - monitoring detects but cannot alert. **OA-27** anti-cheat. **Q-10** the economy has no numbers anywhere in the specification, which blocks Phase 3 and everything behind it.
