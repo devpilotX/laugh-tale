@@ -1,0 +1,7 @@
+#!/bin/sh
+# .githooks/pre-commit - shim. The logic lives in scripts/hooks/pre-commit.ps1 so
+# it is reviewable as a normal file rather than hidden inside .git/, which is not
+# version controlled and so cannot be shared or audited.
+#
+# Enable with: powershell -File scripts/install-hooks.ps1
+exec powershell -NoProfile -ExecutionPolicy Bypass -File scripts/hooks/pre-commit.ps1
