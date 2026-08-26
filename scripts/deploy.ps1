@@ -118,6 +118,10 @@ Write-Output ("mode       : {0}" -f $(if ($DryRun) { 'DRY RUN' } else { 'live' }
 # Checked first and locally: there is no point stopping a running server to find
 # out a checksum is wrong or a secret was committed.
 Invoke-Stage -Name 'verify manifest checksums' -Local -LocalScript 'verify-manifest.ps1'
+# Row 25 is a structural guarantee maintained by hand, so it is checked mechanically. A missing
+# guard does not error - it freezes the server for the length of a query - which is the hardest
+# class of bug to attribute after the fact.
+Invoke-Stage -Name 'verify row 25 thread guards' -Local -LocalScript 'check-db-thread-guard.ps1'
 Invoke-Stage -Name 'no secrets in the repository' -Local -LocalScript 'check-no-secrets.ps1'
 Invoke-Stage -Name 'no hardcoded host values (row 2)' -Local -LocalScript 'check-hardcoded.ps1'
 Invoke-Stage -Name 'destructive-command guard tests' -Local -LocalScript 'guard.tests.ps1'

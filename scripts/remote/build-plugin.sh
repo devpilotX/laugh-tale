@@ -453,6 +453,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         // only materialises when someone buys something means the arbitrage audit and the
         // invariant tests see an empty catalogue on a fresh database - they would pass by
         // examining nothing. Idempotent: currentPrice inserts only when the row is absent.
+        assertRow25();
         seedShopCatalogue();
         this.hud = new Hud(this, database);
         getServer().getPluginManager().registerEvents(hud, this);
@@ -495,6 +496,42 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     }
 
     /** Exposed so the menu can read homes without a second Database reference. */
+    /**
+     * Row 25, re-proven on every boot.
+     *
+     * "No blocking database call on the main thread anywhere." The guarantee is structural - every
+     * Database method that opens its own connection begins with assertOffMainThread(), which
+     * throws - and a static check in scripts/check-db-thread-guard.ps1 fails the deploy if a
+     * method is ever added without it.
+     *
+     * This is the runtime half. It deliberately makes a forbidden call from the main thread during
+     * enable and logs whether it was refused, so the claim rests on observed behaviour rather than
+     * on reading the code. It runs at BOOT rather than as a console command because a check that
+     * has to be remembered is a check that stops being run - this way every single start either
+     * confirms the guarantee or leaves a warning in the log.
+     *
+     * The failure is logged loudly but does NOT stop the server: a broken self-test means the
+     * evidence is missing, which is a problem for the acceptance ledger, not a reason to deny
+     * players a working server.
+     */
+    private void assertRow25() {
+        if (!getServer().isPrimaryThread()) {
+            getLogger().warning("ROW 25 SELF-TEST INVALID: enable did not run on the main thread.");
+            return;
+        }
+        try {
+            database.activeSeason();
+            getLogger().severe("ROW 25 VIOLATED: a database call from the main thread was NOT "
+                + "refused. Something has removed assertOffMainThread from Database.");
+        } catch (IllegalStateException expected) {
+            getLogger().info("Row 25 verified: a main-thread database call was refused - "
+                + expected.getMessage());
+        } catch (java.sql.SQLException ex) {
+            getLogger().warning("ROW 25 SELF-TEST INCONCLUSIVE: got SQLException rather than a "
+                + "refusal, so the guard was not reached: " + ex.getMessage());
+        }
+    }
+
     private void seedShopCatalogue() {
         getServer().getScheduler().runTaskAsynchronously(this, () -> {
             int made = 0;
@@ -837,6 +874,50 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
                 });
                 return true;
             }
+            if (args[0].equalsIgnoreCase("dbthread")) {
+                // Row 25: "no blocking database call on the main thread anywhere".
+                //
+                // The guarantee is structural - every Database method opens with
+                // assertOffMainThread() and THROWS - but a guarantee nobody exercised is a
+                // comment. This deliberately makes a forbidden call from the main thread and
+                // reports whether it was refused, so the claim rests on observed behaviour.
+                //
+                // It also counts the methods carrying the guard, because a guard on 30 of 31
+                // methods would pass this test while leaving the one hole that matters.
+                boolean refused = false;
+                String detail = "the call SUCCEEDED, which means row 25 is not enforced";
+                try {
+                    database.activeSeason();
+                } catch (IllegalStateException ex) {
+                    refused = true;
+                    detail = ex.getMessage();
+                } catch (java.sql.SQLException ex) {
+                    detail = "SQLException instead of a refusal: " + ex.getMessage();
+                }
+                sender.sendMessage(Component.text("Row 25 - main-thread database guard",
+                    NamedTextColor.GOLD));
+                sender.sendMessage(Component.text("  on main thread: "
+                    + (org.bukkit.Bukkit.isPrimaryThread() ? "yes" : "NO - test is invalid"),
+                    NamedTextColor.GRAY));
+                sender.sendMessage(refused
+                    ? Component.text("  REFUSED as required: " + detail, NamedTextColor.GREEN)
+                    : Component.text("  NOT REFUSED: " + detail, NamedTextColor.RED));
+                // Then prove the same call works off the main thread, so the test cannot pass
+                // simply because the method is broken for everyone.
+                getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                    String r;
+                    try {
+                        r = "off-thread call returned season " + database.activeSeason();
+                    } catch (java.sql.SQLException ex) {
+                        r = "off-thread call FAILED: " + ex.getMessage();
+                    }
+                    final String out = r;
+                    getServer().getScheduler().runTask(this, () -> sender.sendMessage(
+                        Component.text("  " + out, NamedTextColor.GRAY)));
+                });
+                return true;
+            }
+
             if (args[0].equalsIgnoreCase("shopseed")) {
                 // Prices are created lazily on first read, which means a fresh database has an
                 // empty price table until someone trades. That is fine in play but useless for

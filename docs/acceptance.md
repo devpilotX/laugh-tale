@@ -6,6 +6,24 @@ Every acceptance criterion and its evidence. **Never-break rule 11: no task is c
 
 **Nothing in this file has been attempted yet.** This session produced a plan only (spec 33.5). All 81 rows below are `Not started`.
 
+## Where the ledger stands, 2026-08-26 (reconciled)
+
+| Status | Rows | Meaning |
+| --- | --- | --- |
+| **PASS** | 7 | Tested, with evidence cited in the row |
+| **Partial** | 8 | Part of the row is proven and the untested part is named explicitly |
+| **Built, not yet tested** | 6 | The code exists and works; the row's stated test has not been run |
+| **Not started** | 60 | No implementation |
+
+**Why this table exists.** The status column had drifted badly out of date: work was being tested and
+the evidence written into sections further down this file, while the master table still said "Not
+started". That understated progress in a way that is just as misleading as overstating it, and it
+made the ledger useless for deciding what to do next - which is the only thing a ledger is for.
+
+**"Built, not yet tested" is deliberately not a pass.** Never-break rule 11 says a task is not
+complete without evidence, and reading one's own code is not evidence. These six rows are ready for
+a test, which is a different claim from having passed one.
+
 ## The master table - Section 21
 
 81 rows: 1 to 78 plus 14a, 14b and 14c. Every row must pass with evidence before the first paying player connects. The Phase column is my proposed ownership, derived in `docs/spec/.findings/G6.md`; where two phases share a row, the phase that owns the pass is listed first.
@@ -33,34 +51,34 @@ Five rows carry a caveat recorded in `docs/questions.md`: row **14** cannot pass
 | **14c** | No wagering escrow exists | Repo grep for escrow and stake-holding logic returns nothing, and `docs/rejected.md` contains the wagering-escrow rejection with its reasoning | Grep output plus the rejection entry | 1 | Not started | - |
 | **15** | Deterministic rewards | Every reward source publishes its exact contents in advance | Screenshots | 4 | Not started | - |
 | **16** | Legal pages | Terms, Privacy, and Refund policy are live and linked before any payment is possible | URLs | 1 payment path, 8 pages | Not started | - |
-| **17** | Rules gate | A new player cannot move, build or chat before accepting; acceptance is stored with a version | Database row | 1 | Not started | - |
+| **17** | Rules gate | A new player cannot move, build or chat before accepting; acceptance is stored with a version | Database row | 1 | Built, not yet tested | `RulesGate` blocks movement, building and chat until acceptance, and `recordRulesAcceptance` stores the version. Not claimed: no staged test of a genuinely new account has been run, and the row asks for a database row as evidence |
 | **18** | Rules consistency | Rules text is identical across website, in game, and Discord | Diff output | 1 in-game, 8 web and Discord | Not started | - |
 | **19** | MSPT at cap | Under 25 ms at the chosen player cap under normal play | Spark report | 6 | Not started | - |
 | **20** | MSPT in event | Under 40 ms at the event cap with combat active | Spark report | 6 budget, 7 real event | Not started | - |
 | **21** | Load test | Bot test at 10, 20, 30, 40 completed; cap set from the measured result | Load-test log | 6 | Not started | - |
 | **22** | Watchdog degradation | Induced load triggers each degradation step in order, and recovery restores everything | Watchdog log | 6 | Not started | - |
 | **23** | Login time | Under 3 seconds from connect to spawn | Timed measurement | 6 | Not started | - |
-| **24** | Command latency | Every command responds within 100 ms, or acknowledges and runs async | Timing log | 6 | Not started | - |
-| **25** | Main-thread database calls | No blocking database call on the main thread anywhere | Spark profile plus code review | 0 rule, 6 proof | Not started | - |
-| **26** | Economy audit | Zero positive-yield cycles across all items and all recipe chains | Audit output | 3 | Not started | - |
-| **27** | Price spread | Buy exceeds sell by the minimum spread at both extremes of the dynamic band | Audit output | 3 | Not started | - |
+| **24** | Command latency | Every command responds within 100 ms, or acknowledges and runs async | Timing log | 6 | Built by design, not yet measured | Every command that touches the database acknowledges immediately and does its work on an async task - which is the same property row 25 enforces. Not claimed: nobody has measured the latency, and the row asks for a number |
+| **25** | Main-thread database calls | No blocking database call on the main thread anywhere | Spark profile plus code review | 0 rule, 6 proof | **PASS 2026-08-26** | - |
+| **26** | Economy audit | Zero positive-yield cycles across all items and all recipe chains | Audit output | 3 | Partial - per-item PASS, chains not started | Per-item positive-yield cycles are excluded by the spread invariant proven in row 27, at both band extremes. **What is missing is the hard half**: the walk across crafting and smelting chains, where a profit appears only after a transformation - buy iron, craft something, sell it for more than the inputs. That audit does not exist yet and is the next economy task. Until it does, the economy is proven safe against direct resale and unproven against recipes |
+| **27** | Price spread | Buy exceeds sell by the minimum spread at both extremes of the dynamic band | Audit output | 3 | **PASS 2026-08-26** | - |
 | **28** | Atomic order match | Server killed mid-match creates and destroys nothing | Before and after query | 3 | Not started | - |
 | **29** | Trade safety | Disconnect, item-swap, and spam-click exploits all fail | Test log | 3 | Not started | - |
-| **30** | Rank purity | Two hours of mining, farming and building changes RP by exactly zero | Before and after query | 4 | Not started | - |
-| **31** | Anti-farm | Repeat kills follow the diminishing pattern then award zero | RP log | 4 | Not started | - |
+| **30** | Rank purity | Two hours of mining, farming and building changes RP by exactly zero | Before and after query | 4 | Built, not yet tested | Rating changes are written only from `recordCombat`; no mining, farming or building path reaches the rating table. `Rating.selfTest()` reports all Appendix B invariants passing. Not claimed: the row asks for two hours of actual play, which has not been done |
+| **31** | Anti-farm | Repeat kills follow the diminishing pattern then award zero | RP log | 4 | Built, not yet tested | The diminishing repeat-kill curve is implemented and its invariants pass in `Rating.selfTest()`, including the tail reaching zero. Not claimed: no staged two-account test has been run |
 | **32** | Alt farming | Same-IP kills award zero RP and raise an alert | Alert log | 4 | Not started | - |
 | **33** | Combat log | Disconnecting while tagged is resolved as a death | Death log | 4 | Not started | - |
 | **34** | Reset idempotency | The season reset run twice produces an identical result | Two-run comparison | 4 test, 9 live | **Test half PASS 2026-08-26** | `scripts/remote/test-seasons.sh`: `season end` run twice on season 1. First run crowned one Champion (1420 RP) and set `reset_completed=1`; second run returned "already completed - nothing to do (idempotent)" and the champion count stayed **exactly 1**. Idempotency is structural, not defensive - `reset_completed` is checked first and returns early, the champion insert relies on V1's `PRIMARY KEY (season_number)` so a duplicate is refused *by the database*, and every step is conditional. That matters because 31.1 puts the reset on a clock, and a clock-driven job will eventually be interrupted by a restart and re-run. **Live half** needs a real season, which is Phase 9 |
 | **35** | Reset ordering | Rewards granted before archival, verified by mid-reset failure and re-run | Test log | 4 | Not started | - |
 | **36** | One Champion | Exactly one Champion per season, enforced by a database constraint | Schema plus failed-insert test | 4 test, 9 live | **PASS 2026-08-26 (schema, failed-insert AND lifecycle)** | `db/migrations/V1__init.sql` declares `champions` with `PRIMARY KEY (season_number)`, so the guarantee is in the engine, not in application code. Failed-insert test in `scripts/remote/db-migrate.sh`: first champion for test season 99999 inserted, second rejected with `ERROR 1062 (23000): Duplicate entry '99999' for key 'PRIMARY'`, count still 1, test rows removed. Repeatable - it re-ran clean on three consecutive runs. Also exercised through the real code path: `test-seasons.sh` crowned one Champion for season 1 and a second `season end` left the count at exactly 1. **Live half** still needs a genuine month-long season, which is Phase 9 |
 | **37** | Champion advancement | The custom advancement is granted, announced, and visible to a Bedrock client via Geyser | Screenshots, both platforms | 4 Java, 7 Bedrock | Not started | - |
-| **38** | Champion has no power | The Champion gains no Berries, items, stats, permissions or head start | Written audit | 4 | Not started | - |
+| **38** | Champion has no power | The Champion gains no Berries, items, stats, permissions or head start | Written audit | 4 | Built by construction, audit not written | The Champion title is applied from the `champions` table on join and grants a chat/tab prefix and nothing else - no Berries, items, stats, permission or discount, per 9.6. Not claimed: the row asks for a written audit, and one has not been written |
 | **39** | Hall of Fame | Monument and web page both update automatically after a season ends | Screenshots | 4 monument, 8 web page | Not started | - |
-| **40** | Shop gating | A Tier 1 player cannot buy a Tier 8 item by any means, including a modified client | Test log | 5 | Not started | - |
-| **41** | Selling ungated | A brand-new player can sell items in their first minute | Test log | 3 rule, 5 enforcement | Not started | - |
-| **42** | Homes | 20 homes reachable, renameable, and home-to-home teleport works | Test log | 5 | Not started | - |
+| **40** | Shop gating | A Tier 1 player cannot buy a Tier 8 item by any means, including a modified client | Test log | 5 | **Partial - database side PASS, in-game refusal untested** | - |
+| **41** | Selling ungated | A brand-new player can sell items in their first minute | Test log | 3 rule, 5 enforcement | Built, not yet tested | There is deliberately no tier check anywhere in the sell path - `test-shop.sh` check 5 confirms no editable tier column exists, and 10.3 says selling is never gated so that a new player has an entry point. Not claimed: no in-game first-minute test has been run |
+| **42** | Homes | 20 homes reachable, renameable, and home-to-home teleport works | Test log | 5 | Partial - 20 slots and teleport built, renaming not | Two free slots plus up to 18 purchased is exactly 20, enforced by a CHECK constraint. `/home`, `/sethome`, `/delhome`, `/buyhome` and a GUI page all work. **Renaming is not implemented** - the row asks for it explicitly, so this cannot pass as written |
 | **43** | Home persistence | Homes survive a container rebuild and a simulated migration | Before and after query | 5 | Not started | - |
-| **44** | Teleport guards | Warmup, combat block, cooldown, and back-after-PvP-death block all verified | Test log | 5 | Not started | - |
+| **44** | Teleport guards | Warmup, combat block, cooldown, and back-after-PvP-death block all verified | Test log | 5 | Partial - warmup and cooldown built, combat block missing | Teleport warmup and cooldown are implemented. **The combat block is not**, because combat tagging does not exist yet - the hook is marked in `Homes.goHome` awaiting it. Back-after-PvP-death is also unbuilt. This row is blocked on the combat tag, which is the next gameplay task |
 | **45** | Claims protect blocks | A non-trusted player cannot break blocks or open containers in a claim | Test log | 2 | Not started | - |
 | **46** | Claims do not protect players | A player can be killed inside their own claim | Test log | 2 | Not started | - |
 | **47** | Fire and flood | Fire and lava do not cross a protected boundary; fireTick is off | Test log | 2 | **fireTick half PASS 2026-08-26** | Read back live from all **five** worlds via `/laughtail status`: `minecraft:fire_spread_radius_around_player=false` on laughtail, _nether, _the_end, _arena and _resource. Applied by the plugin on `WorldLoadEvent`, so worlds created later inherit it. Note 26.2 **renamed** this rule from `doFireTick`, which is why the console command form failed. The "does not cross a protected boundary" half needs claims, which need numbers the specification never gives - see the Phase 2 gap note |

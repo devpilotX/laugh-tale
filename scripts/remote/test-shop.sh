@@ -91,6 +91,37 @@ echo "  ... and the cheapest:"
 q "SELECT item, category, base_price, current_price, sell_price FROM shop_prices ORDER BY base_price ASC, item LIMIT 4;" \
   | awk 'NF{printf "  %-22s %-8s %6s %8s %6s\n",$1,$2,$3,$4,$5}'
 
+echo "=== 7. row 27: the spread holds at BOTH EXTREMES of the dynamic band ==="
+# Checking today's prices is not enough. Row 27 asks whether buy still exceeds sell by the minimum
+# spread at the FLOOR (0.6x base) and the CEILING (1.4x base) - the two places the elasticity can
+# push a price. If the spread inverted at either end, a player could drive the price to that end
+# and then print Berries, and no test of the current price would ever notice.
+#
+# FLOOR(x * 0.88) is the same arithmetic Shop.sellPrice performs, applied to the extremes rather
+# than to the stored value.
+LOWBAD=$(q "SELECT COUNT(*) FROM shop_prices WHERE FLOOR(GREATEST(1, ROUND(base_price*0.6)) * 0.88) >= GREATEST(1, ROUND(base_price*0.6));")
+HIGHBAD=$(q "SELECT COUNT(*) FROM shop_prices WHERE FLOOR(ROUND(base_price*1.4) * 0.88) >= ROUND(base_price*1.4);")
+echo "  at the floor (0.6x base):   $LOWBAD item(s) would invert"
+echo "  at the ceiling (1.4x base): $HIGHBAD item(s) would invert"
+if [ "$LOWBAD" = "0" ] && [ "$HIGHBAD" = "0" ]; then
+  ok "buy exceeds sell at both extremes for every item - the band cannot be driven to a profit"
+else
+  bad "the spread inverts at a band extreme: floor $LOWBAD, ceiling $HIGHBAD"
+  q "SELECT item, base_price, GREATEST(1,ROUND(base_price*0.6)) AS at_floor, FLOOR(GREATEST(1,ROUND(base_price*0.6))*0.88) AS sell_at_floor FROM shop_prices WHERE FLOOR(GREATEST(1, ROUND(base_price*0.6)) * 0.88) >= GREATEST(1, ROUND(base_price*0.6)) LIMIT 5;"
+fi
+
+echo "=== 8. the cheapest items, where rounding is most dangerous ==="
+# A 1-Berry item is the interesting case: 12% of 1 rounds to nothing, so an implementation that
+# rounded would sell it back for 1 and print a Berry per trade. These must all sell for strictly
+# less than they cost.
+q "SELECT item, current_price, sell_price FROM shop_prices WHERE current_price <= 4 ORDER BY current_price, item;" \
+  | awk 'NF{printf "  %-20s buy %-4s sell %-4s %s\n",$1,$2,$3,($3<$2?"ok":"INVERTED")}'
+CHEAPBAD=$(q "SELECT COUNT(*) FROM shop_prices WHERE current_price <= 4 AND sell_price >= current_price;")
+if [ "$CHEAPBAD" = "0" ]; then
+  ok "every cheap item sells for strictly less than it costs"
+else
+  bad "$CHEAPBAD cheap item(s) sell for at least what they cost"
+fi
 echo
 if [ "$FAIL" -eq 0 ]; then
   echo "SHOP INVARIANTS: all pass"
