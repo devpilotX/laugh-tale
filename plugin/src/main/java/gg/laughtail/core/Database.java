@@ -1039,6 +1039,19 @@ public final class Database {
         }
     }
 
+    /** Kills and deaths, for the HUD. Returns {kills, deaths}, zeroes when unrecorded. */
+    int[] killsAndDeaths(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT kills, deaths FROM stats WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? new int[] { rs.getInt(1), rs.getInt(2) } : new int[] { 0, 0 };
+            }
+        }
+    }
+
     /** Current RP for a season, or the starting value when unrated. */
     int currentRp(UUID uuid, int season) throws SQLException {
         assertOffMainThread();

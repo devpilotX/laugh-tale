@@ -1870,6 +1870,19 @@ public final class Database {
         }
     }
 
+    /** Kills and deaths, for the HUD. Returns {kills, deaths}, zeroes when unrecorded. */
+    int[] killsAndDeaths(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT kills, deaths FROM stats WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? new int[] { rs.getInt(1), rs.getInt(2) } : new int[] { 0, 0 };
+            }
+        }
+    }
+
     /** Current RP for a season, or the starting value when unrated. */
     int currentRp(UUID uuid, int season) throws SQLException {
         assertOffMainThread();
@@ -4855,8 +4868,11 @@ LT_SRC_EOF_src_main_java_gg_laughtail_core_Menu_java
 cat > "$SRC/src/main/java/gg/laughtail/core/Hud.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Hud_java'
 package gg.laughtail.core;
 
+import io.papermc.paper.scoreboard.numbers.NumberFormat;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextColor;
+import net.kyori.adventure.text.format.TextDecoration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -4866,40 +4882,61 @@ import org.bukkit.scoreboard.Criteria;
 import org.bukkit.scoreboard.DisplaySlot;
 import org.bukkit.scoreboard.Objective;
 import org.bukkit.scoreboard.Scoreboard;
+import org.bukkit.scoreboard.Team;
 
 import java.sql.SQLException;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * The sidebar HUD. Rank, season, Berries and homes, always visible.
+ * The sidebar HUD: icons, colour, and an animated title, with no score numbers.
  *
- * A scoreboard sidebar renders on the RIGHT of the screen, vertically centred, which is exactly
- * where the owner asked for it. It is also the only way to get persistent on-screen text that
- * works on a vanilla client and through Geyser for Bedrock - the action bar and the boss bar are
- * the alternatives and both are worse here: the action bar is transient and was already rejected
- * as spam, and a boss bar sits at the top and competes with 31.7's cosmetic budget.
+ * THE 1-9 ON THE RIGHT WERE SCOREBOARD SCORES. Every sidebar line has an integer score, and
+ * vanilla renders it in red down the right edge. The usual workarounds are ugly - hiding them
+ * behind long lines, or setting every score to the same value so they collapse. Paper 1.20.5 and
+ * later expose `Objective#numberFormat`, so `NumberFormat.blank()` removes them properly. This
+ * server is 26.2, so the correct tool exists and is used.
  *
- * DATA IS READ ASYNCHRONOUSLY AND CACHED. The sidebar refreshes every two seconds, but a
- * database read every two seconds per player would be 12 queries a minute each - 288 a minute at
- * 24 players, in a hot path, which is exactly the sort of thing acceptance row 25 exists to stop.
- * So values are fetched off the main thread every ten seconds into a per-player snapshot, and the
- * sidebar renders from the snapshot. Berries and rank do not change often enough for anyone to
- * notice ten seconds, and the alternative is a database call inside the tick loop.
+ * LINES ARE RENDERED THROUGH TEAM PREFIXES, not as entry strings. A scoreboard entry is limited
+ * and must be unique - which is why the previous version needed invisible padding like " " and
+ * "  " to make blank lines distinct, and why a changing value meant removing and re-adding an
+ * entry every refresh. Using a team per line with a fixed invisible entry and the visible text in
+ * the prefix means values update in place with no flicker and no uniqueness games.
  *
- * ONE LINE PER FACT, no decoration, no borders. The owner asked for clean and organised, and a
- * sidebar is small - every character spent on a box-drawing frame is a character not spent on
- * information.
+ * THE ANIMATION IS A SHIMMER ACROSS THE TITLE, nothing more. It updates only the objective's
+ * display name - one small packet per player per frame - at 5 frames a second. A moving sidebar
+ * body would be genuinely expensive and, worse, unreadable: the eye cannot read a number that is
+ * changing colour. So the data stays still and only the header moves, which is the effect people
+ * actually mean by "animated scoreboard".
+ *
+ * COST, stated because 31.7 puts a budget on decoration: 5 title packets per second per player,
+ * 120 a second at 24 players. That is trivial next to movement and chunk traffic, and it is
+ * deliberately the ONLY animated element. If MSPT ever comes under pressure this is the first
+ * thing that should be switched off, and the watchdog in 6.6 is where that switch belongs.
  */
 final class Hud implements Listener {
 
     private record Snapshot(long berries, int rp, String tier, int season, int homes,
-                            int homeMax, int champTitles) { }
+                            int homeMax, int champTitles, int kills, int deaths) { }
+
+    /** The shimmer palette - gold moving through pale yellow and back. */
+    private static final List<TextColor> SHIMMER = List.of(
+        TextColor.fromHexString("#FFB302"),
+        TextColor.fromHexString("#FFC93C"),
+        TextColor.fromHexString("#FFE07D"),
+        TextColor.fromHexString("#FFF3C4"),
+        TextColor.fromHexString("#FFE07D"),
+        TextColor.fromHexString("#FFC93C")
+    );
+
+    private static final String TITLE_TEXT = "LAUGH TALE";
 
     private final LaughTailPlugin plugin;
     private final Database db;
     private final Map<UUID, Snapshot> cache = new ConcurrentHashMap<>();
+    private int frame = 0;
 
     Hud(LaughTailPlugin plugin, Database db) {
         this.plugin = plugin;
@@ -4907,16 +4944,18 @@ final class Hud implements Listener {
     }
 
     void start() {
-        // Render often, read rarely. See the class note.
-        plugin.getServer().getScheduler().runTaskTimer(plugin, this::renderAll, 40L, 40L);
+        // Body every second: values change slowly and a redraw is cheap.
+        plugin.getServer().getScheduler().runTaskTimer(plugin, this::renderAll, 20L, 20L);
+        // Title every 4 ticks: 5 frames a second is smooth enough to read as movement without
+        // being a flicker.
+        plugin.getServer().getScheduler().runTaskTimer(plugin, this::animateAll, 20L, 4L);
+        // Data every 10 seconds, off the main thread. See the class note on row 25.
         plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, this::refreshAll,
             20L, 200L);
     }
 
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
-        // Refresh immediately rather than waiting up to ten seconds, so a joining player does
-        // not see an empty or stale sidebar - first impressions are 7.5's whole argument.
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin,
             () -> refresh(e.getPlayer().getUniqueId()));
     }
@@ -4927,76 +4966,140 @@ final class Hud implements Listener {
     }
 
     private void refreshAll() {
-        for (Player p : plugin.getServer().getOnlinePlayers()) {
-            refresh(p.getUniqueId());
-        }
+        for (Player p : plugin.getServer().getOnlinePlayers()) refresh(p.getUniqueId());
     }
 
     private void refresh(UUID id) {
         try {
-            long berries = db.balance(id);
             int season = db.activeSeason();
             int rp = db.currentRp(id, season);
-            int homes = db.homeNames(id).size();
-            int purchased = db.purchasedSlots(id);
-            int champs = db.championSeasons(id).size();
-            cache.put(id, new Snapshot(berries, rp, Rating.tierName(rp), season, homes,
-                Math.min(Homes.MAX_HOMES, Homes.FREE_SLOTS + purchased), champs));
+            int[] kd = db.killsAndDeaths(id);
+            cache.put(id, new Snapshot(
+                db.balance(id), rp, Rating.tierName(rp), season,
+                db.homeNames(id).size(),
+                Math.min(Homes.MAX_HOMES, Homes.FREE_SLOTS + db.purchasedSlots(id)),
+                db.championSeasons(id).size(), kd[0], kd[1]));
         } catch (SQLException e) {
-            // A failed refresh leaves the previous snapshot in place rather than blanking the
-            // sidebar. Stale information is better than a display that flickers empty on every
-            // transient database hiccup.
-            plugin.getLogger().fine("HUD refresh failed for " + id + ": " + e.getMessage());
+            // Keep the previous snapshot. Stale beats a sidebar that flickers empty.
+            plugin.getLogger().fine("HUD refresh failed: " + e.getMessage());
         }
     }
 
-    private void renderAll() {
-        for (Player p : plugin.getServer().getOnlinePlayers()) {
-            Snapshot s = cache.get(p.getUniqueId());
-            if (s == null) continue;
-            render(p, s);
-        }
-    }
+    // ---- rendering -----------------------------------------------------------
 
-    private void render(Player p, Snapshot s) {
+    private Objective objectiveFor(Player p) {
         Scoreboard board = p.getScoreboard();
-        // A player on the main shared scoreboard must be given their own, or every player would
-        // see the same numbers.
         if (board == plugin.getServer().getScoreboardManager().getMainScoreboard()) {
             board = plugin.getServer().getScoreboardManager().getNewScoreboard();
             p.setScoreboard(board);
         }
         Objective o = board.getObjective("laughtail");
         if (o == null) {
-            o = board.registerNewObjective("laughtail", Criteria.DUMMY,
-                Component.text("Laugh Tale", NamedTextColor.GOLD));
+            o = board.registerNewObjective("laughtail", Criteria.DUMMY, title(0));
             o.setDisplaySlot(DisplaySlot.SIDEBAR);
+            // The whole reason the numbers are gone.
+            o.numberFormat(NumberFormat.blank());
         }
-
-        // Scoreboard lines are keyed by entry string, so a changing value needs the old entry
-        // removed or lines accumulate. Rebuilding is simpler and cheap at this size.
-        for (String entry : board.getEntries()) {
-            board.resetScores(entry);
-        }
-
-        int line = 9;
-        set(o, line--, "\u00A77Rank \u00A7f" + s.tier());
-        set(o, line--, "\u00A77RP \u00A7f" + s.rp());
-        set(o, line--, " ");
-        set(o, line--, "\u00A77Berries \u00A76" + s.berries());
-        set(o, line--, "  ");
-        set(o, line--, "\u00A77Homes \u00A7f" + s.homes() + "\u00A78/" + s.homeMax());
-        if (s.champTitles() > 0) {
-            set(o, line--, "\u00A77Titles \u00A76" + s.champTitles() + " \u00A7eChampion");
-        }
-        set(o, line--, "   ");
-        set(o, line--, s.season() > 0
-            ? "\u00A77Season \u00A7f" + s.season()
-            : "\u00A78no active season");
+        return o;
     }
 
-    private void set(Objective o, int line, String text) {
-        o.getScore(text).setScore(line);
+    /** The shimmering header. Each character takes its colour from a moving offset. */
+    private Component title(int f) {
+        Component out = Component.text("\u2726 ", TextColor.fromHexString("#FFF3C4"));
+        for (int i = 0; i < TITLE_TEXT.length(); i++) {
+            TextColor c = SHIMMER.get(Math.floorMod(i + f, SHIMMER.size()));
+            out = out.append(Component.text(String.valueOf(TITLE_TEXT.charAt(i)), c)
+                .decoration(TextDecoration.BOLD, true));
+        }
+        return out.append(Component.text(" \u2726", TextColor.fromHexString("#FFF3C4")));
+    }
+
+    private void animateAll() {
+        frame++;
+        for (Player p : plugin.getServer().getOnlinePlayers()) {
+            if (cache.containsKey(p.getUniqueId())) {
+                objectiveFor(p).displayName(title(frame));
+            }
+        }
+    }
+
+    private void renderAll() {
+        for (Player p : plugin.getServer().getOnlinePlayers()) {
+            Snapshot s = cache.get(p.getUniqueId());
+            if (s != null) render(p, s);
+        }
+    }
+
+    /**
+     * One team per line. The entry is an invisible unique marker and the visible text lives in
+     * the team prefix, so a value can change without removing and re-adding anything.
+     */
+    private void line(Scoreboard board, Objective o, int index, Component text) {
+        String key = "lt" + index;
+        Team t = board.getTeam(key);
+        if (t == null) {
+            t = board.registerNewTeam(key);
+            // A colour code as the entry: invisible, unique per line, and stable.
+            t.addEntry("\u00A7" + "0123456789abcdef".charAt(index % 16) + "\u00A7r");
+        }
+        t.prefix(text);
+        o.getScore(t.getEntries().iterator().next()).setScore(30 - index);
+    }
+
+    private void render(Player p, Snapshot s) {
+        Objective o = objectiveFor(p);
+        Scoreboard board = p.getScoreboard();
+        int i = 0;
+
+        line(board, o, i++, Component.text("\u2694 ", NamedTextColor.RED)
+            .append(Component.text("Rank ", NamedTextColor.GRAY))
+            .append(Component.text(s.tier(), NamedTextColor.WHITE)));
+
+        line(board, o, i++, Component.text("\u2605 ", NamedTextColor.AQUA)
+            .append(Component.text("RP ", NamedTextColor.GRAY))
+            .append(Component.text(String.valueOf(s.rp()), NamedTextColor.WHITE)));
+
+        line(board, o, i++, Component.text("\u2620 ", NamedTextColor.DARK_RED)
+            .append(Component.text("K/D ", NamedTextColor.GRAY))
+            .append(Component.text(s.kills() + "/" + s.deaths(), NamedTextColor.WHITE)));
+
+        line(board, o, i++, Component.empty());
+
+        line(board, o, i++, Component.text("\u25C8 ", NamedTextColor.GOLD)
+            .append(Component.text("Berries ", NamedTextColor.GRAY))
+            .append(Component.text(String.valueOf(s.berries()), NamedTextColor.YELLOW)));
+
+        line(board, o, i++, Component.text("\u2302 ", NamedTextColor.GREEN)
+            .append(Component.text("Homes ", NamedTextColor.GRAY))
+            .append(Component.text(s.homes() + "/" + s.homeMax(), NamedTextColor.WHITE)));
+
+        if (s.champTitles() > 0) {
+            line(board, o, i++, Component.text("\u265B ", NamedTextColor.GOLD)
+                .append(Component.text("Champion ", NamedTextColor.GRAY))
+                .append(Component.text("x" + s.champTitles(), NamedTextColor.GOLD)));
+        }
+
+        line(board, o, i++, Component.empty());
+
+        line(board, o, i++, s.season() > 0
+            ? Component.text("\u25F7 ", NamedTextColor.LIGHT_PURPLE)
+                .append(Component.text("Season ", NamedTextColor.GRAY))
+                .append(Component.text(String.valueOf(s.season()), NamedTextColor.WHITE))
+            : Component.text("\u25F7 ", NamedTextColor.DARK_GRAY)
+                .append(Component.text("No active season", NamedTextColor.DARK_GRAY)));
+
+        line(board, o, i++, Component.text("\u2726 ", TextColor.fromHexString("#FFE07D"))
+            .append(Component.text("/menu", NamedTextColor.WHITE)));
+
+        // Any line left over from a previous render - for instance the Champion line after a
+        // reset - must be removed or it would linger with stale text.
+        for (int stale = i; stale < 16; stale++) {
+            Team t = board.getTeam("lt" + stale);
+            if (t != null) {
+                for (String entry : t.getEntries()) board.resetScores(entry);
+                t.unregister();
+            }
+        }
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Hud_java
