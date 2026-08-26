@@ -63,11 +63,15 @@ final class Hud implements Listener {
      * family (amber to gold) plus two cool accents, which is the smallest palette that still lets
      * each line be told apart at a glance.
      *
-     * Labels are grey and values white, so the eye lands on the number rather than the word.
+     * LABELS ARE A SOFT STEEL BLUE RATHER THAN GREY. Grey reads as disabled - it is the colour every
+     * interface uses for text you are not meant to act on - so a whole panel of grey labels looks
+     * switched off. A desaturated blue sits opposite the warm gold header on the colour wheel, which
+     * is what makes the two look chosen rather than merely coexisting, and it stays readable against
+     * both a bright sky and dark stone. Values remain pure white so the eye still lands on the number.
      */
-    private static final TextColor LABEL       = TextColor.fromHexString("#8A8F98");
+    private static final TextColor LABEL       = TextColor.fromHexString("#9FB4C7");
     private static final TextColor VALUE       = TextColor.fromHexString("#FFFFFF");
-    private static final TextColor BAR         = TextColor.fromHexString("#5A6570");
+    private static final TextColor BAR         = TextColor.fromHexString("#46586B");
     private static final TextColor ACCENT_WARM  = TextColor.fromHexString("#E8734A");
     private static final TextColor ACCENT_GOLD  = TextColor.fromHexString("#F2B33D");
     private static final TextColor ACCENT_COOL  = TextColor.fromHexString("#5BA8D4");
@@ -81,8 +85,15 @@ final class Hud implements Listener {
         TextColor.fromHexString("#F7C765")
     );
 
-    // Shorter than "LAUGH TALE": the header sets the sidebar's minimum width, so a long title makes
-    // every line below it sit further from the edge of the screen.
+    /**
+     * THE TITLE SETS THE SIDEBAR'S WIDTH, which is the whole reason this is short.
+     *
+     * Minecraft sizes the sidebar box to its widest line and then hugs the right edge of the screen.
+     * The title was the widest line by far, so every data line below it sat with dead space beside it -
+     * the "massive gap" the owner described. Trimming the title from a decorated fourteen characters to
+     * ten pulls the entire panel narrower, and the gap closes because there is no longer a long line
+     * forcing the box wide.
+     */
     private static final String TITLE_TEXT = "LAUGH TALE";
 
     private final LaughTailPlugin plugin;
@@ -166,13 +177,13 @@ final class Hud implements Listener {
 
     /** The shimmering header. Each character takes its colour from a moving offset. */
     private Component title(int f) {
-        Component out = Component.text("\u2726 ", TextColor.fromHexString("#FFF3C4"));
+        Component out = Component.empty();
         for (int i = 0; i < TITLE_TEXT.length(); i++) {
             TextColor c = SHIMMER.get(Math.floorMod(i + f, SHIMMER.size()));
             out = out.append(Component.text(String.valueOf(TITLE_TEXT.charAt(i)), c)
                 .decoration(TextDecoration.BOLD, true));
         }
-        return out.append(Component.text(" \u2726", TextColor.fromHexString("#FFF3C4")));
+        return out;
     }
 
     private void animateAll() {
@@ -234,7 +245,7 @@ final class Hud implements Listener {
             line(board, o, i++, Component.text("\u2692 ", ACCENT_LEAF)
                 .append(Component.text(shortPath(s.pathName()) + " ", LABEL))
                 .append(Component.text(String.valueOf(s.pathLevel()) + " ", VALUE))
-                .append(Component.text(Path.bar(s.pathXp()), BAR)));
+                .append(Component.text(Path.barShort(s.pathXp()), BAR)));
         }
 
         if (s.champTitles() > 0) {

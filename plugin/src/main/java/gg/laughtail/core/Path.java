@@ -123,4 +123,20 @@ enum Path {
         }
         return sb.toString();
     }
-}
+
+    /**
+     * A six-segment bar for the sidebar.
+     *
+     * Separate from bar() rather than a parameter, because the two have different jobs. In chat there is
+     * room for ten segments and the extra resolution is useful. On the sidebar the longest line decides
+     * how wide the whole panel is, and a ten-segment bar was making it the widest line - so the panel
+     * grew to accommodate a level of precision nobody reads at a glance.
+     */
+    static String barShort(long xp) {
+        int filled = (int) Math.round(progress(xp) * 6);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 6; i++) {
+            sb.append(i < filled ? '\u2588' : '\u2591');
+        }
+        return sb.toString();
+    }}
