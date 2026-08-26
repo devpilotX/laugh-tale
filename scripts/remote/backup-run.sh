@@ -30,6 +30,14 @@
 
 set -e
 
+# --db-only skips the world tar. Used by the hourly cron entry: spec 5.4 wants the
+# database hourly but the world only every six hours, because the world tar is the
+# expensive part (213 MB of gzip) and this instance is burstable (R1) - twenty-four
+# world tars a day would spend CPU credits on data that changes far less than the
+# ledger does.
+DB_ONLY=0
+if [ "${1:-}" = "--db-only" ]; then DB_ONLY=1; fi
+
 V=$(sudo -n ls -1 /var/lib/pelican/volumes | head -1)
 D="/var/lib/pelican/volumes/$V"
 DEST=/home/ubuntu/laughtail-backups
@@ -97,7 +105,13 @@ restore_saves() {
 }
 trap restore_saves EXIT
 
-if [ "$SERVER_UP" -eq 1 ]; then
+if [ "$DB_ONLY" -eq 1 ]; then
+  echo "=== --db-only: skipping the world tar and the save flush ==="
+  echo "    (the flush exists to make the WORLD snapshot consistent; the database"
+  echo "     dump is made consistent by --single-transaction instead, so an hourly"
+  echo "     database backup does not need to touch the running world at all)"
+  WORLD_TAR=""
+elif [ "$SERVER_UP" -eq 1 ]; then
   echo "=== flushing world saves before the snapshot (5.4) ==="
   sudo -n python3 /tmp/lt-rcon-bk.py "$D/server.properties" "$CIP" "save-off" "save-all flush"
   # save-all flush returns as soon as it is queued, so give the I/O pool a moment.
@@ -106,6 +120,7 @@ else
   echo "=== server is stopped: the world on disk is already consistent ==="
 fi
 
+if [ "$DB_ONLY" -eq 0 ]; then
 echo "=== world backup ==="
 WORLD_TAR="$DEST/world-$STAMP.tar.gz"
 sudo -n tar -czf "$WORLD_TAR" \
@@ -130,6 +145,7 @@ else
   echo "  FAIL: tar is not listable"
   exit 4
 fi
+fi   # end of the world-backup block skipped by --db-only
 
 echo "=== database backup ==="
 DB_SQL="$DEST/db-$STAMP.sql.gz"
@@ -164,5 +180,31 @@ sudo -n ls -lh "$DEST" | tail -15
 sudo -n du -sh "$DEST"
 echo "=== disk after ==="
 df -h --output=avail,pcent / | tail -1
+
+# ---------------------------------------------------------------------------
+# Status file. A silent backup failure is indistinguishable from success, which is
+# the worst property a backup can have - and there is no alerting channel yet
+# (OA-16, no Discord webhook). So the outcome is written to disk where
+# health-check.sh reads it and complains if it is stale or failed.
+#
+# Written LAST and only on success. If the script died earlier, the file keeps its
+# previous timestamp and goes stale, which is exactly the signal wanted.
+# ---------------------------------------------------------------------------
+WORLD_SZ=$(sudo -n stat -c %s "$WORLD_TAR" 2>/dev/null || echo 0)
+DB_SZ=$(sudo -n stat -c %s "$DB_SQL" 2>/dev/null || echo 0)
+sudo -n tee "$DEST/last-status.json" > /dev/null <<JSON
+{
+  "finished_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "epoch": $(date -u +%s),
+  "result": "ok",
+  "world_archive": "$(basename "$WORLD_TAR")",
+  "world_bytes": $WORLD_SZ,
+  "db_archive": "$(basename "$DB_SQL")",
+  "db_bytes": $DB_SZ,
+  "server_was_running": $SERVER_UP
+}
+JSON
+sudo -n cat "$DEST/last-status.json"
+
 echo "BACKUP COMPLETE"
 echo "=== END ==="
