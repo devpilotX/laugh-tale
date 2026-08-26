@@ -110,6 +110,38 @@ function Assert-CommandAllowed {
     }
   }
 
+  # ---- DROP / TRUNCATE: denied by name, not by keyword ------------------------
+  # The blanket rule 'drop database|drop table|truncate table' protected player data
+  # correctly but also refused the Phase 0.6 restore drill, which must create and
+  # remove a THROWAWAY schema to prove the backups restore. Refusing to test a
+  # backup in the name of data safety is a net loss of safety.
+  #
+  # So the target name is parsed and checked against an explicit scratch allowlist.
+  # This is narrower than the old rule, not looser: `DROP DATABASE laughtail` is
+  # still refused, and now so is `DROP TABLE players`, while `DROP DATABASE
+  # laughtail_drill` is permitted. Enforced by guard.tests.ps1 in both directions.
+  foreach ($seg in ($norm -split ';')) {
+    $s = $seg.Trim()
+    if ($s -notmatch '\b(drop\s+(database|schema|table)|truncate\s+table)\b') { continue }
+
+    # Strip the keywords and the optional IF EXISTS, then take the first identifier.
+    $tail = $s -replace '.*\b(drop\s+(?:database|schema|table)|truncate\s+table)\b', ''
+    $tail = $tail -replace '^\s*if\s+exists\s*', ''
+    $target = ($tail.Trim() -split '[\s,(]')[0]
+    $target = $target -replace '^.*\.', ''      # schema.table -> table
+    $target = $target.Trim('`', '[', ']')
+
+    if ([string]::IsNullOrWhiteSpace($target)) {
+      throw ("GUARD REFUSED (data safety): a DROP or TRUNCATE with no parseable target. Fail closed.`n  command: {0}" -f $Command)
+    }
+
+    $isScratch = $target -match '^(lt|laughtail)_(drill|scratch|test)$' -or
+                 $target -match '_(drill|scratch)$'
+    if (-not $isScratch) {
+      throw ("GUARD REFUSED (data safety): destroys player data.`n  command: {0}`n  target : {1}`n  Only scratch names are permitted here - something ending in _drill or _scratch,`n  such as laughtail_drill for the restore drill. If dropping '{1}' is genuinely`n  required, write it to docs/owner-actions.md and get explicit confirmation." -f $Command, $target)
+    }
+  }
+
   # ---- absolute denials -----------------------------------------------------
   # Each entry: pattern, which rule it protects, why it is unrecoverable.
   $deny = @(
@@ -133,8 +165,6 @@ function Assert-CommandAllowed {
        r = 'git safety'; why = 'rewrites all history' }
     @{ p = '(^|[\s;&|])/?reload($|[\s;&|])'
        r = 'never-break rule 7'; why = 'vanilla /reload corrupts plugin state. Use /laughtail reload' }
-    @{ p = 'drop\s+(database|schema)\b|drop\s+table\b|truncate\s+table\b'
-       r = 'data safety'; why = 'destroys player data' }
     @{ p = 'docker\s+(volume\s+)?rm\b|docker\s+system\s+prune|docker\s+volume\s+prune'
        r = 'never-break rule 8'; why = 'deletes a Pelican server volume' }
     @{ p = 'ufw\s+(disable|--force\s+reset|reset)\b'

@@ -131,6 +131,26 @@ Should-Refuse '' 'empty'
 Should-Refuse '   ' 'whitespace only'
 
 Write-Output ''
+Write-Output 'GROUP 14  DROP and TRUNCATE are judged by TARGET NAME, not by keyword'
+# The old rule refused every DROP, which also refused the Phase 0.6 restore drill.
+# Refusing to test a backup in the name of data safety is a net loss of safety.
+# These tests prove the replacement is NARROWER, not weaker: real schemas and real
+# tables are still refused, and only explicit scratch names are permitted.
+Should-Refuse 'mariadb -e "DROP DATABASE laughtail"'                    'the live schema'
+Should-Refuse 'mariadb -e "DROP DATABASE IF EXISTS laughtail"'          'live schema with IF EXISTS'
+Should-Refuse 'mariadb -e "DROP SCHEMA laughtail"'                      'SCHEMA is a synonym'
+Should-Refuse 'mariadb -e "DROP TABLE players"'                         'a real table - the old rule caught this too'
+Should-Refuse 'mariadb -e "DROP TABLE laughtail.transactions"'          'schema-qualified real table'
+Should-Refuse 'mariadb -e "TRUNCATE TABLE balances"'                    'truncate is as destructive as drop'
+Should-Refuse 'mariadb -e "DROP DATABASE `panel`"'                      'the Panel database'
+Should-Refuse 'mariadb -e "DROP DATABASE"'                             'no target - fail closed'
+Should-Refuse 'mariadb -e "SELECT 1; DROP DATABASE laughtail"'          'hidden behind a harmless statement'
+Should-Allow  'mariadb -e "DROP DATABASE IF EXISTS laughtail_drill"'
+Should-Allow  'mariadb -e "DROP DATABASE laughtail_drill"'
+Should-Allow  'mariadb -e "DROP TABLE players_scratch"'
+Should-Allow  'mariadb -e "SELECT COUNT(*) FROM players"'
+
+Write-Output ''
 Write-Output ("PASS {0}   FAIL {1}" -f $pass, $fail)
 if ($fail -eq 0) { Write-Output 'GUARD TESTS PASS (pre-flight 33.6 item 13)'; exit 0 }
 else { Write-Output 'GUARD TESTS FAILED'; exit 1 }
