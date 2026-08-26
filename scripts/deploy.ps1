@@ -130,6 +130,7 @@ Invoke-Stage -Name 'regenerate properties deploy' -Local -LocalScript 'gen-deplo
 Invoke-Stage -Name 'regenerate paper tuning' -Local -LocalScript 'gen-paper-tuning.ps1'
 Invoke-Stage -Name 'regenerate db migrate' -Local -LocalScript 'gen-db-migrate.ps1'
 Invoke-Stage -Name 'regenerate backup schedule' -Local -LocalScript 'gen-schedule-backups.ps1'
+Invoke-Stage -Name 'regenerate permissions' -Local -LocalScript 'gen-permissions.ps1'
 
 # ---- 3. artefacts onto the host, verified there -------------------------------
 if (-not $SkipFetch) {
@@ -160,6 +161,13 @@ if (-not $NoRestart) {
     -Reason 'deploy: whitelist and ops from the repository'
   Invoke-Stage -Name 'start and verify' -Script 'scripts/remote/start-server-and-verify.sh' `
     -Reason 'deploy: boot and prove all manifest plugins load'
+  # Permissions need a running server: LuckPerms is driven through its commands,
+  # which are the only supported interface - its storage format is an
+  # implementation detail and hand-editing it is how permission systems break.
+  Invoke-Stage -Name 'apply permission ladder' -Script 'scripts/remote/apply-permissions.sh' `
+    -Reason 'deploy: Section 17 staff ladder with the never-grant list as explicit denials'
+  Invoke-Stage -Name 'verify permissions (17.5)' -Script 'scripts/remote/verify-permissions.sh' `
+    -Reason 'deploy: prove every never-grant node is denied and inheritance is correct'
 }
 
 # ---- 6. prove the result matches the repository ------------------------------

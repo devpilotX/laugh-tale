@@ -1,0 +1,209 @@
+# LaughTail SMP - the permission ladder (Section 17)
+#
+# This file is the source of truth for the staff ladder. It is applied to LuckPerms
+# by scripts/remote/apply-permissions.sh and verified, node by node, by
+# scripts/remote/verify-permissions.sh.
+#
+# THE CENTRAL DESIGN DECISION: the never-grant list is applied as EXPLICIT DENIALS
+# on the admin group, not merely left ungranted.
+#
+# Leaving a permission ungranted looks equivalent and is not. Absence is fragile -
+# any future wildcard, any plugin that ships a permissive default, any inherited
+# group, or anyone adding a convenience node can turn absence into a grant without
+# touching this file. An explicit `false` in LuckPerms beats an inherited `true`,
+# so a denial keeps working even if someone later grants the node higher up the
+# chain. Spec 17.3 calls these server-destruction, economy-corruption and
+# audit-evasion risks; fragile is not good enough for that list.
+#
+# A NOTE ON NODES THAT DO NOT EXIST YET. Several 17.3 entries belong to plugins not
+# installed - CoreProtect for rollbacks, WorldEdit for world editing, and the
+# LaughTail core plugin for economy and seasons. Their nodes are denied here anyway,
+# using the names those plugins actually use. Denying a node before its plugin
+# arrives is free and means the plugin cannot arrive holding an open door. The
+# alternative - add the denial when the plugin lands - relies on remembering.
+
+groups:
+
+  # Order matters: each group is created before anything inherits from it.
+  - name: default
+    display: Member
+    weight: 0
+    inherits: []
+    granted:
+      - laughtail.player.basic
+      - laughtail.rules.accept
+
+  - name: helper
+    display: Helper
+    weight: 10
+    inherits: [default]
+    granted:
+      # 17.2: answer questions, read-only block inspection, short mutes and kicks,
+      # claim and view reports, teleport to coordinates.
+      - laughtail.staff.chat
+      - laughtail.report.view
+      - laughtail.report.claim
+      - laughtail.punish.mute.short
+      - laughtail.punish.kick
+      - laughtail.inspect.blocks.read
+      - laughtail.tp.coords
+
+  - name: mod
+    display: Mod
+    weight: 20
+    inherits: [helper]
+    granted:
+      - laughtail.punish.tempban
+      - laughtail.punish.mute.voice
+      - laughtail.report.close
+      - laughtail.tp.player
+      - laughtail.inspect.inventory
+
+  - name: srmod
+    display: SrMod
+    weight: 30
+    inherits: [mod]
+    granted:
+      - laughtail.punish.tempban.long
+      - laughtail.appeal.review
+      - laughtail.punish.history
+      - laughtail.punish.overturn
+
+  - name: admin
+    display: Admin
+    weight: 40
+    inherits: [srmod]
+    granted:
+      # 17.2 server management - and nothing else.
+      - laughtail.event.start
+      - laughtail.event.stop
+      - laughtail.arena.manage
+      # NOTE THE DISTINCTION, which 17.2 and 17.3 make and which is easy to miss:
+      # an Admin MAY reload the LaughTail config, and MAY NOT reload the server.
+      # Two different nodes; one granted here, the other denied below. Never-break
+      # rule 7 also forbids vanilla /reload outright, for everyone.
+      - laughtail.reload
+      - laughtail.claims.admin
+      - laughtail.cosmetics.grant
+      - laughtail.cosmetics.revoke
+      - laughtail.shoptier.adjust
+      - laughtail.world.manage
+      - laughtail.rollback.preview
+      - laughtail.punish.permban
+      - chunky.base
+      - grim.alerts
+      - grim.verbose
+      - voicechat.admin.mute
+
+  - name: owner
+    display: Owner
+    weight: 100
+    inherits: [admin]
+    granted:
+      # The Owner gets the never-grant list explicitly rather than by wildcard.
+      # A wildcard is itself on 17.3's list for a reason - it silently grants
+      # everything added in future, including things nobody has thought about yet.
+      # Listing them is more work and it means the Owner's power is auditable.
+      - laughtail.economy.set
+      - laughtail.economy.reset
+      - laughtail.economy.price
+      - laughtail.season.reset
+      - laughtail.season.champion
+      - laughtail.backup.run
+      - laughtail.backup.restore
+      - laughtail.db.access
+      - laughtail.audit.read
+      - laughtail.secrets.read
+      - laughtail.whitelist.add
+      - laughtail.whitelist.remove
+      - laughtail.plugins.manage
+
+# ---------------------------------------------------------------------------
+# THE NEVER-GRANT-TO-ADMIN LIST (17.3), applied as explicit denials on `admin`.
+# Each entry names the risk class 17.3 assigns it.
+# ---------------------------------------------------------------------------
+never_grant_to_admin:
+
+  - node: '*'
+    why: "wildcard - silently grants everything on this list and everything added in future"
+  - node: 'luckperms.*'
+    why: "permission-plugin administration - whoever can edit permissions can grant themselves everything. 17.3 calls this the single most important line in the table"
+  - node: 'luckperms.user.permission.set'
+    why: "the specific escalation path, denied separately in case the wildcard is ever loosened"
+  - node: 'luckperms.group.permission.set'
+    why: "same escalation path via groups"
+  - node: 'minecraft.command.op'
+    why: "operator status bypasses the entire permission system"
+  - node: 'minecraft.command.deop'
+    why: "removing op is equally an audit-evasion and lockout risk"
+  - node: 'minecraft.command.stop'
+    why: "an unscheduled restart mid-event is a server-wide incident"
+  - node: 'bukkit.command.stop'
+    why: "the Bukkit alias of the same command"
+  - node: 'minecraft.command.reload'
+    why: "reload the server - distinct from laughtail.reload, which an Admin MAY use"
+  - node: 'bukkit.command.reload'
+    why: "never-break rule 7 forbids vanilla /reload for everyone, not just Admins"
+  - node: 'laughtail.plugins.manage'
+    why: "loading or unloading plugins live is both a stability risk and an audit hole"
+  - node: 'plugman.*'
+    why: "the usual runtime plugin manager, denied before it can ever be installed"
+  - node: 'laughtail.economy.set'
+    why: "unlimited money - direct economy corruption; one command could end the season"
+  - node: 'laughtail.economy.reset'
+    why: "resetting balances"
+  - node: 'laughtail.economy.price'
+    why: "editing prices bypasses the dynamic band and the arbitrage audit"
+  - node: 'coreprotect.rollback'
+    why: "an item-duplication vector"
+  - node: 'coreprotect.restore'
+    why: "same vector in reverse"
+  - node: 'coreprotect.purge'
+    why: "destroys the evidence trail. 17.3: the most dangerous permission on the server"
+  - node: 'laughtail.backup.run'
+    why: "backups contain every player's data"
+  - node: 'laughtail.backup.restore'
+    why: "restore can roll back the whole world"
+  - node: 'laughtail.db.access'
+    why: "direct database access is every player's data at once"
+  - node: 'laughtail.season.reset'
+    why: "the integrity of the competition depends on staff being unable to touch this"
+  - node: 'laughtail.season.champion'
+    why: "manual Champion assignment would make the one Champion meaningless"
+  - node: 'worldedit.*'
+    why: "world editing on live worlds - one mistyped selection deletes a region"
+  - node: 'fawe.*'
+    why: "FastAsyncWorldEdit, which was present on this host before the manifest and is now quarantined"
+  - node: 'minecraft.command.whitelist'
+    why: "the whitelist IS the paywall (Section 3). A manual grant bypasses payment - revenue loss and a fairness breach"
+  - node: 'bukkit.command.whitelist'
+    why: "the Bukkit alias of the same command"
+  - node: 'laughtail.whitelist.add'
+    why: "the LaughTail-side equivalent"
+  - node: 'laughtail.whitelist.remove'
+    why: "removing access is equally a paywall bypass in reverse"
+  - node: 'laughtail.audit.read'
+    why: "staff must not read the record of what staff did"
+  - node: 'laughtail.secrets.read'
+    why: "secret access"
+
+# Shell access to the host is on 17.3's list and is NOT a Minecraft permission, so
+# it cannot be denied here. It is controlled by SSH key distribution: the host has
+# key-only authentication with passwords disabled (verified session 1), and no staff
+# member has a key. Recorded so the list can be closed honestly rather than looking
+# like an oversight.
+
+# ---------------------------------------------------------------------------
+# Test fixtures for acceptance 17.5. These UUIDs are synthetic version 4 values
+# that no Mojang account can ever own, so they cannot collide with a real player
+# and cannot be used to log in under online-mode=true.
+# ---------------------------------------------------------------------------
+test_accounts:
+  - uuid: '00000000-0000-4000-8000-0000000000ad'
+    name: 'AdminTestAcct'
+    group: admin
+    purpose: '17.5 item 1 - must be denied every node in the never-grant list, verified one by one'
+  - uuid: '00000000-0000-4000-8000-00000000000b'
+    name: 'HelperTestAcct'
+    group: helper
+    purpose: '17.5 item 2 - inheritance verified by a test matrix, not by assumption'

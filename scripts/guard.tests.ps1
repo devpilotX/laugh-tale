@@ -149,6 +149,21 @@ Should-Allow  'mariadb -e "DROP DATABASE IF EXISTS laughtail_drill"'
 Should-Allow  'mariadb -e "DROP DATABASE laughtail_drill"'
 Should-Allow  'mariadb -e "DROP TABLE players_scratch"'
 Should-Allow  'mariadb -e "SELECT COUNT(*) FROM players"'
+Write-Output ''
+Write-Output 'GROUP 15  never-break rule 7 - /reload judged by command position, not substring'
+# The old substring rule refused any command containing the WORD reload, including
+# an echo that explained the rule. Second false positive of that class; a guard
+# that refuses prose gets worked around, and a worked-around guard protects nothing.
+Should-Refuse 'reload'                                          'bare reload'
+Should-Refuse '/reload'                                         'slash form'
+Should-Refuse 'minecraft:reload'                                'namespaced form'
+Should-Refuse 'bukkit:reload confirm'                           'namespaced with an argument'
+Should-Refuse 'sudo reload'                                     'sudo prefix stripped'
+Should-Allow  'echo "an Admin may reload the LaughTail config"'
+Should-Allow  'lp group admin permission set laughtail.reload true'
+Should-Allow  'lp user 00000000-0000-4000-8000-0000000000ad permission check minecraft.command.reload'
+Should-Allow  'grep -c reload /var/log/syslog'
+
 
 Write-Output ''
 Write-Output ("PASS {0}   FAIL {1}" -f $pass, $fail)

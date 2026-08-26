@@ -163,8 +163,6 @@ function Assert-CommandAllowed {
        r = 'git safety'; why = 'force-deletes a branch' }
     @{ p = 'git\s+filter-branch|git\s+filter-repo'
        r = 'git safety'; why = 'rewrites all history' }
-    @{ p = '(^|[\s;&|])/?reload($|[\s;&|])'
-       r = 'never-break rule 7'; why = 'vanilla /reload corrupts plugin state. Use /laughtail reload' }
     @{ p = 'docker\s+(volume\s+)?rm\b|docker\s+system\s+prune|docker\s+volume\s+prune'
        r = 'never-break rule 8'; why = 'deletes a Pelican server volume' }
     @{ p = 'ufw\s+(disable|--force\s+reset|reset)\b'
@@ -194,6 +192,12 @@ function Assert-CommandAllowed {
     'mkfs.ext4'= 'data safety: destroys the filesystem'
     'fdisk'    = 'data safety: repartitions the disk'
     'init'     = 'availability: changes runlevel'
+    # never-break rule 7. Moved here from the substring table for the SAME reason
+    # shutdown was: the old regex matched the WORD reload anywhere, so an echo
+    # explaining the rule - "an Admin may reload the LaughTail config" - was refused.
+    # That is the second false positive of this class. A guard that refuses prose
+    # gets worked around, and a worked-around guard protects nothing.
+    'reload'   = 'never-break rule 7: vanilla /reload corrupts plugin state. Use /laughtail reload'
   }
   foreach ($seg in ($norm -split '[;&|]|\bthen\b|\bdo\b')) {
     $t = @($seg.Trim() -split '\s+' | Where-Object { $_ -ne '' })
@@ -201,6 +205,7 @@ function Assert-CommandAllowed {
     while ($i -lt $t.Count -and ($t[$i] -eq 'sudo' -or $t[$i] -eq 'env' -or $t[$i] -like '-*' -or $t[$i] -match '^\w+=')) { $i++ }
     if ($i -ge $t.Count) { continue }
     $bin = ($t[$i] -replace '^.*/', '')          # /sbin/shutdown -> shutdown
+    $bin = $bin -replace '^(minecraft|bukkit|spigot|paper):', ''   # minecraft:reload -> reload
     if ($denyBinaries.ContainsKey($bin)) {
       throw ("GUARD REFUSED ({0}).`n  command: {1}`n  If this is genuinely required, write it to docs/owner-actions.md and get explicit confirmation." -f $denyBinaries[$bin], $Command)
     }

@@ -155,3 +155,30 @@ Sections 7, 10, 15, 16 and 19 define no criteria of their own and are covered en
 | 15 | The first session's output was a plan, read and approved by the owner | **Plan written. Approval pending** |
 
 **8 of 15 pass. None of the failures is a defect; each is an owner action or a Phase 0 task.**
+
+---
+
+## Section 17.5 - the Owner and Admin split
+
+Four unnumbered checkbox criteria in the specification, given positional IDs here per `docs/questions.md` **Q-02**.
+
+| # | Criterion | Status | Evidence |
+| --- | --- | --- | --- |
+| 17-1 | An Admin-level test account is denied every single node in 17.3, verified one by one and recorded | **PASS 2026-08-26** | `scripts/remote/verify-permissions.sh`: **31 of 31 nodes denied**, each listed individually with its resolution source, all reading "denied explicitly on admin". Not sampled |
+| 17-2 | Permission inheritance is verified by a test matrix, not by assumption | **PASS 2026-08-26** | **12 matrix rows, 0 failures.** Includes the distinction 17.2 and 17.3 make and which is easy to miss: `admin` **has** `laughtail.reload` and **lacks** `minecraft.command.reload` |
+| 17-3 | A staff account earns zero RP from a kill | **Not started** | Needs the rank system (Phase 4). The permission side exists; the RP exclusion is code that does not exist yet |
+| 17-4 | Every staff action appears in the audit log, and a staff account cannot delete from it | **Partially designed** | `laughtail.audit.read` is denied to Admin and granted to Owner only. The `staff_audit` table itself is Phase 1 - Appendix D marks it append-only |
+
+### How this was verified, and the false pass that came first
+
+The first verifier used `lp user <uuid> permission check <node>` for all 31 nodes and **reported PASS against 31 completely empty responses**. LuckPerms processes commands asynchronously and returns nothing to an RCON sender, so the verdict - computed as "no line said true" - was measuring silence. That is worse than having no check, because it manufactures evidence.
+
+It was replaced with analysis of an authoritative `lp export` snapshot, which also happens to be the "permissions export in version control" that Appendix C asks for. The checker resolves inheritance itself using LuckPerms' own rule - a value on the group wins over anything inherited, nearer ancestors beat further ones - and treats a `*` set to `true` anywhere in the chain as a grant. It **aborts rather than passing** if the export is missing.
+
+### The design decision behind these passes
+
+The never-grant list is applied as **explicit denials** on `admin`, not merely left ungranted. Absence looks equivalent and is fragile: any future wildcard, permissive plugin default, or added convenience node can turn absence into a grant without anyone editing `server/permissions.yml`. An explicit `false` beats an inherited `true`, so the denial holds even if the node is later granted higher up the chain.
+
+For the same reason the **Owner group does not use a wildcard**. A wildcard is itself on 17.3's list because it silently grants everything added in future. The Owner's thirteen elevated nodes are listed one by one, which is more work and makes the Owner's power auditable. The wildcard audit confirms no group holds `*`.
+
+**Shell access to the host** is on 17.3's list and is not a Minecraft permission, so it cannot be denied in LuckPerms. It is controlled by SSH key distribution - key-only authentication with passwords disabled, verified session 1, and no staff member holds a key. Recorded so the list closes honestly rather than looking like an oversight.
