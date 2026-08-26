@@ -131,6 +131,51 @@ final class Menu implements Listener {
         p.openInventory(inv);
     }
 
+    /**
+     * The homes page. One bed per home, clicked to teleport.
+     *
+     * Built asynchronously because it reads the database, then opened on the main thread. The
+     * obvious shortcut - read homes synchronously to build the inventory - would put a query
+     * inside a click handler, which is the exact pattern acceptance row 25 forbids.
+     */
+    void openHomes(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final java.util.List<String> names;
+            final int purchased;
+            try {
+                names = plugin.database().homeNames(p.getUniqueId());
+                purchased = plugin.database().purchasedSlots(p.getUniqueId());
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read your homes.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            final int allowed = Math.min(Homes.MAX_HOMES, Homes.FREE_SLOTS + purchased);
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                Inventory inv = Bukkit.createInventory(new MenuHolder("homes"), 27,
+                    Component.text("Homes " + names.size() + "/" + allowed, NamedTextColor.GREEN));
+                int slot = 0;
+                for (String n : names) {
+                    if (slot >= 18) break;
+                    inv.setItem(slot++, item(Material.RED_BED, n, NamedTextColor.WHITE,
+                        List.of("Click to teleport here.",
+                                "3 second warmup - do not move.")));
+                }
+                if (allowed < Homes.MAX_HOMES) {
+                    inv.setItem(22, item(Material.EMERALD, "Buy another slot",
+                        NamedTextColor.GREEN, List.of(
+                            "Cost: " + Homes.slotCost(purchased) + " Berries",
+                            "The price rises with each slot.",
+                            "A slot you buy is yours permanently.")));
+                }
+                inv.setItem(18, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(26, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
+
     private void openAdmin(Player p) {
         Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
             Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
@@ -185,6 +230,16 @@ final class Menu implements Listener {
             }
         }
 
+        if (holder.page.equals("homes")) {
+            switch (clicked.getType()) {
+                case RED_BED -> { p.closeInventory(); run(p, "home " + name); }
+                case EMERALD -> { p.closeInventory(); run(p, "buyhome"); }
+                case ARROW   -> openMain(p);
+                default -> { }
+            }
+            return;
+        }
+
         if (holder.page.equals("admin")) {
             switch (name) {
                 case "Access audit"   -> run(p, "access audit");
@@ -199,7 +254,7 @@ final class Menu implements Listener {
         }
 
         switch (name) {
-            case "Homes"               -> run(p, "homes");
+            case "Homes"               -> openHomes(p);
             case "Berries"             -> run(p, "berries");
             case "Random Teleport"     -> { p.closeInventory(); run(p, "rtp"); }
             case "Teleport to a player" -> {

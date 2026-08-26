@@ -62,19 +62,11 @@ final class ResourceWorldGuard implements Listener {
     }
 
     void start() {
-        // Every 5 seconds is often enough to be present and rare enough to cost nothing. The
-        // action bar is used rather than chat precisely because it does not scroll away and does
-        // not spam the log.
-        plugin.getServer().getScheduler().runTaskTimer(plugin, () -> {
-            for (UUID id : inside) {
-                Player p = plugin.getServer().getPlayer(id);
-                if (p == null || !p.isOnline()) continue;
-                if (!isResourceWorld(p.getWorld().getName())) continue;
-                p.sendActionBar(Component.text(
-                    "RESOURCE WORLD - everything here is deleted every month",
-                    NamedTextColor.RED));
-            }
-        }, 100L, 100L);
+        // The repeating action-bar reminder was removed. It fired every 5 seconds and the owner
+        // was right that it was spam: a warning shown constantly stops being read, which makes it
+        // worse than a warning shown once at the moment it matters. What remains is one concise
+        // line on entering the world and a warning when placing a container - both tied to an
+        // ACTION rather than to merely existing.
     }
 
     @EventHandler
@@ -84,9 +76,11 @@ final class ResourceWorldGuard implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
-        // A player who logged out in the resource world logs back into it, so the reminder must
-        // be re-established on join and not only on a world change.
-        update(e.getPlayer());
+        // Tracked but NOT announced. A player who logged out here already knows where they are,
+        // and a red banner every login is exactly the noise the owner asked to remove.
+        if (isResourceWorld(e.getPlayer().getWorld().getName())) {
+            inside.add(e.getPlayer().getUniqueId());
+        }
     }
 
     @EventHandler
@@ -104,22 +98,17 @@ final class ResourceWorldGuard implements Listener {
     }
 
     private void announce(Player p) {
+        // One subtitle, no big red headline. The owner asked for clean, and a full-screen red
+        // banner on every entry reads as an error rather than as information.
         p.showTitle(Title.title(
-            Component.text("RESOURCE WORLD", NamedTextColor.RED),
-            Component.text("Everything here is deleted every month", NamedTextColor.YELLOW),
-            Title.Times.times(Duration.ofMillis(300), Duration.ofSeconds(4),
-                Duration.ofMillis(600))));
-        p.sendMessage(Component.text("─────────────────────────────", NamedTextColor.DARK_GRAY));
-        p.sendMessage(Component.text("You are in the RESOURCE WORLD.", NamedTextColor.RED));
-        p.sendMessage(Component.text("  Mine and farm here freely - that is what it is for.",
-            NamedTextColor.GRAY));
-        p.sendMessage(Component.text("  This whole world is DELETED and regenerated every month.",
-            NamedTextColor.YELLOW));
-        p.sendMessage(Component.text("  Do not build a base or store anything you want to keep.",
-            NamedTextColor.YELLOW));
-        p.sendMessage(Component.text("  Your permanent base belongs in the main world - /home.",
-            NamedTextColor.GRAY));
-        p.sendMessage(Component.text("─────────────────────────────", NamedTextColor.DARK_GRAY));
+            Component.empty(),
+            Component.text("Resource world - resets monthly, do not build here",
+                NamedTextColor.YELLOW),
+            Title.Times.times(Duration.ofMillis(200), Duration.ofSeconds(3),
+                Duration.ofMillis(400))));
+        p.sendMessage(Component.text("Resource world: mine freely. ", NamedTextColor.YELLOW)
+            .append(Component.text("Everything here is deleted monthly - build at /home.",
+                NamedTextColor.GRAY)));
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)

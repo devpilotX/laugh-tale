@@ -45,6 +45,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Teleports teleports;
     private ResourceWorldGuard resourceGuard;
     private Menu menu;
+    private Hud hud;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -87,6 +88,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         resourceGuard.start();
         this.menu = new Menu(this);
         getServer().getPluginManager().registerEvents(menu, this);
+        this.hud = new Hud(this, database);
+        getServer().getPluginManager().registerEvents(hud, this);
+        hud.start();
         getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
@@ -123,6 +127,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
             c.getString("database.password", "")
         );
     }
+
+    /** Exposed so the menu can read homes without a second Database reference. */
+    Database database() { return database; }
 
     String rulesVersion() { return rulesVersion; }
     List<String> rulesText() { return rulesText; }

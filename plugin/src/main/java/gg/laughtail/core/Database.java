@@ -1039,6 +1039,21 @@ public final class Database {
         }
     }
 
+    /** Current RP for a season, or the starting value when unrated. */
+    int currentRp(UUID uuid, int season) throws SQLException {
+        assertOffMainThread();
+        if (season <= 0) return Rating.STARTING_CR;
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT current_rp FROM combat_ratings WHERE uuid = ? AND season_number = ?")) {
+            ps.setString(1, uuid.toString());
+            ps.setInt(2, season);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : Rating.STARTING_CR;
+            }
+        }
+    }
+
     /** The seasons a specific player won. 9.6: kept forever, through every future season. */
     java.util.List<Integer> championSeasons(UUID uuid) throws SQLException {
         assertOffMainThread();

@@ -392,6 +392,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Teleports teleports;
     private ResourceWorldGuard resourceGuard;
     private Menu menu;
+    private Hud hud;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -434,6 +435,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         resourceGuard.start();
         this.menu = new Menu(this);
         getServer().getPluginManager().registerEvents(menu, this);
+        this.hud = new Hud(this, database);
+        getServer().getPluginManager().registerEvents(hud, this);
+        hud.start();
         getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
@@ -470,6 +474,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
             c.getString("database.password", "")
         );
     }
+
+    /** Exposed so the menu can read homes without a second Database reference. */
+    Database database() { return database; }
 
     String rulesVersion() { return rulesVersion; }
     List<String> rulesText() { return rulesText; }
@@ -1860,6 +1867,21 @@ public final class Database {
             ps.setString(4, uuid.toString());
             ps.setInt(5, season);
             ps.executeUpdate();
+        }
+    }
+
+    /** Current RP for a season, or the starting value when unrated. */
+    int currentRp(UUID uuid, int season) throws SQLException {
+        assertOffMainThread();
+        if (season <= 0) return Rating.STARTING_CR;
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT current_rp FROM combat_ratings WHERE uuid = ? AND season_number = ?")) {
+            ps.setString(1, uuid.toString());
+            ps.setInt(2, season);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : Rating.STARTING_CR;
+            }
         }
     }
 
@@ -4482,19 +4504,11 @@ final class ResourceWorldGuard implements Listener {
     }
 
     void start() {
-        // Every 5 seconds is often enough to be present and rare enough to cost nothing. The
-        // action bar is used rather than chat precisely because it does not scroll away and does
-        // not spam the log.
-        plugin.getServer().getScheduler().runTaskTimer(plugin, () -> {
-            for (UUID id : inside) {
-                Player p = plugin.getServer().getPlayer(id);
-                if (p == null || !p.isOnline()) continue;
-                if (!isResourceWorld(p.getWorld().getName())) continue;
-                p.sendActionBar(Component.text(
-                    "RESOURCE WORLD - everything here is deleted every month",
-                    NamedTextColor.RED));
-            }
-        }, 100L, 100L);
+        // The repeating action-bar reminder was removed. It fired every 5 seconds and the owner
+        // was right that it was spam: a warning shown constantly stops being read, which makes it
+        // worse than a warning shown once at the moment it matters. What remains is one concise
+        // line on entering the world and a warning when placing a container - both tied to an
+        // ACTION rather than to merely existing.
     }
 
     @EventHandler
@@ -4504,9 +4518,11 @@ final class ResourceWorldGuard implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
-        // A player who logged out in the resource world logs back into it, so the reminder must
-        // be re-established on join and not only on a world change.
-        update(e.getPlayer());
+        // Tracked but NOT announced. A player who logged out here already knows where they are,
+        // and a red banner every login is exactly the noise the owner asked to remove.
+        if (isResourceWorld(e.getPlayer().getWorld().getName())) {
+            inside.add(e.getPlayer().getUniqueId());
+        }
     }
 
     @EventHandler
@@ -4524,22 +4540,17 @@ final class ResourceWorldGuard implements Listener {
     }
 
     private void announce(Player p) {
+        // One subtitle, no big red headline. The owner asked for clean, and a full-screen red
+        // banner on every entry reads as an error rather than as information.
         p.showTitle(Title.title(
-            Component.text("RESOURCE WORLD", NamedTextColor.RED),
-            Component.text("Everything here is deleted every month", NamedTextColor.YELLOW),
-            Title.Times.times(Duration.ofMillis(300), Duration.ofSeconds(4),
-                Duration.ofMillis(600))));
-        p.sendMessage(Component.text("â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€", NamedTextColor.DARK_GRAY));
-        p.sendMessage(Component.text("You are in the RESOURCE WORLD.", NamedTextColor.RED));
-        p.sendMessage(Component.text("  Mine and farm here freely - that is what it is for.",
-            NamedTextColor.GRAY));
-        p.sendMessage(Component.text("  This whole world is DELETED and regenerated every month.",
-            NamedTextColor.YELLOW));
-        p.sendMessage(Component.text("  Do not build a base or store anything you want to keep.",
-            NamedTextColor.YELLOW));
-        p.sendMessage(Component.text("  Your permanent base belongs in the main world - /home.",
-            NamedTextColor.GRAY));
-        p.sendMessage(Component.text("â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€", NamedTextColor.DARK_GRAY));
+            Component.empty(),
+            Component.text("Resource world - resets monthly, do not build here",
+                NamedTextColor.YELLOW),
+            Title.Times.times(Duration.ofMillis(200), Duration.ofSeconds(3),
+                Duration.ofMillis(400))));
+        p.sendMessage(Component.text("Resource world: mine freely. ", NamedTextColor.YELLOW)
+            .append(Component.text("Everything here is deleted monthly - build at /home.",
+                NamedTextColor.GRAY)));
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -4691,6 +4702,51 @@ final class Menu implements Listener {
         p.openInventory(inv);
     }
 
+    /**
+     * The homes page. One bed per home, clicked to teleport.
+     *
+     * Built asynchronously because it reads the database, then opened on the main thread. The
+     * obvious shortcut - read homes synchronously to build the inventory - would put a query
+     * inside a click handler, which is the exact pattern acceptance row 25 forbids.
+     */
+    void openHomes(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final java.util.List<String> names;
+            final int purchased;
+            try {
+                names = plugin.database().homeNames(p.getUniqueId());
+                purchased = plugin.database().purchasedSlots(p.getUniqueId());
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read your homes.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            final int allowed = Math.min(Homes.MAX_HOMES, Homes.FREE_SLOTS + purchased);
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                Inventory inv = Bukkit.createInventory(new MenuHolder("homes"), 27,
+                    Component.text("Homes " + names.size() + "/" + allowed, NamedTextColor.GREEN));
+                int slot = 0;
+                for (String n : names) {
+                    if (slot >= 18) break;
+                    inv.setItem(slot++, item(Material.RED_BED, n, NamedTextColor.WHITE,
+                        List.of("Click to teleport here.",
+                                "3 second warmup - do not move.")));
+                }
+                if (allowed < Homes.MAX_HOMES) {
+                    inv.setItem(22, item(Material.EMERALD, "Buy another slot",
+                        NamedTextColor.GREEN, List.of(
+                            "Cost: " + Homes.slotCost(purchased) + " Berries",
+                            "The price rises with each slot.",
+                            "A slot you buy is yours permanently.")));
+                }
+                inv.setItem(18, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(26, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
+
     private void openAdmin(Player p) {
         Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
             Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
@@ -4745,6 +4801,16 @@ final class Menu implements Listener {
             }
         }
 
+        if (holder.page.equals("homes")) {
+            switch (clicked.getType()) {
+                case RED_BED -> { p.closeInventory(); run(p, "home " + name); }
+                case EMERALD -> { p.closeInventory(); run(p, "buyhome"); }
+                case ARROW   -> openMain(p);
+                default -> { }
+            }
+            return;
+        }
+
         if (holder.page.equals("admin")) {
             switch (name) {
                 case "Access audit"   -> run(p, "access audit");
@@ -4759,7 +4825,7 @@ final class Menu implements Listener {
         }
 
         switch (name) {
-            case "Homes"               -> run(p, "homes");
+            case "Homes"               -> openHomes(p);
             case "Berries"             -> run(p, "berries");
             case "Random Teleport"     -> { p.closeInventory(); run(p, "rtp"); }
             case "Teleport to a player" -> {
@@ -4784,6 +4850,156 @@ final class Menu implements Listener {
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Menu_java
+
+# ---- src/main/java/gg/laughtail/core/Hud.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Hud.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Hud_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.scoreboard.Criteria;
+import org.bukkit.scoreboard.DisplaySlot;
+import org.bukkit.scoreboard.Objective;
+import org.bukkit.scoreboard.Scoreboard;
+
+import java.sql.SQLException;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * The sidebar HUD. Rank, season, Berries and homes, always visible.
+ *
+ * A scoreboard sidebar renders on the RIGHT of the screen, vertically centred, which is exactly
+ * where the owner asked for it. It is also the only way to get persistent on-screen text that
+ * works on a vanilla client and through Geyser for Bedrock - the action bar and the boss bar are
+ * the alternatives and both are worse here: the action bar is transient and was already rejected
+ * as spam, and a boss bar sits at the top and competes with 31.7's cosmetic budget.
+ *
+ * DATA IS READ ASYNCHRONOUSLY AND CACHED. The sidebar refreshes every two seconds, but a
+ * database read every two seconds per player would be 12 queries a minute each - 288 a minute at
+ * 24 players, in a hot path, which is exactly the sort of thing acceptance row 25 exists to stop.
+ * So values are fetched off the main thread every ten seconds into a per-player snapshot, and the
+ * sidebar renders from the snapshot. Berries and rank do not change often enough for anyone to
+ * notice ten seconds, and the alternative is a database call inside the tick loop.
+ *
+ * ONE LINE PER FACT, no decoration, no borders. The owner asked for clean and organised, and a
+ * sidebar is small - every character spent on a box-drawing frame is a character not spent on
+ * information.
+ */
+final class Hud implements Listener {
+
+    private record Snapshot(long berries, int rp, String tier, int season, int homes,
+                            int homeMax, int champTitles) { }
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+    private final Map<UUID, Snapshot> cache = new ConcurrentHashMap<>();
+
+    Hud(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+    }
+
+    void start() {
+        // Render often, read rarely. See the class note.
+        plugin.getServer().getScheduler().runTaskTimer(plugin, this::renderAll, 40L, 40L);
+        plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, this::refreshAll,
+            20L, 200L);
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        // Refresh immediately rather than waiting up to ten seconds, so a joining player does
+        // not see an empty or stale sidebar - first impressions are 7.5's whole argument.
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin,
+            () -> refresh(e.getPlayer().getUniqueId()));
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        cache.remove(e.getPlayer().getUniqueId());
+    }
+
+    private void refreshAll() {
+        for (Player p : plugin.getServer().getOnlinePlayers()) {
+            refresh(p.getUniqueId());
+        }
+    }
+
+    private void refresh(UUID id) {
+        try {
+            long berries = db.balance(id);
+            int season = db.activeSeason();
+            int rp = db.currentRp(id, season);
+            int homes = db.homeNames(id).size();
+            int purchased = db.purchasedSlots(id);
+            int champs = db.championSeasons(id).size();
+            cache.put(id, new Snapshot(berries, rp, Rating.tierName(rp), season, homes,
+                Math.min(Homes.MAX_HOMES, Homes.FREE_SLOTS + purchased), champs));
+        } catch (SQLException e) {
+            // A failed refresh leaves the previous snapshot in place rather than blanking the
+            // sidebar. Stale information is better than a display that flickers empty on every
+            // transient database hiccup.
+            plugin.getLogger().fine("HUD refresh failed for " + id + ": " + e.getMessage());
+        }
+    }
+
+    private void renderAll() {
+        for (Player p : plugin.getServer().getOnlinePlayers()) {
+            Snapshot s = cache.get(p.getUniqueId());
+            if (s == null) continue;
+            render(p, s);
+        }
+    }
+
+    private void render(Player p, Snapshot s) {
+        Scoreboard board = p.getScoreboard();
+        // A player on the main shared scoreboard must be given their own, or every player would
+        // see the same numbers.
+        if (board == plugin.getServer().getScoreboardManager().getMainScoreboard()) {
+            board = plugin.getServer().getScoreboardManager().getNewScoreboard();
+            p.setScoreboard(board);
+        }
+        Objective o = board.getObjective("laughtail");
+        if (o == null) {
+            o = board.registerNewObjective("laughtail", Criteria.DUMMY,
+                Component.text("Laugh Tale", NamedTextColor.GOLD));
+            o.setDisplaySlot(DisplaySlot.SIDEBAR);
+        }
+
+        // Scoreboard lines are keyed by entry string, so a changing value needs the old entry
+        // removed or lines accumulate. Rebuilding is simpler and cheap at this size.
+        for (String entry : board.getEntries()) {
+            board.resetScores(entry);
+        }
+
+        int line = 9;
+        set(o, line--, "\u00A77Rank \u00A7f" + s.tier());
+        set(o, line--, "\u00A77RP \u00A7f" + s.rp());
+        set(o, line--, " ");
+        set(o, line--, "\u00A77Berries \u00A76" + s.berries());
+        set(o, line--, "  ");
+        set(o, line--, "\u00A77Homes \u00A7f" + s.homes() + "\u00A78/" + s.homeMax());
+        if (s.champTitles() > 0) {
+            set(o, line--, "\u00A77Titles \u00A76" + s.champTitles() + " \u00A7eChampion");
+        }
+        set(o, line--, "   ");
+        set(o, line--, s.season() > 0
+            ? "\u00A77Season \u00A7f" + s.season()
+            : "\u00A78no active season");
+    }
+
+    private void set(Objective o, int line, String text) {
+        o.getScore(text).setScore(line);
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Hud_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do
