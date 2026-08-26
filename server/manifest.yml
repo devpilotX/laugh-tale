@@ -17,6 +17,23 @@
 minecraft_version: "1.21.11"
 architecture_required: "aarch64"
 
+# Container images. Never-break rule 9 is written about plugins, but a database
+# image is installed software with the same failure mode, so it is pinned the same
+# way: an exact version tag AND the digest actually pulled. The tag can be
+# repointed by the publisher; the digest cannot.
+infrastructure_images:
+  - name: "mariadb"
+    role: "The db service (spec 5.2). Players, access grants, seasons, champions"
+    version: "11.4.5"
+    image: "mariadb:11.4.5"
+    digest: "sha256:49117dcc565cf51aa57ac5fca59ab31213402ff0eae6ffc13c46a37b938f7e4b"
+    arch_verified: "arm64/linux, confirmed by docker inspect after pull"
+    arm64_load_proof: "PASS 2026-08-26 04:11 UTC - container reached an authenticated query, V1__init.sql applied in 379 ms, acceptance row 36 constraint test passed"
+    why_container_not_apt: "MariaDB is not installed on this host at all (db-assess.sh: no packages, systemctl is-enabled returns not-found). A host install would need apt on the game box, which 33.2 item 4 says requires a fresh snapshot first - and OA-03 means none exists. A container needs no host packages, is memory-capped, and is removable in one command. It is also what 5.2 actually specifies."
+    memory_cap: "320 MiB container limit, MemorySwap equal to it so it cannot swap (same reasoning as deviation D7). Measured use: 180.4 MiB"
+    exposure: "published on 127.0.0.1:3306 only. 5.2 requires container-network only and acceptance row 5 requires MySQL invisible externally; check-external-ports.ps1 probes 3306 and expects closed"
+    tuning: "innodb_buffer_pool_size 64M (not the 128M default), performance_schema off, max_connections 40, UTC. Total data will be a few MB for years; a buffer pool larger than the dataset takes page cache that Paper's chunk I/O needs"
+
 # Bundled with the server - deliberately NOT a separate jar.
 bundled:
   - name: "spark"

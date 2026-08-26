@@ -373,3 +373,60 @@ Rule 4 requires **25% or 768 MB**. It was failing both tests, and the reassuring
 **Note for the migration (Section 22):** the egg has an `update_url` pointing at the upstream `egg-paper.yaml`. Updating the egg from upstream would reset these variables to their defaults. Anyone who does that must re-pin them.
 
 **Verified:** read back as `BUILD_NUMBER = 132`, `MINECRAFT_VERSION = 1.21.11`, `SERVER_JARFILE = server.jar`.
+
+
+---
+
+## D-0023 | 2026-08-26 | MariaDB runs as a container, and a factual correction to session 1
+
+**The correction first.** Session 1 recorded that "`mariadb` and `redis-server` are both **inactive**, so the Panel is not using them". That reading was wrong. `scripts/remote/db-assess.sh` shows **no MariaDB or MySQL packages installed at all**, no server or client binary on `PATH`, and `systemctl is-enabled` returning **`not-found`** rather than `disabled`. They were never installed. `systemctl is-active` reports `inactive` for a unit that does not exist, which is what produced the misreading.
+
+**Why that changed the plan for the better.** "Start the existing service" was never an option. The real choice was between installing MariaDB on the host and running spec 5.2's `db` container. The container wins on three counts:
+
+1. **No `apt` on the game box.** 33.2 item 4 requires a fresh snapshot before "installing or upgrading anything at host level", and **OA-03 means no snapshot exists**. A host package install would have been the one irreversible step in this session.
+2. **The footprint is capped, not hoped for.** `--memory 320m` with `--memory-swap` equal to it, so it cannot swap - the same reasoning as deviation D7 for the game container. Measured use: **180.4 MiB**.
+3. **It is what the specification actually says.** 5.2 lists `db` as a container alongside `mc`.
+
+**Pinned to `mariadb:11.4.5`** with the pulled digest `sha256:49117dcc...938f7e4b` recorded in `server/manifest.yml`. A tag can be repointed by the publisher; a digest cannot. Confirmed `arch=arm64`.
+
+**Not exposed.** Published on `127.0.0.1:3306` only. 5.2 requires container-network only and row 5 requires MySQL invisible from outside; `check-external-ports.ps1` already probes 3306 and expects closed.
+
+**Data lives outside the Pelican volume**, at `/home/ubuntu/laughtail-db/`. Two reasons: it keeps the 33.1 ownership trap away from the database, and world backups and database backups have completely different consistency requirements (5.4) so they should not share a directory.
+
+**Credentials** are generated on the host with `openssl rand`, stored `0600` root-only, and passed as `MARIADB_*_FILE` secrets rather than `-e` values - an environment variable is visible in `docker inspect` for the life of the container. Neither password has been printed or committed.
+
+**Tuning, deliberately small:** `innodb_buffer_pool_size 64M` against the 128M default, `performance_schema` off, `max_connections 40`, UTC, `innodb_flush_log_at_trx_commit 1`. The dataset will be a few MB for years - 24 players and a transaction ledger - so a buffer pool larger than the whole dataset would only take page cache away from Paper's chunk I/O, and `sync-chunk-writes` is false precisely because that cache matters. Durability is kept at the default because a Berry transaction that is acknowledged must survive a power cut.
+
+**The cost, measured:** host available memory fell from 650 MB to **519 MB**. That is the third data point for **Q-41** and it moves in the wrong direction.
+
+---
+
+## D-0024 | 2026-08-26 | Schema conventions, and why the migration runner refuses more than it applies
+
+**Written as `db/migrations/V1__init.sql`, forward-only.** Applied in 379 ms; five tables, all InnoDB and `utf8mb4`.
+
+**V1 is deliberately not all 23 Appendix D tables.** It creates the bookkeeping, the two tables Phase 0 and Phase 1 need (`players`, `access_grants`), and the `seasons`/`champions` pair. Each later phase adds its own migration. The economy tables specifically should not be guessed at now: **Q-10** records that the economy has no numbers anywhere in the specification, and schema written against undecided mechanics gets rewritten - which forward-only migrations make expensive.
+
+**`champions` is the exception and is here on purpose.** Acceptance row 36 asks for "exactly one Champion per season" with evidence "**schema** plus failed-insert test". That wording demands a database constraint, so `PRIMARY KEY (season_number)` is a Phase 0 artefact even though seasons are Phase 4. Application-level checking would satisfy the sentence and miss the point: a race, a bug or a manual console command could still produce two champions.
+
+**Conventions, each with a reason rather than a habit:**
+
+| Choice | Instead of | Why |
+| --- | --- | --- |
+| `CHAR(36)` ascii_bin UUIDs | `BINARY(16)` | Tens of players, not millions, so the space saving is irrelevant while the debugging cost is real - every manual query and support conversation would need hex conversion. `ascii_bin` gives exact, case-sensitive matching |
+| `DATETIME(3)`, UTC by convention | `TIMESTAMP` | `TIMESTAMP` is a 32-bit offset that dies in 2038, and MariaDB converts it using the *session* time zone, so one row reads differently from two connections. 31.1 puts the season reset on a clock, so an ambiguous instant is a real bug |
+| `BIGINT` money | `DECIMAL` or a float | Berries are integers. A float balance cannot be summed reliably and would undermine the Phase 3 arbitrage audit |
+| `first_ip_hash CHAR(64)` | storing the IP | Row 32 needs same-IP kill *comparison*, not readability. A hash satisfies the requirement and limits what a database leak discloses |
+| `rules_version_accepted` | a boolean | Row 17 requires the accepted **version** be stored, so changing the rules can re-gate everyone |
+| `expires_at` nullable | `NOT NULL` | D-0002 and 24.1: the owner has not chosen one-time versus recurring pricing. NULL means never expires, so both models work with no later schema change |
+| `UNIQUE` on `transaction_ref` | no constraint | Payment webhooks are delivered more than once. This is what makes the handler safe to retry - the same payment cannot grant access twice |
+
+**The runner enforces forward-only rather than requesting it.** Every applied migration's SHA-256 is recorded, and if the file's hash later differs, the run **aborts and applies nothing**. Appendix D says never modify a live schema by hand; the corollary is never modify an applied migration, because the database cannot be re-derived from it afterwards. Without a checksum, an edited V1 is indistinguishable from an untouched one.
+
+**All three behaviours were observed, not assumed:**
+
+* **Applies:** V1 in 379 ms, five tables, `ERROR 1062` on the duplicate champion.
+* **Idempotent:** second run reported "already applied, checksum matches", "nothing to apply", `applied_at` unchanged.
+* **Refuses:** with the recorded checksum corrupted to `deadbeef...`, the runner printed both hashes and exited **3**, applying nothing. Then restored and re-verified. A guard that has never been observed refusing anything is an assumption, so it was made to refuse once, reversibly.
+
+**One bug worth recording, because it is a whole class.** The first version of the SQL helper piped output through `grep`, which makes the pipeline's exit status *grep's*. A `CREATE TABLE` produces no output, grep found nothing, exited 1, and `set -e` aborted the run on a statement that had actually succeeded. Output is now captured and filtered with `sed` so the real exit status survives - which the row 36 test depends on, since it must distinguish success from a constraint violation.
