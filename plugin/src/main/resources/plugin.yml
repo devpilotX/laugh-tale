@@ -16,6 +16,32 @@ commands:
   rules:
     description: Read the rules, and accept them.
     usage: /rules [accept]
+  # Moderation. Permission nodes come from the Section 17 ladder, so a Helper physically
+  # cannot issue a permanent ban regardless of what the code does.
+  warn:
+    description: Warn a player. Recorded permanently.
+    usage: /warn <player> <reason>
+  mute:
+    description: Mute a player for a duration.
+    usage: /mute <player> <30m|2h|7d> <reason>
+  unmute:
+    description: Revoke an active mute.
+    usage: /unmute <player> [reason]
+  kick:
+    description: Kick a player. Recorded permanently.
+    usage: /kick <player> <reason>
+  tempban:
+    description: Temporarily ban a player.
+    usage: /tempban <player> <30m|2h|7d> <reason>
+  ban:
+    description: Permanently ban a player.
+    usage: /ban <player> <reason>
+  unban:
+    description: Overturn a ban.
+    usage: /unban <player> [reason]
+  history:
+    description: View a player's punishment history. Viewing is itself audited.
+    usage: /history <player>
 
 permissions:
   # These mirror server/permissions.yml. LuckPerms is the source of truth for who

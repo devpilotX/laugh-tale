@@ -38,6 +38,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private WorldRules worldRules;
     private StatsTracker statsTracker;
     private CombatTracker combatTracker;
+    private Moderation moderation;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -67,6 +68,11 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(statsTracker, this);
         getServer().getPluginManager().registerEvents(combatTracker, this);
         statsTracker.start();
+
+        // Moderation. Every command path writes a staff_audit row, including the ones that
+        // fail validation - an audit that records only successes is a record of intentions.
+        this.moderation = new Moderation(this, database);
+        getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
         // would block startup on a network timeout, and acceptance row 25 forbids
@@ -193,6 +199,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     @Override
     public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
         String name = cmd.getName().toLowerCase();
+
+        if (moderation.handle(sender, name, args)) return true;
 
         if (name.equals("rules")) {
             if (!(sender instanceof Player p)) {

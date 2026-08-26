@@ -160,6 +160,149 @@ public final class Database {
         }
     }
 
+    /**
+     * Writes a staff_audit row. Every staff action goes through here.
+     *
+     * 17.4: "All staff actions are logged, permanently, to the database, including who,
+     * what, when, and to whom - and staff cannot delete these logs." The cannot-delete
+     * half is enforced by triggers in V2 and proven by db-test-append-only.sh; this is the
+     * are-they-logged-at-all half.
+     *
+     * staff_name and target_name are stored alongside the UUIDs on purpose. Appendix D
+     * asks for who and to whom, and a UUID stops being readable the moment an account is
+     * renamed or anonymised under 31.13 - at which point an audit trail of raw UUIDs is
+     * technically complete and practically useless.
+     */
+    void audit(UUID staff, String staffName, String action,
+               UUID target, String targetName, String parameters, String world)
+            throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO staff_audit (staff_uuid, staff_name, action, target_uuid, "
+               + "target_name, parameters, world, occurred_at) "
+               + "VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))")) {
+            if (staff != null) ps.setString(1, staff.toString()); else ps.setNull(1, java.sql.Types.CHAR);
+            ps.setString(2, staffName);
+            ps.setString(3, action);
+            if (target != null) ps.setString(4, target.toString()); else ps.setNull(4, java.sql.Types.CHAR);
+            if (targetName != null) ps.setString(5, targetName); else ps.setNull(5, java.sql.Types.VARCHAR);
+            if (parameters != null) ps.setString(6, parameters); else ps.setNull(6, java.sql.Types.VARCHAR);
+            if (world != null) ps.setString(7, world); else ps.setNull(7, java.sql.Types.VARCHAR);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Records a punishment and returns its id. */
+    long insertPunishment(UUID target, String type, String reason, String evidenceRef,
+                          UUID issuedBy, Long durationSeconds) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO punishments (target_uuid, type, reason, evidence_ref, issued_by, "
+               + "issued_at, expires_at) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3), "
+               + (durationSeconds == null ? "NULL" : "DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ? SECOND)")
+               + ")", PreparedStatement.RETURN_GENERATED_KEYS)) {
+            ps.setString(1, target.toString());
+            ps.setString(2, type);
+            ps.setString(3, reason);
+            if (evidenceRef != null) ps.setString(4, evidenceRef); else ps.setNull(4, java.sql.Types.VARCHAR);
+            if (issuedBy != null) ps.setString(5, issuedBy.toString()); else ps.setNull(5, java.sql.Types.CHAR);
+            if (durationSeconds != null) ps.setLong(6, durationSeconds);
+            ps.executeUpdate();
+            try (ResultSet rs = ps.getGeneratedKeys()) {
+                return rs.next() ? rs.getLong(1) : -1;
+            }
+        }
+    }
+
+    /**
+     * Returns the reason for an ACTIVE punishment of this type, or null if there is none.
+     *
+     * "Active" means not revoked and not expired, evaluated in SQL against the database's
+     * own UTC_TIMESTAMP rather than in Java against the server clock. Two clocks that
+     * disagree by a minute would let a ban expire early or linger, and the database is the
+     * one that wrote the expiry.
+     */
+    String activePunishmentReason(UUID target, String type) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT reason, expires_at FROM punishments WHERE target_uuid = ? AND type = ? "
+               + "AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP(3)) "
+               + "ORDER BY issued_at DESC LIMIT 1")) {
+            ps.setString(1, target.toString());
+            ps.setString(2, type);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                String reason = rs.getString(1);
+                String until = rs.getString(2);
+                return until == null ? reason + " (permanent)" : reason + " (until " + until + " UTC)";
+            }
+        }
+    }
+
+    /** Revokes the newest active punishment of a type. Returns true if one was revoked. */
+    boolean revokePunishment(UUID target, String type, UUID by, String reason) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE punishments SET revoked_at = UTC_TIMESTAMP(3), revoked_by = ?, "
+               + "revoked_reason = ? WHERE target_uuid = ? AND type = ? AND revoked_at IS NULL "
+               + "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP(3)) "
+               + "ORDER BY issued_at DESC LIMIT 1")) {
+            if (by != null) ps.setString(1, by.toString()); else ps.setNull(1, java.sql.Types.CHAR);
+            ps.setString(2, reason);
+            ps.setString(3, target.toString());
+            ps.setString(4, type);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    /** Punishment history for a player, newest first. */
+    java.util.List<String> punishmentHistory(UUID target, int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT id, type, reason, issued_at, expires_at, revoked_at "
+               + "FROM punishments WHERE target_uuid = ? ORDER BY issued_at DESC LIMIT ?")) {
+            ps.setString(1, target.toString());
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String state = rs.getString(6) != null ? "REVOKED"
+                        : (rs.getString(5) == null ? "active/permanent" : "expires " + rs.getString(5));
+                    out.add("#" + rs.getLong(1) + " " + rs.getString(2) + " - " + rs.getString(3)
+                        + " [" + rs.getString(4) + " UTC, " + state + "]");
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Looks up a UUID by cached name. Returns null when the player has never joined. */
+    UUID uuidByName(String name) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT uuid FROM players WHERE current_name = ? ORDER BY last_seen DESC LIMIT 1")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? UUID.fromString(rs.getString(1)) : null;
+            }
+        }
+    }
+
+    int countAuditRows() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM staff_audit");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
     /** Combat event count, for /laughtail status. */
     int countCombatEvents() throws SQLException {
         assertOffMainThread();

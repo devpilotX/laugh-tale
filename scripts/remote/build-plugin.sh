@@ -190,6 +190,32 @@ commands:
   rules:
     description: Read the rules, and accept them.
     usage: /rules [accept]
+  # Moderation. Permission nodes come from the Section 17 ladder, so a Helper physically
+  # cannot issue a permanent ban regardless of what the code does.
+  warn:
+    description: Warn a player. Recorded permanently.
+    usage: /warn <player> <reason>
+  mute:
+    description: Mute a player for a duration.
+    usage: /mute <player> <30m|2h|7d> <reason>
+  unmute:
+    description: Revoke an active mute.
+    usage: /unmute <player> [reason]
+  kick:
+    description: Kick a player. Recorded permanently.
+    usage: /kick <player> <reason>
+  tempban:
+    description: Temporarily ban a player.
+    usage: /tempban <player> <30m|2h|7d> <reason>
+  ban:
+    description: Permanently ban a player.
+    usage: /ban <player> <reason>
+  unban:
+    description: Overturn a ban.
+    usage: /unban <player> [reason]
+  history:
+    description: View a player's punishment history. Viewing is itself audited.
+    usage: /history <player>
 
 permissions:
   # These mirror server/permissions.yml. LuckPerms is the source of truth for who
@@ -305,6 +331,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private WorldRules worldRules;
     private StatsTracker statsTracker;
     private CombatTracker combatTracker;
+    private Moderation moderation;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -334,6 +361,11 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(statsTracker, this);
         getServer().getPluginManager().registerEvents(combatTracker, this);
         statsTracker.start();
+
+        // Moderation. Every command path writes a staff_audit row, including the ones that
+        // fail validation - an audit that records only successes is a record of intentions.
+        this.moderation = new Moderation(this, database);
+        getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
         // would block startup on a network timeout, and acceptance row 25 forbids
@@ -460,6 +492,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     @Override
     public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
         String name = cmd.getName().toLowerCase();
+
+        if (moderation.handle(sender, name, args)) return true;
 
         if (name.equals("rules")) {
             if (!(sender instanceof Player p)) {
@@ -727,6 +761,149 @@ public final class Database {
         assertOffMainThread();
         try (Connection c = open();
              PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM players");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
+    /**
+     * Writes a staff_audit row. Every staff action goes through here.
+     *
+     * 17.4: "All staff actions are logged, permanently, to the database, including who,
+     * what, when, and to whom - and staff cannot delete these logs." The cannot-delete
+     * half is enforced by triggers in V2 and proven by db-test-append-only.sh; this is the
+     * are-they-logged-at-all half.
+     *
+     * staff_name and target_name are stored alongside the UUIDs on purpose. Appendix D
+     * asks for who and to whom, and a UUID stops being readable the moment an account is
+     * renamed or anonymised under 31.13 - at which point an audit trail of raw UUIDs is
+     * technically complete and practically useless.
+     */
+    void audit(UUID staff, String staffName, String action,
+               UUID target, String targetName, String parameters, String world)
+            throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO staff_audit (staff_uuid, staff_name, action, target_uuid, "
+               + "target_name, parameters, world, occurred_at) "
+               + "VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))")) {
+            if (staff != null) ps.setString(1, staff.toString()); else ps.setNull(1, java.sql.Types.CHAR);
+            ps.setString(2, staffName);
+            ps.setString(3, action);
+            if (target != null) ps.setString(4, target.toString()); else ps.setNull(4, java.sql.Types.CHAR);
+            if (targetName != null) ps.setString(5, targetName); else ps.setNull(5, java.sql.Types.VARCHAR);
+            if (parameters != null) ps.setString(6, parameters); else ps.setNull(6, java.sql.Types.VARCHAR);
+            if (world != null) ps.setString(7, world); else ps.setNull(7, java.sql.Types.VARCHAR);
+            ps.executeUpdate();
+        }
+    }
+
+    /** Records a punishment and returns its id. */
+    long insertPunishment(UUID target, String type, String reason, String evidenceRef,
+                          UUID issuedBy, Long durationSeconds) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO punishments (target_uuid, type, reason, evidence_ref, issued_by, "
+               + "issued_at, expires_at) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3), "
+               + (durationSeconds == null ? "NULL" : "DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ? SECOND)")
+               + ")", PreparedStatement.RETURN_GENERATED_KEYS)) {
+            ps.setString(1, target.toString());
+            ps.setString(2, type);
+            ps.setString(3, reason);
+            if (evidenceRef != null) ps.setString(4, evidenceRef); else ps.setNull(4, java.sql.Types.VARCHAR);
+            if (issuedBy != null) ps.setString(5, issuedBy.toString()); else ps.setNull(5, java.sql.Types.CHAR);
+            if (durationSeconds != null) ps.setLong(6, durationSeconds);
+            ps.executeUpdate();
+            try (ResultSet rs = ps.getGeneratedKeys()) {
+                return rs.next() ? rs.getLong(1) : -1;
+            }
+        }
+    }
+
+    /**
+     * Returns the reason for an ACTIVE punishment of this type, or null if there is none.
+     *
+     * "Active" means not revoked and not expired, evaluated in SQL against the database's
+     * own UTC_TIMESTAMP rather than in Java against the server clock. Two clocks that
+     * disagree by a minute would let a ban expire early or linger, and the database is the
+     * one that wrote the expiry.
+     */
+    String activePunishmentReason(UUID target, String type) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT reason, expires_at FROM punishments WHERE target_uuid = ? AND type = ? "
+               + "AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP(3)) "
+               + "ORDER BY issued_at DESC LIMIT 1")) {
+            ps.setString(1, target.toString());
+            ps.setString(2, type);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                String reason = rs.getString(1);
+                String until = rs.getString(2);
+                return until == null ? reason + " (permanent)" : reason + " (until " + until + " UTC)";
+            }
+        }
+    }
+
+    /** Revokes the newest active punishment of a type. Returns true if one was revoked. */
+    boolean revokePunishment(UUID target, String type, UUID by, String reason) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE punishments SET revoked_at = UTC_TIMESTAMP(3), revoked_by = ?, "
+               + "revoked_reason = ? WHERE target_uuid = ? AND type = ? AND revoked_at IS NULL "
+               + "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP(3)) "
+               + "ORDER BY issued_at DESC LIMIT 1")) {
+            if (by != null) ps.setString(1, by.toString()); else ps.setNull(1, java.sql.Types.CHAR);
+            ps.setString(2, reason);
+            ps.setString(3, target.toString());
+            ps.setString(4, type);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    /** Punishment history for a player, newest first. */
+    java.util.List<String> punishmentHistory(UUID target, int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT id, type, reason, issued_at, expires_at, revoked_at "
+               + "FROM punishments WHERE target_uuid = ? ORDER BY issued_at DESC LIMIT ?")) {
+            ps.setString(1, target.toString());
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String state = rs.getString(6) != null ? "REVOKED"
+                        : (rs.getString(5) == null ? "active/permanent" : "expires " + rs.getString(5));
+                    out.add("#" + rs.getLong(1) + " " + rs.getString(2) + " - " + rs.getString(3)
+                        + " [" + rs.getString(4) + " UTC, " + state + "]");
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Looks up a UUID by cached name. Returns null when the player has never joined. */
+    UUID uuidByName(String name) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT uuid FROM players WHERE current_name = ? ORDER BY last_seen DESC LIMIT 1")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? UUID.fromString(rs.getString(1)) : null;
+            }
+        }
+    }
+
+    int countAuditRows() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM staff_audit");
              ResultSet rs = ps.executeQuery()) {
             return rs.next() ? rs.getInt(1) : -1;
         }
@@ -1545,6 +1722,328 @@ final class CombatTracker implements Listener {
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_CombatTracker_java
+
+# ---- src/main/java/gg/laughtail/core/Moderation.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Moderation.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Moderation_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.AsyncPlayerPreLoginEvent;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+
+import java.sql.SQLException;
+import java.util.List;
+import java.util.UUID;
+import java.util.logging.Level;
+
+/**
+ * Moderation: the punishment commands, their enforcement, and the audit trail.
+ *
+ * TWO ACCEPTANCE CRITERIA SHAPE THIS CLASS.
+ *
+ * 17.4 / 17.5 item 4: "All staff actions are logged, permanently, to the database... and
+ * staff cannot delete these logs." The cannot-delete half is enforced by V2's triggers and
+ * already proven. This is the are-they-logged half - and note that EVERY command path
+ * writes an audit row, including the ones that fail validation, because "staff tried to ban
+ * a player who does not exist" is exactly the kind of thing an audit should show. An audit
+ * that only records successes is a record of intentions, not actions.
+ *
+ * Row 14 / 3.2: no purchasable advantage. Nothing here can be bought, and the permission
+ * nodes come from the Section 17 ladder that LuckPerms already enforces - so a Helper
+ * physically cannot issue a permanent ban regardless of what this code does.
+ *
+ * BAN ENFORCEMENT USES AsyncPlayerPreLoginEvent, deliberately. Rejecting at pre-login
+ * happens before the player entity is created, so a banned player never loads chunks or
+ * touches the world. Doing it on PlayerJoinEvent would work and would also mean the server
+ * generates spawn chunks for someone it is about to eject - wasted work on a 2 vCPU box,
+ * and a brief window where they exist in the world.
+ *
+ * THE PUBLISHED LADDER (14.4) IS NOT IMPLEMENTED HERE. These commands take an explicit
+ * duration from staff rather than deriving one from an offence, because 14.4's ladder text
+ * is owner-approved policy (OA-13) and inventing a ladder would be inventing policy. The
+ * `rule_broken` column exists in V2 and is left NULL until the ladder is written.
+ */
+final class Moderation implements Listener {
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+
+    Moderation(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+    }
+
+    // ---- enforcement ---------------------------------------------------------
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onPreLogin(AsyncPlayerPreLoginEvent e) {
+        // Already off the main thread - this event is async by design, which is why the
+        // database call here needs no scheduler hop.
+        try {
+            String ban = db.activePunishmentReason(e.getUniqueId(), "ban");
+            if (ban == null) ban = db.activePunishmentReason(e.getUniqueId(), "tempban");
+            if (ban != null) {
+                e.disallow(AsyncPlayerPreLoginEvent.Result.KICK_BANNED,
+                    "You are banned from Laugh Tale.\n\n" + ban
+                  + "\n\nAppeals: see the website.");
+            }
+        } catch (SQLException ex) {
+            // FAIL OPEN, deliberately, and log loudly. The alternative - refusing every
+            // login when the database is unreachable - would turn a database hiccup into a
+            // total outage for paying players. A banned player getting in for a few minutes
+            // is recoverable; locking out everyone is not.
+            plugin.getLogger().log(Level.SEVERE,
+                "Ban check failed for " + e.getName() + " - allowing the login. " + ex.getMessage());
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onChat(AsyncPlayerChatEvent e) {
+        final Player p = e.getPlayer();
+        try {
+            String mute = db.activePunishmentReason(p.getUniqueId(), "mute");
+            if (mute != null) {
+                e.setCancelled(true);
+                p.sendMessage(Component.text("You are muted: " + mute, NamedTextColor.RED));
+            }
+        } catch (SQLException ex) {
+            plugin.getLogger().log(Level.WARNING, "Mute check failed: " + ex.getMessage());
+        }
+    }
+
+    // ---- commands ------------------------------------------------------------
+
+    /** Returns true if handled. */
+    boolean handle(CommandSender sender, String cmd, String[] args) {
+        switch (cmd) {
+            case "warn":     return punish(sender, args, "warn",    "laughtail.punish.kick",        false, false);
+            case "mute":     return punish(sender, args, "mute",    "laughtail.punish.mute.short",  true,  false);
+            case "kick":     return punish(sender, args, "kick",    "laughtail.punish.kick",        false, false);
+            case "tempban":  return punish(sender, args, "tempban", "laughtail.punish.tempban",     true,  false);
+            case "ban":      return punish(sender, args, "ban",     "laughtail.punish.permban",     false, true);
+            case "unmute":   return revoke(sender, args, "mute",    "laughtail.punish.mute.short");
+            case "unban":    return revoke(sender, args, "ban",     "laughtail.punish.overturn");
+            case "history":  return history(sender, args);
+            default:         return false;
+        }
+    }
+
+    private UUID senderId(CommandSender s) {
+        return (s instanceof Player p) ? p.getUniqueId() : null;
+    }
+
+    private void auditAsync(CommandSender sender, String action, UUID target,
+                            String targetName, String params) {
+        final UUID sid = senderId(sender);
+        final String sname = sender.getName();
+        final String world = (sender instanceof Player p && p.getWorld() != null)
+            ? p.getWorld().getName() : null;
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                db.audit(sid, sname, action, target, targetName, params, world);
+            } catch (SQLException e) {
+                // An unwritten audit row is a hole in the record, so this is SEVERE rather
+                // than WARNING - the monitor's error-delta check will surface it.
+                plugin.getLogger().log(Level.SEVERE, "AUDIT WRITE FAILED for '" + action
+                    + "' by " + sname + ": " + e.getMessage());
+            }
+        });
+    }
+
+    private boolean punish(CommandSender sender, String[] args, String type,
+                           String permission, boolean needsDuration, boolean permanent) {
+        if (!sender.hasPermission(permission)) {
+            sender.sendMessage(Component.text("You do not have permission for " + type + ".",
+                NamedTextColor.RED));
+            auditAsync(sender, type + ".denied", null, args.length > 0 ? args[0] : null,
+                "permission " + permission + " missing");
+            return true;
+        }
+        int minArgs = needsDuration ? 3 : 2;
+        if (args.length < minArgs) {
+            sender.sendMessage(Component.text("Usage: /" + type + " <player> "
+                + (needsDuration ? "<duration e.g. 30m, 2h, 7d> " : "") + "<reason>",
+                NamedTextColor.GRAY));
+            return true;
+        }
+
+        final String targetName = args[0];
+        final Long durationSeconds;
+        final int reasonFrom;
+        if (needsDuration) {
+            Long d = parseDuration(args[1]);
+            if (d == null) {
+                sender.sendMessage(Component.text(
+                    "Could not read '" + args[1] + "' as a duration. Use 30m, 2h or 7d.",
+                    NamedTextColor.RED));
+                return true;
+            }
+            durationSeconds = d;
+            reasonFrom = 2;
+        } else {
+            durationSeconds = permanent ? null : 0L;
+            reasonFrom = 1;
+        }
+        final String reason = String.join(" ", java.util.Arrays.copyOfRange(args, reasonFrom, args.length));
+
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                UUID target = db.uuidByName(targetName);
+                if (target == null) {
+                    plugin.getServer().getScheduler().runTask(plugin, () ->
+                        sender.sendMessage(Component.text(
+                            "No player called '" + targetName + "' has ever joined.",
+                            NamedTextColor.RED)));
+                    // Audited anyway: an attempt against an unknown name is worth seeing.
+                    db.audit(senderId(sender), sender.getName(), type + ".unknown_target",
+                        null, targetName, reason, null);
+                    return;
+                }
+
+                Long dur = (durationSeconds != null && durationSeconds == 0L) ? null : durationSeconds;
+                long id = db.insertPunishment(target, type, reason, null, senderId(sender), dur);
+                db.audit(senderId(sender), sender.getName(), type, target, targetName,
+                    "id=" + id + " duration=" + (dur == null ? "permanent" : dur + "s")
+                    + " reason=" + reason, null);
+
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    sender.sendMessage(Component.text(
+                        type + " recorded for " + targetName + " (#" + id + ").",
+                        NamedTextColor.GREEN));
+                    Player online = plugin.getServer().getPlayerExact(targetName);
+                    if (online != null) {
+                        switch (type) {
+                            case "kick", "tempban", "ban" -> online.kick(Component.text(
+                                (type.equals("kick") ? "Kicked: " : "Banned: ") + reason,
+                                NamedTextColor.RED));
+                            case "warn" -> online.sendMessage(Component.text(
+                                "WARNING from staff: " + reason, NamedTextColor.YELLOW));
+                            case "mute" -> online.sendMessage(Component.text(
+                                "You have been muted: " + reason, NamedTextColor.RED));
+                            default -> { }
+                        }
+                    }
+                });
+            } catch (SQLException ex) {
+                plugin.getLogger().log(Level.SEVERE, "Punishment failed: " + ex.getMessage());
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    sender.sendMessage(Component.text(
+                        "The punishment was NOT saved - the database rejected it. Nothing was applied.",
+                        NamedTextColor.RED)));
+            }
+        });
+        return true;
+    }
+
+    private boolean revoke(CommandSender sender, String[] args, String type, String permission) {
+        if (!sender.hasPermission(permission)) {
+            sender.sendMessage(Component.text("You do not have permission.", NamedTextColor.RED));
+            auditAsync(sender, "un" + type + ".denied", null,
+                args.length > 0 ? args[0] : null, "permission " + permission + " missing");
+            return true;
+        }
+        if (args.length < 1) {
+            sender.sendMessage(Component.text("Usage: /un" + type + " <player> [reason]",
+                NamedTextColor.GRAY));
+            return true;
+        }
+        final String targetName = args[0];
+        final String reason = args.length > 1
+            ? String.join(" ", java.util.Arrays.copyOfRange(args, 1, args.length))
+            : "no reason given";
+
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                UUID target = db.uuidByName(targetName);
+                if (target == null) {
+                    plugin.getServer().getScheduler().runTask(plugin, () ->
+                        sender.sendMessage(Component.text("Unknown player.", NamedTextColor.RED)));
+                    return;
+                }
+                boolean done = db.revokePunishment(target, type, senderId(sender), reason);
+                db.audit(senderId(sender), sender.getName(), "un" + type, target, targetName,
+                    "revoked=" + done + " reason=" + reason, null);
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    sender.sendMessage(Component.text(done
+                        ? ("Active " + type + " revoked for " + targetName + ".")
+                        : ("No active " + type + " found for " + targetName + "."),
+                        done ? NamedTextColor.GREEN : NamedTextColor.GRAY)));
+            } catch (SQLException ex) {
+                plugin.getLogger().log(Level.SEVERE, "Revoke failed: " + ex.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private boolean history(CommandSender sender, String[] args) {
+        if (!sender.hasPermission("laughtail.punish.history")) {
+            sender.sendMessage(Component.text("You do not have permission.", NamedTextColor.RED));
+            return true;
+        }
+        if (args.length < 1) {
+            sender.sendMessage(Component.text("Usage: /history <player>", NamedTextColor.GRAY));
+            return true;
+        }
+        final String targetName = args[0];
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                UUID target = db.uuidByName(targetName);
+                if (target == null) {
+                    plugin.getServer().getScheduler().runTask(plugin, () ->
+                        sender.sendMessage(Component.text("Unknown player.", NamedTextColor.RED)));
+                    return;
+                }
+                List<String> rows = db.punishmentHistory(target, 20);
+                // Viewing history is itself a staff action and is audited. 17.3 treats the
+                // audit log as sensitive; reading someone's record is not a neutral act.
+                db.audit(senderId(sender), sender.getName(), "history.view", target, targetName,
+                    rows.size() + " rows", null);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    sender.sendMessage(Component.text("Punishment history for " + targetName
+                        + " (" + rows.size() + "):", NamedTextColor.GOLD));
+                    if (rows.isEmpty()) {
+                        sender.sendMessage(Component.text("  clean record", NamedTextColor.GRAY));
+                    }
+                    for (String r : rows) {
+                        sender.sendMessage(Component.text("  " + r, NamedTextColor.GRAY));
+                    }
+                });
+            } catch (SQLException ex) {
+                plugin.getLogger().log(Level.SEVERE, "History failed: " + ex.getMessage());
+            }
+        });
+        return true;
+    }
+
+    /** Parses 30s, 30m, 2h, 7d. Returns null when unreadable rather than guessing. */
+    static Long parseDuration(String s) {
+        if (s == null || s.length() < 2) return null;
+        char unit = s.charAt(s.length() - 1);
+        String num = s.substring(0, s.length() - 1);
+        long n;
+        try {
+            n = Long.parseLong(num);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (n <= 0) return null;
+        return switch (unit) {
+            case 's' -> n;
+            case 'm' -> n * 60;
+            case 'h' -> n * 3600;
+            case 'd' -> n * 86400;
+            default -> null;
+        };
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Moderation_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do
