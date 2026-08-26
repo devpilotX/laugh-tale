@@ -120,7 +120,11 @@ q "" "SHOW DATABASES;"
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== PART 2: world restore into scratch ==="
-sudo -n rm -rf "$SCRATCH"
+# LITERAL PATH, NOT $SCRATCH. The destructive-command guard refuses a recursive delete whose target
+# is a variable, and it is right to: a static check cannot know what a variable expands to, and this
+# is the one command in the repository that could delete the wrong tree. Written out so the guard can
+# read it, and so can anyone reviewing this file.
+sudo -n rm -rf /home/ubuntu/laughtail-scratch/restore-drill
 sudo -n mkdir -p "$SCRATCH"
 sudo -n tar -xzf "$WORLD_TAR" -C "$SCRATCH"
 echo "extracted to $SCRATCH"
@@ -156,7 +160,11 @@ fi
 
 echo "--- region files: restored vs live ---"
 R_RESTORED=$(sudo -n find "$SCRATCH" -name '*.mca' | wc -l)
-R_LIVE=$(sudo -n find "$D/laughtail" "$D/laughtail_nether" "$D/laughtail_the_end" -name '*.mca' 2>/dev/null | wc -l)
+# 26.2 UNIFIED WORLD LAYOUT (D-0029): every dimension now lives INSIDE laughtail/dimensions/, so the
+# old sibling directories laughtail_nether and laughtail_the_end no longer exist. `find` on a missing
+# path exits 1, and under `set -e` that killed the whole drill silently after the level.dat checks -
+# which is exactly the kind of stale assumption a drill is supposed to catch, in its own code this time.
+R_LIVE=$(sudo -n find "$D/laughtail" -name '*.mca' 2>/dev/null | wc -l || true)
 echo "  restored=$R_RESTORED live=$R_LIVE"
 if [ "$R_RESTORED" -ge 1 ] && [ "$R_RESTORED" -eq "$R_LIVE" ]; then
   echo "  OK: every region file came back"
@@ -165,9 +173,12 @@ else
 fi
 
 echo "--- a region file must have a non-empty header ---"
-SAMPLE=$(sudo -n find "$SCRATCH" -name '*.mca' | head -1)
+# -print -quit RATHER THAN | head -1. head closes the pipe as soon as it has its line, find then dies
+# of SIGPIPE, and under `pipefail` that is exit 141 which kills the drill. The drill exited 141 here
+# with no error message at all, which is worse than failing loudly.
+SAMPLE=$(sudo -n find "$SCRATCH" -name '*.mca' -print -quit)
 if [ -n "$SAMPLE" ]; then
-  NONZERO=$(sudo -n od -An -tx1 -N 4096 "$SAMPLE" | tr -d ' \n' | tr -d '0' | wc -c)
+  NONZERO=$( { sudo -n od -An -tx1 -N 4096 "$SAMPLE" || true; } | tr -d ' \n' | tr -d '0' | wc -c )
   echo "  $(basename "$SAMPLE"): $NONZERO non-zero nibbles in the 4 KB location table"
   if [ "$NONZERO" -gt 0 ]; then echo "  OK: the chunk location table is populated"; else echo "  FAIL: header is all zeroes"; FAIL=$((FAIL + 1)); fi
 fi
@@ -184,7 +195,11 @@ done
 echo "  rcon.password present? $(sudo -n grep -c '^rcon.password=..*' "$SCRATCH/server.properties") (1 expected - the backup DOES contain secrets, which is why it stays on the host)"
 
 echo "--- cleaning up scratch ---"
-sudo -n rm -rf "$SCRATCH"
+# LITERAL PATH, NOT $SCRATCH. The destructive-command guard refuses a recursive delete whose target
+# is a variable, and it is right to: a static check cannot know what a variable expands to, and this
+# is the one command in the repository that could delete the wrong tree. Written out so the guard can
+# read it, and so can anyone reviewing this file.
+sudo -n rm -rf /home/ubuntu/laughtail-scratch/restore-drill
 sudo -n test -d "$SCRATCH" && echo "  WARNING: scratch still present" || echo "  removed"
 
 echo ""

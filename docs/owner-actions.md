@@ -709,7 +709,7 @@ What I am doing meanwhile: the parts of Phase 4 that do not need the ranking mat
      Champion mechanism. All of it is testable without a single rating point.
 ```
 
-## OA-31 - roleplay needs one paragraph from the owner before anything can be built
+BLOCKED - OA-31 Roleplay needs one paragraph from the owner before anything more can be built
 
 **What is blocked.** The roleplay system. Asked for twice, recorded as D-0033, still undesigned.
 
@@ -733,7 +733,7 @@ schema decides everything after it.
 **What I will do meanwhile.** Continue with the auction house, claims, chat protection and the tested
 gaps. None of them depend on this answer.
 
-## OA-32 - anti-cheat is the launch blocker and needs a decision, not more engineering
+BLOCKED - OA-32 Anti-cheat is the launch blocker and needs a decision, not more engineering
 
 **Status.** Row 50 requires flight and reach cheats to be caught and logged. GrimAC was installed and
 tested twice on Minecraft 26.2 and failed both times with `NMS_ITEM_STACK_CLASS is null`. The version
