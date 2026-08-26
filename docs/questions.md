@@ -360,3 +360,29 @@ Not contradictions - the document was written before anyone looked at this machi
 This file holds what changes a build decision. The complete raw findings - every acceptance criterion catalogued per section, all 117 contradictions with both sides quoted, all 254 ambiguities with a narrowest resolving question each, plus per-section dependency and host-risk lists - are in `docs/spec/.findings/G1.md` through `G9.md`.
 
 They are working notes, not deliverables, and they are noisier than this file. But nothing was discarded, and if a question here looks under-argued, the quoted source is there.
+
+
+### Q-41 | SERIOUS | The 2,816 MiB allocation may be larger than this box can honour, and the spec's own heap target cannot fit at all
+
+**The arithmetic**, all measured this session rather than assumed:
+
+| Quantity | Value |
+| --- | --- |
+| Host total RAM | 3,825 MB |
+| Host services at idle, server stopped (OS, Docker, Wings, nginx, php-fpm, queue) | ~700 MB |
+| Panel allocation for `laughtail-dev` | 2,816 MiB |
+| Container ceiling Wings enforces (allocation + Pelican's 10%) | 3,097 MiB = 3,248 MB |
+| Ceiling + host services | **3,948 MB against 3,825 MB total** |
+
+**So the container is permitted to grow past the point where the host runs out.** In practice it does not: heap is capped at 2,048 MiB and observed non-heap use puts the real ceiling near 2,530 MiB, which fits with roughly 475 MB to spare. Measured at idle: container 2.487 GiB of 3.025 GiB, host 625 MB available. Nothing is failing. But the *limit* is set where a limit should never be set - above what the machine has - so it protects nothing.
+
+**Two ways to make the ceiling itself safe, both with a real cost:**
+
+1. **Reduce the allocation to ~2,560 MiB.** Ceiling becomes 2,816 MiB = 2,953 MB; plus host that is 3,653 MB, leaving ~170 MB. Rule 4 then forces the heap down to **1,792 MiB** (2,560 − 768).
+2. **Leave it as it is** and rely on the JVM not using what it is allowed. This is what almost every small server does, and it works right up until it does not, at which point the host OOM killer chooses the victim - possibly the Panel rather than the game.
+
+**Why this is not just tidiness:** it interacts with the player cap, which is the product's own promise. Spec 22.3 sizes "up to 24 players" at "4 GB, heap ~2.5 GB". A 2.5 GB heap inside a 2,816 MiB allocation leaves 11% outside, which **never-break rule 4 forbids outright**. So the specification's own sizing guidance and its own never-break rule cannot both be satisfied on this box. One of them has to give, and which one gives determines whether 24 players is achievable here or whether the real number is lower.
+
+**This sharpens R3 from a worry into a conclusion:** this box cannot host the spec's 24-player heap *and* run the Pelican Panel. The options are a bigger instance, or moving the Panel off the game box, or a lower cap. All three are owner decisions with cost attached, and all three are cheaper to make now than after the Phase 6 load test is run on a configuration that has to change anyway.
+
+**What I did meanwhile:** left the working configuration in place - heap 2,048 MiB, rule 4 passing at 27.3%, swap disabled, zero errors - and did not quietly re-size the box's allocation, because the choice between "lower heap" and "fewer players" is a product decision, not a tuning one. Related: **OA-05** (burstable instance) and **R3** in `docs/progress.md`. Phase 6 must not be run until this is settled, for the same reason OA-05 must be settled: a cap measured on a configuration that is about to change is not a measurement.

@@ -316,3 +316,60 @@ A version 4 UUID is issued by Mojang; a version 3 UUID is invented by an offline
 **Decision:** no script in this repository dumps `server.properties` wholesale. Key **names** are read by `read-properties-keys.sh`; **values** are read only by explicit name, and the two secret-bearing keys are excluded by construction. Any output that might contain them is passed through a redacting `sed` first. The reason is written into the script itself as a comment so the next person does not re-add the convenience.
 
 **Residual risk, stated plainly:** the two secrets did appear in one earlier session's transcript. They are unchanged on the host and remain functional. Rotating them is cheap - RCON is not reachable externally and the management server is disabled - but it is the owner's call, so it is raised as an owner action rather than done silently.
+
+
+---
+
+## D-0020 | 2026-08-26 | Never-break rule 4 was being measured against the wrong number, and was failing
+
+**What session 1 recorded:** "Allocation 3,097 MiB, `-Xms768M -Xmx2304M`. Headroom 793 MiB = **25.6%**. Never-break rule 4 is satisfied, but only just."
+
+**That was wrong.** 3,097 MiB is the **container limit**, which Pelican computes as the allocation **plus its own 10% overhead**. The allocation the Panel actually enforces is **2,816 MiB**, read from `Server::find(1)->memory`. Against that number:
+
+```
+2816 - 2304 = 512 MiB outside the heap = 18.2%
+```
+
+Rule 4 requires **25% or 768 MB**. It was failing both tests, and the reassuring 25.6% came from treating Pelican's overhead allowance as headroom we were entitled to spend. It is not: it is the room the JVM's non-heap memory - metaspace, code cache, thread stacks, direct byte buffers, GC structures - has to live in.
+
+**Fixed:** `-Xms2048M -Xmx2048M`. That leaves exactly **768 MiB = 27.3%** outside the heap, passing both tests.
+
+**Why `Xms` equals `Xmx`:** the startup line already carries `-Dusing.aikars.flags` and `-XX:+AlwaysPreTouch`. Aikar's flags require `Xms=Xmx`, and pre-touching a fixed heap makes the footprint **predictable at boot** rather than growing later into a box with no room to grow. On 3.8 GB, a surprise is worse than a cost.
+
+**Verified in the running container, not in the Panel record** - the distinction matters because Wings only applies memory changes when it recreates the container:
+
+* `docker top` shows `-Xms2048M -Xmx2048M`
+* allocation 2816, xmx 2048, outside 768 MiB (27%) - **RULE 4 PASS**
+* boot clean, `Done (54s)`, all eight plugins enabled, 0 ERROR
+
+**The cost, stated because it is real:** committing the heap up front pushed container use to 2.487 GiB of its 3.025 GiB ceiling at idle, and host page cache from 1,844 MB down to 740 MB with 625 MB available. Predictable, but tight. See **Q-41**, which works through whether the 2,816 MiB allocation is itself too large for this box.
+
+---
+
+## D-0021 | 2026-08-26 | The existing server is renamed to `laughtail-dev` rather than a second server being created
+
+**The blocker:** pre-flight 33.6 items 9 and 10 require a server named `laughtail-dev` with its own allocation and a heap 25% below it. D-0012 established that Pelican has **no `p:server:make`**, so a server cannot be created over SSH, and OA-25 has been waiting on the owner since.
+
+**What I did instead:** renamed the one existing server. It already has the only allocation on the node (`0.0.0.0:25565`), it already runs the pinned Paper with our config, and its heap now satisfies rule 4. Renaming satisfies items 9 and 10 today, with a single scalar field change.
+
+**Why this is better than creating a second server, not merely easier:** a second server needs a second allocation and its own memory. This box has 3,825 MB total and this one server is allocated 2,816 MiB. Two such servers cannot coexist - which is exactly why never-break rule 2 exists. Creating a second one would produce a Panel record that can never safely start, and pre-flight item 11 already requires the other server to stay stopped. One server, correctly named, is the honest configuration.
+
+**How it was changed:** through the application's own Eloquent models via `artisan tinker`, never raw SQL against `database.sqlite`. The models handle casts, timestamps and encrypted attributes correctly; hand-editing a Panel database is the class of change that breaks a Panel silently, and it is the trap 33.1 warns about. Every previous value was printed before being overwritten, so reverting is copy and paste.
+
+**Consequence for OA-25:** **downgraded from blocking to optional.** The Application API key is still the better long-term route - the production server, the restore-drill scratch server and the post-migration replacement all still need creating, and Section 29 wants each to be a scripted, reviewable action rather than a sequence of clicks. But Phase 0 is no longer stalled behind it.
+
+**Production is unaffected.** `laughtail` still does not exist, and never-break rule 1 is intact.
+
+---
+
+## D-0022 | 2026-08-26 | The egg variables are pinned so a Reinstall reproduces the manifest instead of destroying it
+
+**What I found:** the Paper egg's install script downloads from `fill.papermc.io` using two server variables, and they read `MINECRAFT_VERSION=26.2` and `BUILD_NUMBER=latest`.
+
+**Why that was a loaded gun:** the install script runs on install and reinstall, **not** on boot - so nothing was broken today. But one click of "Reinstall" in the Panel would have fetched the newest 26.2 build, overwritten the pinned `server.jar`, and left a 1.21.11 world and config under a 26.2 server. `latest` is precisely the floating tag spec 4.2 forbids, sitting in the one place nobody was looking.
+
+**Fixed:** `MINECRAFT_VERSION=1.21.11`, `BUILD_NUMBER=132` - the same values `server/manifest.yml` pins and whose checksum `verify-manifest.ps1` confirms. A reinstall now rebuilds exactly what the manifest describes, which is what Section 29 means by the repository reproducing the runtime.
+
+**Note for the migration (Section 22):** the egg has an `update_url` pointing at the upstream `egg-paper.yaml`. Updating the egg from upstream would reset these variables to their defaults. Anyone who does that must re-pin them.
+
+**Verified:** read back as `BUILD_NUMBER = 132`, `MINECRAFT_VERSION = 1.21.11`, `SERVER_JARFILE = server.jar`.
