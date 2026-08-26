@@ -64,10 +64,25 @@ The dev server is **running**. That is a deliberate choice, not an oversight: th
 
 **Next, in order:**
 
-1. Owner answers **OA-25** (Panel API key or clicks) so `laughtail-dev` can exist and this work can move off the stock server.
-2. Owner answers **OA-26** (rotate the two leaked-to-transcript secrets, or defer).
-3. Capture the empty-server MSPT and memory baseline via bundled spark - deviation **D2**. The server is up and idle, so this is cheap and is a prerequisite for attributing any later cost.
-4. Phase 0.2 repository machinery that needs no new server: `deploy.sh`, the pre-commit secret hook, `db/migrations/`.
+1. Owner answers **OA-26** (rotate the two secrets that reached a transcript, or defer).
+2. Owner answers **Q-41** and **OA-05** - the memory ceiling and the burstable instance. Both must be settled *before* Phase 6, because a cap measured on a configuration that is about to change is not a measurement.
+3. Appendix C Paper configuration as repository source of truth: `paper-global.yml`, `paper-world-defaults.yml`, `spigot.yml`, `bukkit.yml`. This also enables the bundled spark profiler, which is currently off.
+4. `db/migrations/` and the migration runner - Phase 0.5, needs no new server.
+5. The pre-commit secret hook and `scripts/deploy.sh` - Phase 0.2.
+
+### Session 2, second half - what changed after the reconnect
+
+**Pre-flight items 9 and 10 now PASS.** The existing server was renamed to `laughtail-dev` rather than a second server being created, because a second 2,816 MiB allocation cannot coexist with this one on a 3,825 MB box. **OA-25 drops from blocking to optional** - the Application API key is still the better long-term route for the three servers still to be created, but Phase 0 is no longer stalled behind it. See **D-0021**.
+
+**Never-break rule 4 was being violated, and the number that said otherwise was measured against the wrong denominator.** Session 1's "25.6% headroom, satisfied but only just" used the 3,097 MiB container limit, which is the allocation *plus Pelican's own 10% overhead*. Against the real 2,816 MiB allocation, `-Xmx2304M` left 18.2% - failing both of rule 4's tests. Now `-Xms2048M -Xmx2048M`, leaving exactly 768 MiB = 27.3%. Verified with `docker top` on the running container, because a Panel edit without a restart proves nothing. See **D-0020**.
+
+**Deviation D7 done.** `swap` 512 → 0, so `MemorySwap` equals `Memory` and the JVM cannot swap. It will OOM cleanly instead of stalling for seconds.
+
+**A loaded gun found and unloaded.** The egg's variables read `MINECRAFT_VERSION=26.2` and `BUILD_NUMBER=latest`, and its install script downloads from `fill.papermc.io` using them. Nothing was wrong today - that script runs on install and reinstall, not boot - but one click of "Reinstall" would have overwritten the pinned jar and left a 1.21.11 world under a 26.2 server. Now pinned to 1.21.11 / 132, matching the manifest. See **D-0022**.
+
+**Deviation D2 done.** Baseline in `docs/baselines.md`: TPS 20.0 flat, MSPT avg 0.2 ms - 0.8% of the 25 ms budget - so the whole budget is still unspent and later overruns are attributable to features. The figure that needs watching is not CPU (2.2%) but **647 MB host memory available**, down from 1,844 MB of page cache, because fixing the heap at 2 GiB took that cache and chunk I/O is served from it.
+
+**New risk, and it is the sharpest one yet - Q-41.** The container ceiling is 3,248 MB and host services need ~700 MB, against 3,825 MB total. The limit is therefore set above what the machine can honour; it fits in practice only because the JVM does not use all it is allowed. More importantly, spec 22.3's "~2.5 GB heap for 24 players" inside a 2,816 MiB allocation leaves 11% outside, which **never-break rule 4 forbids outright**. The specification's own sizing and its own never-break rule cannot both hold on this box. That makes **R3 a conclusion rather than a worry**: either the instance grows, or the Panel moves off the game box, or the cap is below 24. All three are owner decisions with money attached.
 
 
 ## 1. What this session actually did
