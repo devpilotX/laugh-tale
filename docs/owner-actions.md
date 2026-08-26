@@ -613,3 +613,35 @@ What I will do when it arrives: create laughtail-dev with the allocation and hea
 What I am doing meanwhile: repo-side Phase 0.2 work that needs no server -
      deploy.sh, drift.sh, and the database schema in db/migrations/.
 ```
+
+
+```
+BLOCKED - OA-26 Decide whether to rotate the RCON password and management secret
+What I need: a yes or no on rotating two credentials, plus the same answer for the
+     Pelican SFTP and Panel passwords if you reused anything.
+Why: an earlier version of one of my read-only scripts ended with
+     `cat server.properties`, which printed the live RCON password (32 characters)
+     and the 1.21.9 management-server secret (40 characters) into a session
+     transcript. That is exactly what never-break rule 5 exists to prevent. I have
+     removed the dump, written the reason into the script as a comment so it does
+     not come back, and recorded it as decisions.md D-0019.
+How bad it is, honestly: low, but not zero. Neither credential is reachable from
+     the internet - proven, not assumed. The external probe from my PC shows port
+     25575 closed, Docker publishes only 25565, and the management server is
+     disabled, bound to localhost, on port 0. So exploiting either one requires
+     already having a shell on the host, at which point they are the least of the
+     problems. Neither value has ever been committed to git.
+Steps for the owner:
+  1. Decide: rotate now, or rotate at launch with everything else.
+  2. If rotating now, reply "rotate rcon" and I will generate a new value on the
+     host, write it straight into the live file, and never read it back. It is one
+     command and one restart of the dev server. Nothing depends on the old value.
+  3. The management secret needs no rotation while the management server is
+     disabled, but I will do both together if you prefer.
+  4. Do NOT reuse these values anywhere else in the meantime.
+What I will do when it arrives: rotate host-side with the value never leaving the
+     host, then re-run the drift check to confirm both keys are still non-empty.
+What I am doing meanwhile: treating both as live and never reading them again. The
+     Section 22.7 migration step rotates every secret anyway, so this is a question
+     of timing rather than of whether.
+```

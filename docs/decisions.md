@@ -207,3 +207,112 @@ Also verified before committing to 1.21.11: Geyser **2.11.2 build 1232** (`Geyse
 **What I refused to do:** create the server by writing to `/var/www/pelican/database/database.sqlite`. It is technically possible and it is exactly the class of change that breaks a Panel silently, which is the trap 33.1 itself warns about.
 
 **Verified:** the `p:` namespace listing and the allocation, node, server, egg and user counts are in this session's transcript and re-derivable with `scripts/remote/panel-capability.sh`.
+
+
+---
+
+## D-0013 | 2026-08-26 | `level-name=laughtail`, and the owner's existing world is never opened
+
+**The problem:** the volume already held a `world/` directory. `scripts/remote/check-world-version.sh` read its `level.dat` and found **DataVersion 4903, written by Minecraft 26.2**. We are pinning **1.21.11** (D-0011), and Minecraft cannot open a world from a newer version - it either refuses or corrupts. Deleting it was never an option: never-break rule 3.
+
+**Decision:** set `level-name=laughtail`. Paper then generates fresh `laughtail`, `laughtail_nether` and `laughtail_the_end` directories and never reads `world/` at all. The old world stays on disk, untouched, as its own rollback.
+
+**Why not downgrade or convert:** there is no supported downgrade path. Any conversion tool would be operating on the owner's only copy of a world we did not create.
+
+**Verified:** first boot created all three `laughtail*` directories, and `world/level.dat` has mtime **1787711549 before and after** the boot - byte-identical, never opened. Evidence in `scripts/remote/start-server-and-verify.sh` output.
+
+**Cost:** the old world occupies 749 MB that will not be reclaimed until the owner says it may be. Recorded against **OA-04** (disk) rather than silently deleted.
+
+---
+
+## D-0014 | 2026-08-26 | `server.properties` lives in git with secrets as `__PRESERVE__`, resolved host-side
+
+**The problem:** Section 29 requires the repository to be the only source of truth for configuration, but the live `server.properties` contains an RCON password and a management-server secret. Never-break rule 5 forbids either entering git.
+
+**Decision:** the repository holds the full file with every secret written as the literal `__PRESERVE__`. `scripts/remote/deploy-server-properties.sh` - generated from that one file by `scripts/gen-deploy-server-properties.ps1` - reads each placeheld value **from the live file on the host** and substitutes it there. No credential is transmitted, printed or stored. The script reports only a character count.
+
+**Why not a `.env` file or Panel variables:** both would split the truth across two places, and the Panel's copy cannot be diffed or reviewed. One file, one source, secrets resolved at the last possible moment.
+
+**Four properties the deploy script enforces, each of which was a real failure mode, not a hypothetical:**
+
+1. **Refuses to run while the container is up.** Paper rewrites `server.properties` at shutdown, so editing a running server silently discards the edit.
+2. **Aborts if the template lacks any key the live file has.** Paper regenerates a default for a missing key - for a secret that is a silent credential rotation. This check caught **twelve** keys the first draft had omitted, including `management-server-secret`.
+3. **Aborts if a `__PRESERVE__` placeholder survives into the output.** It did, twice, during development - once from a mis-escaped `sed`, once because the check matched the template's own explanatory prose. Both times it installed nothing.
+4. **Refuses to generate at all if a real secret is sitting in the template**, so the placeholder cannot be filled in by accident and committed.
+
+**Verified:** deployed with `rcon.password` (32 chars) and `management-server-secret` (40 chars) both carried across, file `owner=999:987 mode=644`, and all 73 keys read back from disk.
+
+---
+
+## D-0015 | 2026-08-26 | Configuration drift is defined on meaning, not on bytes
+
+**What I measured:** Paper rewrites `server.properties` on boot. The deployed file went from **6,155 bytes with ~60 comment lines to 1,868 bytes with 2**, and the keys were reordered. Every value survived.
+
+**Therefore:** a drift detector that compares bytes, or runs `diff`, reports drift after **every single start**. A check that always fails is a check everybody learns to ignore, which is worse than no check.
+
+**Decision:** `scripts/remote/check-properties-drift.sh` compares **key and value**, sorted, with comments discarded. Two further equivalences are handled explicitly rather than by loosening the comparison:
+
+* The two secrets are compared as **"still non-empty"**, never by value. A secret that has become empty is a real failure and is reported as one.
+* `motd` is compared **after decoding** `\uXXXX` escapes and `\\` on **both** sides. The repository writes escapes because that is the portable way to put section signs in a `.properties` file; Paper writes literal UTF-8. Same string, two spellings.
+
+**A trap worth recording:** the first attempt decoded only the repository side, then tried Python's `unicode_escape` codec, which decodes via latin-1 and turns a literal UTF-8 `§` into two mojibake characters. It reported drift that did not exist. Both sides must be decoded, with the same rules.
+
+**Verified:** `template keys: 73   live keys: 73`, `NO DRIFT`, both secrets non-empty, motd identical after decoding. Exit code 0.
+
+---
+
+## D-0016 | 2026-08-26 | The 1.21.9 management server is explicitly disabled, and its secret is preserved
+
+**What I found:** Minecraft 1.21.9 added a management API, and the live file already had eight `management-server-*` keys including a 40-character secret. The first draft of the template omitted all of them.
+
+**Why that mattered:** this is a **second remote-control surface** for the server, so acceptance row 5 - "RCON unreachable, only the intended ports open" - governs it exactly as it governs RCON. Omitting the keys would have had Paper regenerate the secret at boot: a silent credential rotation.
+
+**Decision:** all eight keys are stated explicitly. `management-server-enabled=false`, `management-server-host=localhost`, `management-server-port=0`, and the secret carried across by `__PRESERVE__`. Disabled, bound to loopback, and pointed at port 0 - three independent reasons nothing can listen, so no single mistake opens it.
+
+**Verified:** read back from disk after boot as `management-server-enabled=false`, `management-server-port=0`. The external probe found no port answering beyond the five intended ones.
+
+---
+
+## D-0017 | 2026-08-26 | The dev whitelist holds the owner only, and two offline-mode op grants were removed
+
+**The urgent part:** deploying `white-list=true` and `enforce-whitelist=true` against a `whitelist.json` of `[]` locks out **everybody, including the owner**. That window existed and is now closed.
+
+**What Mojang says about the three op entries** (`scripts/remote/verify-owner-identity.sh`):
+
+| UUID | Version | Name in file | Mojang |
+| --- | --- | --- | --- |
+| `5139b372-eba4-3bf7-b8a7-0da708433c5e` | 3 | dipanshu03j | **unknown** |
+| `263645f0-7a1b-4d45-a0c9-16d9b0d345d0` | 4 | dipanshu03j | **confirmed, currently named IgnisClaw** |
+| `7d6a728a-8c62-31b4-89e5-2555c96ba89c` | 3 | IgnisClaw | **unknown** |
+
+A version 4 UUID is issued by Mojang; a version 3 UUID is invented by an offline-mode server from the player's name.
+
+**Decision:** `ops.json` and `whitelist.json` contain exactly one entry, the owner's real account, with the name corrected to **IgnisClaw** - `usercache.json` and Mojang agree the account was renamed from dipanshu03j, and Minecraft matches on UUID so the rename is harmless either way.
+
+**Why the two version 3 entries were removed rather than left alone:** under `online-mode=true` they can never authenticate, so they grant nothing today - but they are standing **level 4** grants that would activate for whoever holds those names if online-mode were ever turned off. Dead configuration that becomes a privilege escalation under one config change is not harmless.
+
+**`bypassesPlayerLimit` is `false`.** Law 1: the owner does not get a reserved slot that a paying player cannot have.
+
+**Scope, stated so it is not mistaken for a precedent:** this is `laughtail-dev`. Acceptance row 12 - "whitelist matches paid transactions exactly, zero unexplained entries" - is a **production** test. The production whitelist is written only by the paid grant pipeline built in Phase 1. The owner is on the dev whitelist because nothing can be tested otherwise.
+
+**Verified:** both files validated as one-element JSON arrays before installation, installed `owner=999:987 mode=644`, and both removed UUIDs confirmed absent from `ops.json`. Originals saved to `_quarantine/*.prebuild`.
+
+---
+
+## D-0018 | 2026-08-26 | `allow-flight=false` until GrimAC is proven to catch flight
+
+**The tension:** 7.2 allows elytra, and the vanilla flight check has a history of false-kicking elytra users on a laggy tick - which a 2 vCPU burstable box will produce. The usual answer is `allow-flight=true`, letting a real anti-cheat do the movement checks properly.
+
+**Decision:** leave it `false` for now. GrimAC is installed but **not yet proven** - acceptance row 50 requires a caught test flight with a logged violation, and that is Phase 1 work. Until that evidence exists, the crude vanilla check is the only flight protection there is, and turning it off would leave a gap that nothing covers while looking like a tuning improvement.
+
+**Revisit in Phase 1**, immediately after row 50 passes. Note this is a `server.properties` key only; 15.6's permanent ban on `/fly` as a *feature* is a permission node and is unaffected either way.
+
+---
+
+## D-0019 | 2026-08-26 | The read-only scripts never print a whole config file again
+
+**What went wrong:** the first version of `scripts/remote/read-access-state.sh` ended with `cat "$D/server.properties"`. It printed the live RCON password and the management-server secret into an agent transcript. Never-break rule 5 exists precisely to stop that.
+
+**Decision:** no script in this repository dumps `server.properties` wholesale. Key **names** are read by `read-properties-keys.sh`; **values** are read only by explicit name, and the two secret-bearing keys are excluded by construction. Any output that might contain them is passed through a redacting `sed` first. The reason is written into the script itself as a comment so the next person does not re-add the convenience.
+
+**Residual risk, stated plainly:** the two secrets did appear in one earlier session's transcript. They are unchanged on the host and remain functional. Rotating them is cheap - RCON is not reachable externally and the management server is disabled - but it is the owner's call, so it is raised as an owner action rather than done silently.

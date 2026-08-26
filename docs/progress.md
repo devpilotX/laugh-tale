@@ -1,6 +1,6 @@
 # LaughTail SMP - Progress
 
-**Status: Day Zero plan written. Waiting for owner approval before any build task begins (spec 33.5).**
+**Status: pinned Paper 1.21.11 and all eight manifest plugins are running and verified on the dev box (aarch64). Blocked on OA-25 for `laughtail-dev` to exist as its own Panel server. See "Session 2" below - it supersedes the session 1 statement that nothing on the server has been changed.**
 
 | | |
 | --- | --- |
@@ -12,6 +12,63 @@
 | Next gate | Owner reads this file, `docs/owner-actions.md` and `docs/questions.md`, then approves or asks for a rewrite |
 
 ---
+
+## Session 2 - 2026-08-26 - the dev server actually runs pinned Paper on aarch64
+
+**Read this first. It supersedes the "no server configuration has been changed" claim in section 1 below, which was true only for session 1.**
+
+The owner granted full VPS access and told me to proceed. The stock server was stopped through the Panel, pinned Paper 1.21.11 build 132 replaced the running jar, the eight manifest plugins were installed against publisher checksums, and the server was started and verified. The session dropped mid-way through writing `server/server.properties`; this section is the state after finishing that work.
+
+### What is now true on `laughtail-dev`
+
+| Thing | State | Evidence |
+| --- | --- | --- |
+| Paper | **1.21.11-132 running**, Temurin 25.0.4, aarch64, `Done (83.5s)` | `start-server-and-verify.sh` |
+| Plugins | **All 8 manifest plugins enabled**, 0 ERROR, 0 SEVERE | Deviation **D5 gate: PASSED**. Recorded against every manifest entry |
+| Native path | Paper reports aarch64 libdeflate **and** OpenSSL in use | So the native path is exercised, not merely absent - which is what R2 was actually worried about |
+| `server.properties` | **73 keys deployed from the repository**, both secrets preserved host-side | D-0014. `owner=999:987 mode=644` |
+| Drift | **Zero**, by key and value | `check-properties-drift.sh` exit 0 |
+| Access | Whitelist and ops hold **one entry, the owner's real account** | D-0017 |
+| Row 5 (TCP half) | **PASS from outside the host** - RCON closed, no unexpected port answered | `scripts/check-external-ports.ps1` |
+| Old world | **Untouched.** `world/level.dat` mtime identical before and after boot | D-0013 |
+| Rollback | `server.jar.prebuild` present, 61,859,678 bytes, sha256 recorded | Reverting is one `cp` |
+
+### The four things worth knowing that were not knowable before
+
+**1. Paper strips every comment from `server.properties` at boot.** 6,155 bytes down to 1,868; ~60 comment lines down to 2. Values all survived. This kills the obvious design for `scripts/drift.sh`: a byte or `diff` comparison would report drift after every single start, and a check that always fails is a check everyone ignores. Drift is now defined on **meaning** - same keys, same values, comments discarded, secrets compared as "still non-empty", `motd` compared after decoding escapes on both sides. See **D-0015**.
+
+**2. The container publishes only 25565.** Not a firewall matter - `docker inspect` shows `PortBindings` containing `25565/tcp` and `25565/udp` and nothing else. Geyser is listening on 19132 and voice chat on 24454 *inside* the container, and neither is reachable from anywhere no matter what ufw or the security group say. **OA-06 therefore needs a third layer that progress.md previously described as two:** the Pelican allocation must publish the UDP ports before Phase 7 can test row 6.
+
+**3. ufw does not govern published Docker ports at all.** Docker inserts its rules in `DOCKER-USER` and `DOCKER`, traversed before ufw's chains. `DOCKER-USER` here is empty. Reading `ufw status` to answer "is RCON exposed" would have produced a confident, wrong answer. The external probe is the only honest test, which is why row 5's evidence comes from off the box.
+
+**4. A bare `[ -f ]` inside the volume silently returns false.** The `ubuntu` user cannot traverse `/var/lib/pelican/volumes`, so an unprivileged file test is not just wrong, it is wrong *quietly* and the script takes the other branch. This made the installer report that it had saved `server.jar.prebuild` when it had never looked. Every file test in these scripts now runs under `sudo -n`. Related: a glob like `"$D/plugins"/*.jar` is expanded by the calling shell and so fails the same way.
+
+### Acceptance movement
+
+| Row | Was | Now | Note |
+| --- | --- | --- | --- |
+| **5** Port exposure | Not started | **TCP half PASS** | RCON unreachable, proven externally. UDP half belongs to row 6 |
+| **6** UDP voice port | Not started | Still not started, **and now better understood** | Needs the Panel allocation, not just OA-06's firewall rules |
+| **D5** aarch64 gate | Proposed | **PASSED for all 9 components** | Recorded in `server/manifest.yml` per component |
+
+### What I did NOT do
+
+* **Did not create `laughtail-dev`.** It still does not exist. Everything above happened on the pre-existing stock server, which is the only server in the Panel. **OA-25** is still the blocker: Pelican has no `p:server:make`, so there is no CLI path to create one. Pre-flight items 9 and 10 remain failed.
+* **Did not touch production.** It does not exist yet either.
+* **Did not open any firewall port** - that is OA-06, and it now needs the allocation change described above.
+* **Did not take the `pre-build` host snapshot (OA-03).** Mitigated, not solved: there is a volume tar backup at `/home/ubuntu/laughtail-backups/` and `server.jar.prebuild`, so the *server* is recoverable. A broken Panel, corrupted Docker or a locked-out SSH is **not** covered. This is the largest outstanding risk and it is unchanged.
+
+### Handoff - where I stopped
+
+The dev server is **running**. That is a deliberate choice, not an oversight: the owner can now join and confirm the whitelist, the rename to IgnisClaw, and the MOTD from a real client, which is evidence no script can produce. It also burns CPU credits on a burstable instance (**R1**), so if the owner is not going to test it soon, stopping it is the better state - `scripts/remote/stop-server.sh` does that cleanly and refuses if anyone is online.
+
+**Next, in order:**
+
+1. Owner answers **OA-25** (Panel API key or clicks) so `laughtail-dev` can exist and this work can move off the stock server.
+2. Owner answers **OA-26** (rotate the two leaked-to-transcript secrets, or defer).
+3. Capture the empty-server MSPT and memory baseline via bundled spark - deviation **D2**. The server is up and idle, so this is cheap and is a prerequisite for attributing any later cost.
+4. Phase 0.2 repository machinery that needs no new server: `deploy.sh`, the pre-commit secret hook, `db/migrations/`.
+
 
 ## 1. What this session actually did
 
