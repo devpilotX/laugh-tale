@@ -36,6 +36,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Database database;
     private RulesGate rulesGate;
     private WorldRules worldRules;
+    private StatsTracker statsTracker;
+    private CombatTracker combatTracker;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -55,6 +57,16 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         // by the 26.2 parser. Also re-applied on WorldLoadEvent, so the resource world
         // (7.4) and arena (7.1) inherit these rules when they are eventually created.
         worldRules.applyToAll();
+
+        // Stats and combat. Both write only through Database, which refuses main-thread
+        // calls, so acceptance row 25 is enforced by the layer below rather than by these
+        // classes remembering to be careful.
+        this.statsTracker = new StatsTracker(this, database);
+        this.combatTracker = new CombatTracker(this, database, statsTracker);
+        loadPrivateThresholds();
+        getServer().getPluginManager().registerEvents(statsTracker, this);
+        getServer().getPluginManager().registerEvents(combatTracker, this);
+        statsTracker.start();
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
         // would block startup on a network timeout, and acceptance row 25 forbids
@@ -93,6 +105,42 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
 
     String rulesVersion() { return rulesVersion; }
     List<String> rulesText() { return rulesText; }
+
+    /**
+     * Loads the anti-farm thresholds from a PRIVATE file that is deliberately not part of
+     * the plugin's committed config.
+     *
+     * Never-break rule 10: "Never publish detector thresholds for anti-cheat, wagering, or
+     * market manipulation. Publishing them teaches evasion." A player who knows the
+     * repeat-kill window is one hour and the limit is three knows exactly how to farm an
+     * alt without ever being flagged.
+     *
+     * So `config.yml` - which is in git - contains none of these numbers, and
+     * `private.yml` alongside it is created on the host, listed in .gitignore, and read
+     * here. If it is absent the plugin still runs on conservative placeholders and says so
+     * loudly, because silently running with unknown thresholds would be worse than either
+     * alternative.
+     */
+    private void loadPrivateThresholds() {
+        java.io.File f = new java.io.File(getDataFolder(), "private.yml");
+        if (!f.isFile()) {
+            combatTracker.configure(3_600_000L, 3, "", false);
+            return;
+        }
+        org.bukkit.configuration.file.YamlConfiguration p =
+            org.bukkit.configuration.file.YamlConfiguration.loadConfiguration(f);
+        long window = p.getLong("anti-farm.repeat-kill-window-seconds", 3600L) * 1000L;
+        int limit = p.getInt("anti-farm.repeat-kills-before-zero", 3);
+        String salt = p.getString("anti-farm.ip-hash-salt", "");
+        if (salt == null || salt.isBlank()) {
+            getLogger().warning("private.yml has no ip-hash-salt. Same-IP detection still "
+                + "works, but unsalted hashes of the IPv4 space are reversible by brute force.");
+        }
+        combatTracker.configure(window, limit, salt, true);
+        // The VALUES are never logged - only that they were loaded. Logging them would put
+        // them in a file that gets pasted into support threads.
+        getLogger().info("Anti-farm thresholds loaded from private.yml (values not logged).");
+    }
 
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
@@ -215,7 +263,11 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
                 getServer().getScheduler().runTaskAsynchronously(this, () -> {
                     String line;
                     try {
-                        line = "  players recorded: " + database.countPlayers();
+                        line = "  players recorded: " + database.countPlayers()
+                             + "   combat events: " + database.countCombatEvents()
+                             + "   anti-farm config: "
+                             + (combatTracker.isPrivateConfigLoaded() ? "private.yml" : "PLACEHOLDERS")
+                             + "   stat flushes pending: " + statsTracker.pendingCount();
                     } catch (SQLException ex) {
                         line = "  players recorded: query failed - " + ex.getMessage();
                     }

@@ -303,6 +303,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Database database;
     private RulesGate rulesGate;
     private WorldRules worldRules;
+    private StatsTracker statsTracker;
+    private CombatTracker combatTracker;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -322,6 +324,16 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         // by the 26.2 parser. Also re-applied on WorldLoadEvent, so the resource world
         // (7.4) and arena (7.1) inherit these rules when they are eventually created.
         worldRules.applyToAll();
+
+        // Stats and combat. Both write only through Database, which refuses main-thread
+        // calls, so acceptance row 25 is enforced by the layer below rather than by these
+        // classes remembering to be careful.
+        this.statsTracker = new StatsTracker(this, database);
+        this.combatTracker = new CombatTracker(this, database, statsTracker);
+        loadPrivateThresholds();
+        getServer().getPluginManager().registerEvents(statsTracker, this);
+        getServer().getPluginManager().registerEvents(combatTracker, this);
+        statsTracker.start();
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
         // would block startup on a network timeout, and acceptance row 25 forbids
@@ -360,6 +372,42 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
 
     String rulesVersion() { return rulesVersion; }
     List<String> rulesText() { return rulesText; }
+
+    /**
+     * Loads the anti-farm thresholds from a PRIVATE file that is deliberately not part of
+     * the plugin's committed config.
+     *
+     * Never-break rule 10: "Never publish detector thresholds for anti-cheat, wagering, or
+     * market manipulation. Publishing them teaches evasion." A player who knows the
+     * repeat-kill window is one hour and the limit is three knows exactly how to farm an
+     * alt without ever being flagged.
+     *
+     * So `config.yml` - which is in git - contains none of these numbers, and
+     * `private.yml` alongside it is created on the host, listed in .gitignore, and read
+     * here. If it is absent the plugin still runs on conservative placeholders and says so
+     * loudly, because silently running with unknown thresholds would be worse than either
+     * alternative.
+     */
+    private void loadPrivateThresholds() {
+        java.io.File f = new java.io.File(getDataFolder(), "private.yml");
+        if (!f.isFile()) {
+            combatTracker.configure(3_600_000L, 3, "", false);
+            return;
+        }
+        org.bukkit.configuration.file.YamlConfiguration p =
+            org.bukkit.configuration.file.YamlConfiguration.loadConfiguration(f);
+        long window = p.getLong("anti-farm.repeat-kill-window-seconds", 3600L) * 1000L;
+        int limit = p.getInt("anti-farm.repeat-kills-before-zero", 3);
+        String salt = p.getString("anti-farm.ip-hash-salt", "");
+        if (salt == null || salt.isBlank()) {
+            getLogger().warning("private.yml has no ip-hash-salt. Same-IP detection still "
+                + "works, but unsalted hashes of the IPv4 space are reversible by brute force.");
+        }
+        combatTracker.configure(window, limit, salt, true);
+        // The VALUES are never logged - only that they were loaded. Logging them would put
+        // them in a file that gets pasted into support threads.
+        getLogger().info("Anti-farm thresholds loaded from private.yml (values not logged).");
+    }
 
     @EventHandler
     public void onJoin(PlayerJoinEvent e) {
@@ -482,7 +530,11 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
                 getServer().getScheduler().runTaskAsynchronously(this, () -> {
                     String line;
                     try {
-                        line = "  players recorded: " + database.countPlayers();
+                        line = "  players recorded: " + database.countPlayers()
+                             + "   combat events: " + database.countCombatEvents()
+                             + "   anti-farm config: "
+                             + (combatTracker.isPrivateConfigLoaded() ? "private.yml" : "PLACEHOLDERS")
+                             + "   stat flushes pending: " + statsTracker.pendingCount();
                     } catch (SQLException ex) {
                         line = "  players recorded: query failed - " + ex.getMessage();
                     }
@@ -526,6 +578,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.Map;
 import java.util.UUID;
 import java.util.logging.Level;
 
@@ -676,6 +729,142 @@ public final class Database {
              PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM players");
              ResultSet rs = ps.executeQuery()) {
             return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
+    /** Combat event count, for /laughtail status. */
+    int countCombatEvents() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM combat_events");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
+    /**
+     * Applies accumulated stat DELTAS in one transaction.
+     *
+     * Deltas, not totals, and applied as `col = col + ?`. Two reasons: a flush that fails
+     * can be retried without double-counting anything already committed, and two writers
+     * cannot clobber each other by both reading 10 and both writing 11.
+     *
+     * killstreak_best uses GREATEST so it can only ever rise - a "best ever" that a later
+     * flush could lower would not be a best ever.
+     */
+    void applyStatsDelta(UUID uuid, long kills, long deaths, long mined, long placed,
+                         long playtimeSeconds, int killstreakCurrent, int killstreakBest,
+                         Map<String, Long> mobKills, Map<String, Long> distance)
+            throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                // The row may not exist yet: a player who breaks a block before the join
+                // handler has finished. INSERT ... ON DUPLICATE KEY makes that harmless.
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO stats (uuid, kills, deaths, blocks_mined, blocks_placed, "
+                      + "playtime_seconds, killstreak_current, killstreak_best, created_at, updated_at) "
+                      + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) "
+                      + "ON DUPLICATE KEY UPDATE "
+                      + "kills = kills + VALUES(kills), "
+                      + "deaths = deaths + VALUES(deaths), "
+                      + "blocks_mined = blocks_mined + VALUES(blocks_mined), "
+                      + "blocks_placed = blocks_placed + VALUES(blocks_placed), "
+                      + "playtime_seconds = playtime_seconds + VALUES(playtime_seconds), "
+                      + "killstreak_current = IF(VALUES(killstreak_current) < 0, killstreak_current, VALUES(killstreak_current)), "
+                      + "killstreak_best = GREATEST(killstreak_best, VALUES(killstreak_best)), "
+                      + "updated_at = UTC_TIMESTAMP(3)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setLong(2, kills);
+                    ps.setLong(3, deaths);
+                    ps.setLong(4, mined);
+                    ps.setLong(5, placed);
+                    ps.setLong(6, playtimeSeconds);
+                    ps.setInt(7, Math.max(killstreakCurrent, 0));
+                    ps.setInt(8, Math.max(killstreakBest, 0));
+                    ps.executeUpdate();
+                }
+
+                if (!mobKills.isEmpty()) {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "INSERT INTO stats_mob_kills (uuid, mob_type, kills, updated_at) "
+                          + "VALUES (?, ?, ?, UTC_TIMESTAMP(3)) "
+                          + "ON DUPLICATE KEY UPDATE kills = kills + VALUES(kills), "
+                          + "updated_at = UTC_TIMESTAMP(3)")) {
+                        for (Map.Entry<String, Long> e : mobKills.entrySet()) {
+                            ps.setString(1, uuid.toString());
+                            ps.setString(2, e.getKey());
+                            ps.setLong(3, e.getValue());
+                            ps.addBatch();
+                        }
+                        ps.executeBatch();
+                    }
+                }
+
+                if (!distance.isEmpty()) {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "INSERT INTO stats_distance (uuid, method, centimetres, updated_at) "
+                          + "VALUES (?, ?, ?, UTC_TIMESTAMP(3)) "
+                          + "ON DUPLICATE KEY UPDATE centimetres = centimetres + VALUES(centimetres), "
+                          + "updated_at = UTC_TIMESTAMP(3)")) {
+                        for (Map.Entry<String, Long> e : distance.entrySet()) {
+                            ps.setString(1, uuid.toString());
+                            ps.setString(2, e.getKey());
+                            ps.setLong(3, e.getValue());
+                            ps.addBatch();
+                        }
+                        ps.executeBatch();
+                    }
+                }
+
+                c.commit();
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Records one death. Appendix D: "Every write that spans two tables runs in a
+     * transaction" - this one writes a single table, so it does not need one, but it must
+     * never fail silently, which is why the caller logs at SEVERE.
+     *
+     * season_number is resolved from the active season, falling back to 0 when no season
+     * has been created yet. 0 is deliberate rather than NULL: it keeps the column NOT NULL
+     * and makes pre-season test data obvious in a query instead of blending in.
+     */
+    void recordCombatEvent(UUID killer, UUID victim, int rpKiller, int rpVictim,
+                           String suppressedReason, boolean sameIp,
+                           String world, int x, int y, int z) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            int season = 0;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT season_number FROM seasons WHERE state = 'active' "
+                  + "ORDER BY season_number DESC LIMIT 1");
+                 ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) season = rs.getInt(1);
+            }
+            try (PreparedStatement ps = c.prepareStatement(
+                    "INSERT INTO combat_events (season_number, killer_uuid, victim_uuid, "
+                  + "rp_delta_killer, rp_delta_victim, multiplier_applied, suppressed_reason, "
+                  + "same_ip, world, x, y, z, occurred_at) "
+                  + "VALUES (?, ?, ?, ?, ?, 1.0000, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))")) {
+                ps.setInt(1, season);
+                if (killer != null) ps.setString(2, killer.toString()); else ps.setNull(2, java.sql.Types.CHAR);
+                ps.setString(3, victim.toString());
+                ps.setInt(4, rpKiller);
+                ps.setInt(5, rpVictim);
+                if (suppressedReason != null) ps.setString(6, suppressedReason); else ps.setNull(6, java.sql.Types.VARCHAR);
+                ps.setInt(7, sameIp ? 1 : 0);
+                if (world != null) ps.setString(8, world); else ps.setNull(8, java.sql.Types.VARCHAR);
+                ps.setInt(9, x);
+                ps.setInt(10, y);
+                ps.setInt(11, z);
+                ps.executeUpdate();
+            }
         }
     }
 }
@@ -983,6 +1172,379 @@ final class WorldRules implements Listener {
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_WorldRules_java
+
+# ---- src/main/java/gg/laughtail/core/StatsTracker.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/StatsTracker.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_StatsTracker_java'
+package gg.laughtail.core;
+
+import org.bukkit.Material;
+import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+
+import java.sql.SQLException;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
+
+/**
+ * Tracks the statistics 9.8 lists.
+ *
+ * THE DESIGN CONSTRAINT IS ACCEPTANCE ROW 25: no database call on the main thread. Every
+ * event here fires on the main thread and some fire constantly - a block break per swing,
+ * a movement update per tick. Writing to MariaDB inside those handlers would put network
+ * latency inside the tick loop, which is how a server with a healthy CPU still stutters.
+ *
+ * So events only touch an in-memory counter, and a scheduled asynchronous task flushes
+ * deltas to the database every 30 seconds. Counters are DELTAS, not totals, and are
+ * applied with `col = col + ?` - which means a flush that races with another server
+ * process cannot lose counts, and a flush that fails simply retries with the delta still
+ * pending.
+ *
+ * ROW 30 IS SATISFIED BY CONSTRUCTION, NOT BY A CHECK. "Mining, farming and building for
+ * two hours changes RP by exactly zero." Blocks mined and placed are recorded here, in a
+ * class that has no access to rating at all - the only thing that writes combat_ratings is
+ * CombatTracker, and the only thing that calls it is a player death. There is no code path
+ * from a pickaxe to a rating point, which is a stronger guarantee than a test.
+ */
+final class StatsTracker implements Listener {
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+
+    /** Pending deltas, keyed by player. Cleared on successful flush. */
+    private final Map<UUID, Delta> pending = new ConcurrentHashMap<>();
+    /** When each online player's playtime last counted, for active-time accrual. */
+    private final Map<UUID, Long> lastTick = new ConcurrentHashMap<>();
+
+    private static final class Delta {
+        long kills, deaths, mined, placed, playtimeSeconds;
+        int killstreakCurrent = -1;   // -1 means "unchanged"
+        int killstreakBest = -1;
+        final Map<String, Long> mobKills = new ConcurrentHashMap<>();
+        final Map<String, Long> distance = new ConcurrentHashMap<>();
+
+        boolean isEmpty() {
+            return kills == 0 && deaths == 0 && mined == 0 && placed == 0
+                && playtimeSeconds == 0 && killstreakCurrent < 0 && killstreakBest < 0
+                && mobKills.isEmpty() && distance.isEmpty();
+        }
+    }
+
+    StatsTracker(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+    }
+
+    private Delta delta(UUID u) {
+        return pending.computeIfAbsent(u, k -> new Delta());
+    }
+
+    void start() {
+        // 30 seconds: frequent enough that a crash loses little, rare enough that it is
+        // 2 writes a minute per active player rather than thousands.
+        plugin.getServer().getScheduler().runTaskTimerAsynchronously(
+            plugin, this::flush, 20L * 30, 20L * 30);
+
+        // Playtime accrues on the main thread but writes nothing - it only increments a
+        // counter. 7.3 requires claim area to accrue with ACTIVE playtime and not idle
+        // time, and 9.8's playtime must agree with it or the two contradict each other.
+        // "Active" here means online; genuine AFK detection needs a movement threshold and
+        // is deliberately left until claims are built, so this currently over-counts an
+        // idle player. Recorded rather than hidden.
+        plugin.getServer().getScheduler().runTaskTimer(plugin, () -> {
+            long now = System.currentTimeMillis();
+            for (Player p : plugin.getServer().getOnlinePlayers()) {
+                Long last = lastTick.put(p.getUniqueId(), now);
+                if (last != null) {
+                    long seconds = (now - last) / 1000L;
+                    if (seconds > 0 && seconds < 300) {   // ignore absurd gaps
+                        delta(p.getUniqueId()).playtimeSeconds += seconds;
+                    }
+                }
+            }
+        }, 20L * 20, 20L * 20);
+    }
+
+    /** Flushes and clears pending deltas. Runs OFF the main thread. */
+    void flush() {
+        if (pending.isEmpty()) return;
+        for (UUID u : pending.keySet().toArray(new UUID[0])) {
+            Delta d = pending.remove(u);
+            if (d == null || d.isEmpty()) continue;
+            try {
+                db.applyStatsDelta(u, d.kills, d.deaths, d.mined, d.placed,
+                    d.playtimeSeconds, d.killstreakCurrent, d.killstreakBest,
+                    d.mobKills, d.distance);
+            } catch (SQLException e) {
+                // Put it back rather than dropping it. A lost stat is invisible; a
+                // repeated attempt is not.
+                pending.merge(u, d, (a, b) -> {
+                    a.kills += b.kills; a.deaths += b.deaths;
+                    a.mined += b.mined; a.placed += b.placed;
+                    a.playtimeSeconds += b.playtimeSeconds;
+                    return a;
+                });
+                plugin.getLogger().log(Level.WARNING,
+                    "Stats flush failed for " + u + ", delta retained: " + e.getMessage());
+            }
+        }
+    }
+
+    // ---- counters ------------------------------------------------------------
+
+    void recordKill(UUID killer, int newStreak, boolean newBest) {
+        Delta d = delta(killer);
+        d.kills++;
+        d.killstreakCurrent = newStreak;
+        if (newBest) d.killstreakBest = newStreak;
+    }
+
+    void recordDeath(UUID victim) {
+        Delta d = delta(victim);
+        d.deaths++;
+        d.killstreakCurrent = 0;   // a death always ends the streak
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBreak(BlockBreakEvent e) {
+        // 9.8 marks this informational only. Nothing here can reach rating.
+        delta(e.getPlayer().getUniqueId()).mined++;
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlace(BlockPlaceEvent e) {
+        delta(e.getPlayer().getUniqueId()).placed++;
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onMobDeath(EntityDeathEvent e) {
+        if (e.getEntity() instanceof Player) return;          // player deaths are combat
+        Player killer = e.getEntity().getKiller();
+        if (killer == null) return;                            // died to environment
+        EntityType t = e.getEntity().getType();
+        delta(killer.getUniqueId()).mobKills.merge(t.name(), 1L, Long::sum);
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        lastTick.put(e.getPlayer().getUniqueId(), System.currentTimeMillis());
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        UUID u = e.getPlayer().getUniqueId();
+        lastTick.remove(u);
+        // Flush this player's numbers now rather than waiting: a quit is the most likely
+        // moment for the server to stop, and losing a session's stats to a restart is
+        // exactly the sort of quiet data loss players notice and cannot prove.
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, this::flush);
+    }
+
+    /** Unused for now; kept because 9.8 asks for distance by method and the schema has it. */
+    void recordDistance(UUID u, String method, long centimetres) {
+        delta(u).distance.merge(method, centimetres, Long::sum);
+    }
+
+    int pendingCount() {
+        return pending.size();
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_StatsTracker_java
+
+# ---- src/main/java/gg/laughtail/core/CombatTracker.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/CombatTracker.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_CombatTracker_java'
+package gg.laughtail.core;
+
+import org.bukkit.Location;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.entity.PlayerDeathEvent;
+
+import java.nio.charset.StandardCharsets;
+import java.sql.SQLException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
+
+/**
+ * Records every player death as a combat_events row, with the reason it did or did not
+ * count towards rating.
+ *
+ * WHAT THIS DOES NOT DO: calculate rating. Every row is written with rp_delta 0 and the
+ * rating tables are untouched, because Appendix B contradicts Section 9 in three places
+ * (questions.md Q-11 to Q-13) and 28.8 names ranking as the place where maximum care is
+ * warranted. Writing a formula now would mean either guessing which of two contradictory
+ * specifications is meant, or quietly inventing a third. The EVIDENCE is being collected
+ * from the first kill onwards, so when the constants are settled the history is already
+ * there - and row 31's diminishing-returns pattern can be validated against real data
+ * rather than a synthetic test.
+ *
+ * WHY THE THRESHOLDS ARE NOT IN THIS FILE. Never-break rule 10: "Never publish detector
+ * thresholds for anti-cheat, wagering, or market manipulation. Publishing them teaches
+ * evasion." The repeat-kill window and the alt-detection settings are read at runtime from
+ * a private config that is created on the host and never committed. The DETECTION LOGIC is
+ * public and reviewable here; only the numbers are withheld, which is the right split -
+ * a reviewer can check the logic is sound without learning where the line sits.
+ *
+ * SAME-IP HANDLING, and why it stores a hash. Row 32 requires same-IP kills to award zero
+ * and raise an alert, which needs comparison, not readability. Storing the address itself
+ * would put a personal identifier in a table that 31.13 governs for retention, for no
+ * benefit - a hash compares exactly as well. The salt lives in the private config so the
+ * hashes are not reversible with a rainbow table of the IPv4 space, which is small enough
+ * to enumerate.
+ */
+final class CombatTracker implements Listener {
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+    private final StatsTracker stats;
+
+    /** Recent kills per (killer -> victim), newest first. Bounded, in memory only. */
+    private final Map<String, Deque<Long>> recentKills = new ConcurrentHashMap<>();
+    /** Current killstreak per player. Reset on death. */
+    private final Map<UUID, Integer> streaks = new ConcurrentHashMap<>();
+
+    // Read from the private config. Defaults here are deliberately NOT the operating
+    // values - they are conservative placeholders so the plugin runs if the private file
+    // is missing, and the log says loudly when that happens.
+    private long repeatWindowMillis = 3_600_000L;
+    private int repeatBeforeZero = 3;
+    private String ipSalt = "";
+    private boolean privateConfigLoaded = false;
+
+    CombatTracker(LaughTailPlugin plugin, Database db, StatsTracker stats) {
+        this.plugin = plugin;
+        this.db = db;
+        this.stats = stats;
+    }
+
+    void configure(long repeatWindowMillis, int repeatBeforeZero, String ipSalt, boolean loaded) {
+        this.repeatWindowMillis = repeatWindowMillis;
+        this.repeatBeforeZero = repeatBeforeZero;
+        this.ipSalt = ipSalt;
+        this.privateConfigLoaded = loaded;
+        if (!loaded) {
+            plugin.getLogger().warning(
+                "Anti-farm thresholds are running on PLACEHOLDER defaults because the private "
+              + "config was not found. Detection works but the numbers are not the operating "
+              + "ones. See never-break rule 10 and docs/private/.");
+        }
+    }
+
+    private String hashIp(Player p) {
+        if (p.getAddress() == null || p.getAddress().getAddress() == null) return null;
+        String raw = ipSalt + '|' + p.getAddress().getAddress().getHostAddress();
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] h = md.digest(raw.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(64);
+            for (byte b : h) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return null;   // SHA-256 is mandated by the JLS; this cannot happen
+        }
+    }
+
+    /**
+     * Decides whether a kill counts, and why not if it does not. Returns null when the
+     * kill is legitimate.
+     *
+     * The order matters: cheapest and most certain checks first, so an obvious
+     * self-inflicted death never reaches the alt-detection logic.
+     */
+    private String suppressionReason(Player killer, Player victim, boolean sameIp) {
+        if (killer == null) return "no_killer";                       // environment or mob
+        if (killer.getUniqueId().equals(victim.getUniqueId())) return "self_inflicted";
+        if (sameIp) return "same_ip";                                  // row 32
+        if (killer.hasPermission("laughtail.staff.chat")) return "staff_excluded";  // 17.4
+        if (victim.hasPermission("laughtail.staff.chat")) return "staff_excluded";
+
+        String key = killer.getUniqueId() + ">" + victim.getUniqueId();
+        Deque<Long> q = recentKills.computeIfAbsent(key, k -> new ArrayDeque<>());
+        long now = System.currentTimeMillis();
+        synchronized (q) {
+            while (!q.isEmpty() && now - q.peekLast() > repeatWindowMillis) q.pollLast();
+            int recent = q.size();
+            q.addFirst(now);
+            // Bounded so a long session cannot grow this without limit.
+            while (q.size() > 64) q.pollLast();
+            if (recent >= repeatBeforeZero) return "repeat_kill";     // row 31
+        }
+        return null;
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onDeath(PlayerDeathEvent e) {
+        final Player victim = e.getEntity();
+        final Player killer = victim.getKiller();
+
+        boolean sameIp = false;
+        String killerHash = null, victimHash = hashIp(victim);
+        if (killer != null) {
+            killerHash = hashIp(killer);
+            sameIp = killerHash != null && killerHash.equals(victimHash);
+        }
+
+        final String reason = suppressionReason(killer, victim, sameIp);
+        final boolean counted = (reason == null);
+
+        // Streak bookkeeping happens whether or not the kill scores rating: 9.8 tracks
+        // killstreak as a statistic, and a suppressed kill is still a kill.
+        streaks.put(victim.getUniqueId(), 0);
+        stats.recordDeath(victim.getUniqueId());
+        if (killer != null && !killer.getUniqueId().equals(victim.getUniqueId())) {
+            int s = streaks.merge(killer.getUniqueId(), 1, Integer::sum);
+            stats.recordKill(killer.getUniqueId(), s, true);
+        }
+
+        if (sameIp) {
+            // Row 32 wants an ALERT, not just a zero. There is no Discord webhook yet
+            // (OA-16), so it goes to the console at WARNING where the monitor's
+            // error-delta check will surface it within five minutes.
+            plugin.getLogger().warning("ROW 32 ALERT: same-IP kill - "
+                + (killer != null ? killer.getName() : "?") + " killed " + victim.getName()
+                + ". Zero rating awarded. Investigate for alt farming.");
+        }
+
+        final Location loc = victim.getLocation();
+        final UUID killerId = killer != null ? killer.getUniqueId() : null;
+        final UUID victimId = victim.getUniqueId();
+        final boolean sameIpFinal = sameIp;
+
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                db.recordCombatEvent(killerId, victimId, counted ? 0 : 0, 0,
+                    reason, sameIpFinal,
+                    loc.getWorld() != null ? loc.getWorld().getName() : null,
+                    loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
+            } catch (SQLException ex) {
+                plugin.getLogger().log(Level.SEVERE,
+                    "Could not record combat event: " + ex.getMessage());
+            }
+        });
+    }
+
+    boolean isPrivateConfigLoaded() {
+        return privateConfigLoaded;
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_CombatTracker_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do

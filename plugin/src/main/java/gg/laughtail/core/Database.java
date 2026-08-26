@@ -6,6 +6,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.Map;
 import java.util.UUID;
 import java.util.logging.Level;
 
@@ -156,6 +157,142 @@ public final class Database {
              PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM players");
              ResultSet rs = ps.executeQuery()) {
             return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
+    /** Combat event count, for /laughtail status. */
+    int countCombatEvents() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM combat_events");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
+    /**
+     * Applies accumulated stat DELTAS in one transaction.
+     *
+     * Deltas, not totals, and applied as `col = col + ?`. Two reasons: a flush that fails
+     * can be retried without double-counting anything already committed, and two writers
+     * cannot clobber each other by both reading 10 and both writing 11.
+     *
+     * killstreak_best uses GREATEST so it can only ever rise - a "best ever" that a later
+     * flush could lower would not be a best ever.
+     */
+    void applyStatsDelta(UUID uuid, long kills, long deaths, long mined, long placed,
+                         long playtimeSeconds, int killstreakCurrent, int killstreakBest,
+                         Map<String, Long> mobKills, Map<String, Long> distance)
+            throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                // The row may not exist yet: a player who breaks a block before the join
+                // handler has finished. INSERT ... ON DUPLICATE KEY makes that harmless.
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO stats (uuid, kills, deaths, blocks_mined, blocks_placed, "
+                      + "playtime_seconds, killstreak_current, killstreak_best, created_at, updated_at) "
+                      + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) "
+                      + "ON DUPLICATE KEY UPDATE "
+                      + "kills = kills + VALUES(kills), "
+                      + "deaths = deaths + VALUES(deaths), "
+                      + "blocks_mined = blocks_mined + VALUES(blocks_mined), "
+                      + "blocks_placed = blocks_placed + VALUES(blocks_placed), "
+                      + "playtime_seconds = playtime_seconds + VALUES(playtime_seconds), "
+                      + "killstreak_current = IF(VALUES(killstreak_current) < 0, killstreak_current, VALUES(killstreak_current)), "
+                      + "killstreak_best = GREATEST(killstreak_best, VALUES(killstreak_best)), "
+                      + "updated_at = UTC_TIMESTAMP(3)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setLong(2, kills);
+                    ps.setLong(3, deaths);
+                    ps.setLong(4, mined);
+                    ps.setLong(5, placed);
+                    ps.setLong(6, playtimeSeconds);
+                    ps.setInt(7, Math.max(killstreakCurrent, 0));
+                    ps.setInt(8, Math.max(killstreakBest, 0));
+                    ps.executeUpdate();
+                }
+
+                if (!mobKills.isEmpty()) {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "INSERT INTO stats_mob_kills (uuid, mob_type, kills, updated_at) "
+                          + "VALUES (?, ?, ?, UTC_TIMESTAMP(3)) "
+                          + "ON DUPLICATE KEY UPDATE kills = kills + VALUES(kills), "
+                          + "updated_at = UTC_TIMESTAMP(3)")) {
+                        for (Map.Entry<String, Long> e : mobKills.entrySet()) {
+                            ps.setString(1, uuid.toString());
+                            ps.setString(2, e.getKey());
+                            ps.setLong(3, e.getValue());
+                            ps.addBatch();
+                        }
+                        ps.executeBatch();
+                    }
+                }
+
+                if (!distance.isEmpty()) {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "INSERT INTO stats_distance (uuid, method, centimetres, updated_at) "
+                          + "VALUES (?, ?, ?, UTC_TIMESTAMP(3)) "
+                          + "ON DUPLICATE KEY UPDATE centimetres = centimetres + VALUES(centimetres), "
+                          + "updated_at = UTC_TIMESTAMP(3)")) {
+                        for (Map.Entry<String, Long> e : distance.entrySet()) {
+                            ps.setString(1, uuid.toString());
+                            ps.setString(2, e.getKey());
+                            ps.setLong(3, e.getValue());
+                            ps.addBatch();
+                        }
+                        ps.executeBatch();
+                    }
+                }
+
+                c.commit();
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Records one death. Appendix D: "Every write that spans two tables runs in a
+     * transaction" - this one writes a single table, so it does not need one, but it must
+     * never fail silently, which is why the caller logs at SEVERE.
+     *
+     * season_number is resolved from the active season, falling back to 0 when no season
+     * has been created yet. 0 is deliberate rather than NULL: it keeps the column NOT NULL
+     * and makes pre-season test data obvious in a query instead of blending in.
+     */
+    void recordCombatEvent(UUID killer, UUID victim, int rpKiller, int rpVictim,
+                           String suppressedReason, boolean sameIp,
+                           String world, int x, int y, int z) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            int season = 0;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT season_number FROM seasons WHERE state = 'active' "
+                  + "ORDER BY season_number DESC LIMIT 1");
+                 ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) season = rs.getInt(1);
+            }
+            try (PreparedStatement ps = c.prepareStatement(
+                    "INSERT INTO combat_events (season_number, killer_uuid, victim_uuid, "
+                  + "rp_delta_killer, rp_delta_victim, multiplier_applied, suppressed_reason, "
+                  + "same_ip, world, x, y, z, occurred_at) "
+                  + "VALUES (?, ?, ?, ?, ?, 1.0000, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))")) {
+                ps.setInt(1, season);
+                if (killer != null) ps.setString(2, killer.toString()); else ps.setNull(2, java.sql.Types.CHAR);
+                ps.setString(3, victim.toString());
+                ps.setInt(4, rpKiller);
+                ps.setInt(5, rpVictim);
+                if (suppressedReason != null) ps.setString(6, suppressedReason); else ps.setNull(6, java.sql.Types.VARCHAR);
+                ps.setInt(7, sameIp ? 1 : 0);
+                if (world != null) ps.setString(8, world); else ps.setNull(8, java.sql.Types.VARCHAR);
+                ps.setInt(9, x);
+                ps.setInt(10, y);
+                ps.setInt(11, z);
+                ps.executeUpdate();
+            }
         }
     }
 }
