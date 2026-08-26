@@ -148,3 +148,43 @@ Season end hour 00:00 IST on the 1st (31.1). Combat-log penalty 25 RP on top of 
 **Why:** 5.1's intent is portability of the deployable artefact. A specification that quotes an example IP is not a portability defect; a deploy script that hardcodes one is.
 
 **Verified:** 91 tracked files, 12 deployable scanned, 8 documentation files scanned for secrets, 0 hits. Recorded here because narrowing the scope of a launch-gate test is exactly the kind of change that must not happen silently - `32-2` forbids weakening a test, and this is a scoping decision the owner can overrule.
+
+
+---
+
+## D-0011 | 2026-08-26 | Pin Minecraft 1.21.11 and Paper build 132, not the newest stable
+
+**The specification says:** 4.2 - "run the **latest stable release that all critical plugins support.** Never run a snapshot in production. Never update on launch day of a new version - **wait for anti-cheat and the economy plugins to confirm support.** Pin the exact version in the compose file; never use a floating `latest` tag."
+
+**What the newest stable actually is.** Queried the PaperMC v3 API directly (`scripts/paper-versions.ps1`; the v2 API now returns 410 Gone):
+
+| Version | Newest STABLE build | SHA-256 |
+| --- | --- | --- |
+| 26.2 | 119 | `a8c9140c3075bd7c04973e9cdc491b21bfe6bad472b674ef932a4ae0fec19629` |
+| 26.1.2 | 74 | `1d70b1dab9cf4a6de615209a536f3a45a2186240253c428213ce2188ab95e5f7` |
+| 1.21.11 | 132 | `5ffef465eeeb5f2a3c23a24419d97c51afd7dbb4923ff42df9a3f58bba1ccfba` |
+
+**What the critical plugins support** (`scripts/plugin-support.ps1`, against each plugin's own repository):
+
+| Component | Latest release | Supports 26.2 |
+| --- | --- | --- |
+| ViaVersion | 5.11.0 | yes |
+| ViaBackwards | 5.11.0 | yes |
+| Floodgate | 2.2.6-b67 | yes |
+| LuckPerms | 5.5.71-bukkit | yes |
+| Chunky | 1.5.3 | yes |
+| spark | current | yes |
+| Simple Voice Chat | bukkit-2.6.21 | yes |
+| **GrimAC (anti-cheat)** | **2.3.73** | **no - stable ceiling is 1.21.11** |
+
+**The decision:** pin **Minecraft 1.21.11, Paper build 132**.
+
+**Why.** GrimAC is the gating component and 4.2 names anti-cheat explicitly as the thing to wait for. Confirmed with a second, narrower query (`scripts/check-gating-plugins.ps1`): the highest Minecraft version supported by **any GrimAC release** is 1.21.11. A non-release GrimAC build does reach 26.2 - but Section 23 forbids snapshots in production, Section 23 makes packet protection "a launch blocker", and rows 50 and 51 make anti-cheat behaviour a launch gate. Running a beta anti-cheat as the sole cheat defence on a **paid** server trades a real protection for a version number nobody can see.
+
+Also verified before committing to 1.21.11: Geyser **2.11.2 build 1232** (`Geyser-Spigot.jar`, sha256 `5a56d231221fbf7ad6d701f2a39581fff9b7835df28f1a6345a1b8cf34455b92`) states support for 1.21.11, so 4.4 crossplay is not sacrificed by the older pin (`scripts/check-geyser-for.ps1`).
+
+**Cost of this decision, stated honestly.** We launch one Minecraft line behind current. Players on 26.x clients still connect through ViaVersion, which 4.3 already requires for the Indian playerbase. The upgrade path is a single re-pin once GrimAC ships a stable 26.x release, and 4.2's instruction to wait is exactly this situation.
+
+**Revisit when:** GrimAC publishes a stable release supporting 26.x. Then re-run `scripts/plugin-support.ps1` and re-pin.
+
+**Verified:** all three scripts are in the repository and every number above is re-derivable. This decision was reached before any jar was downloaded or installed.
