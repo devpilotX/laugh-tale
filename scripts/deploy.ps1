@@ -131,6 +131,7 @@ Invoke-Stage -Name 'regenerate paper tuning' -Local -LocalScript 'gen-paper-tuni
 Invoke-Stage -Name 'regenerate db migrate' -Local -LocalScript 'gen-db-migrate.ps1'
 Invoke-Stage -Name 'regenerate backup schedule' -Local -LocalScript 'gen-schedule-backups.ps1'
 Invoke-Stage -Name 'regenerate permissions' -Local -LocalScript 'gen-permissions.ps1'
+Invoke-Stage -Name 'regenerate monitor schedule' -Local -LocalScript 'gen-schedule-monitor.ps1'
 
 # ---- 3. artefacts onto the host, verified there -------------------------------
 if (-not $SkipFetch) {
@@ -178,6 +179,8 @@ Invoke-Stage -Name 'paper tuning drift check' -Script 'scripts/remote/check-pape
 Invoke-Stage -Name 'external port exposure (row 5)' -Local -LocalScript 'check-external-ports.ps1'
 Invoke-Stage -Name 'backup schedule' -Script 'scripts/remote/schedule-backups.sh' -Confirmed `
   -Reason 'deploy: ensure backups are scheduled'
+Invoke-Stage -Name 'monitor schedule' -Script 'scripts/remote/schedule-monitor.sh' -Confirmed `
+  -Reason 'deploy: ensure monitoring is scheduled, and take one sample now'
 Invoke-Stage -Name 'health check' -Script 'scripts/remote/health-check.sh' `
   -Reason 'deploy: final state check'
 
