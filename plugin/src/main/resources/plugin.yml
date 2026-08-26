@@ -39,6 +39,9 @@ commands:
   unban:
     description: Overturn a ban.
     usage: /unban <player> [reason]
+  access:
+    description: Grant, revoke and audit paid access. The whitelist IS the paywall (17.3).
+    usage: /access <grant|revoke|list|audit>
   season:
     description: Season lifecycle. Owner and Console only (17.3).
     usage: /season <status|start|end>

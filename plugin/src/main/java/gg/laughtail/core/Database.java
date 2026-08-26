@@ -303,6 +303,111 @@ public final class Database {
         }
     }
 
+    // ---- access grants (D-0032: manual, no payment integration) --------------
+
+    /**
+     * Records a paid access grant. Returns the id, or -1 if the reference is already used.
+     *
+     * The player row is created first because `access_grants` has a foreign key to it, and a
+     * manual grant normally happens BEFORE the player's first login - so there is usually no
+     * player row yet. That is not an edge case, it is the normal path for a whitelist.
+     *
+     * The duplicate-reference check relies on V1's UNIQUE constraint on `transaction_ref`
+     * rather than a SELECT first. Checking then inserting has a race; letting the database
+     * refuse does not, and one payment must never grant access twice.
+     */
+    long grantAccess(UUID uuid, String name, String source, String reference,
+                     Long amountMinor, String currency) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO players (uuid, current_name, first_join, last_seen, "
+                      + "created_at, updated_at) VALUES (?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), "
+                      + "UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) "
+                      + "ON DUPLICATE KEY UPDATE current_name = VALUES(current_name), "
+                      + "updated_at = UTC_TIMESTAMP(3)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, name);
+                    ps.executeUpdate();
+                }
+                long id;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO access_grants (uuid, source, transaction_ref, amount_minor, "
+                      + "currency, granted_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, "
+                      + "UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+                        PreparedStatement.RETURN_GENERATED_KEYS)) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, source);
+                    ps.setString(3, reference);
+                    if (amountMinor != null) ps.setLong(4, amountMinor); else ps.setNull(4, java.sql.Types.BIGINT);
+                    ps.setString(5, currency);
+                    ps.executeUpdate();
+                    try (ResultSet rs = ps.getGeneratedKeys()) {
+                        id = rs.next() ? rs.getLong(1) : -1;
+                    }
+                }
+                c.commit();
+                return id;
+            } catch (java.sql.SQLIntegrityConstraintViolationException dup) {
+                c.rollback();
+                return -1;   // the unique transaction_ref did its job
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    boolean revokeAccess(UUID uuid, String reason) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE access_grants SET revoked_at = UTC_TIMESTAMP(3), revoked_reason = ?, "
+               + "updated_at = UTC_TIMESTAMP(3) WHERE uuid = ? AND revoked_at IS NULL "
+               + "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP(3))")) {
+            ps.setString(1, reason);
+            ps.setString(2, uuid.toString());
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    java.util.List<String> liveGrants() throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT g.id, p.current_name, g.source, g.transaction_ref, g.amount_minor, "
+               + "g.granted_at FROM access_grants g JOIN players p ON p.uuid = g.uuid "
+               + "WHERE g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at > UTC_TIMESTAMP(3)) "
+               + "ORDER BY g.granted_at DESC");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                long minor = rs.getLong(5);
+                out.add("#" + rs.getLong(1) + " " + rs.getString(2)
+                    + " [" + rs.getString(3) + "] ref=" + rs.getString(4)
+                    + (rs.wasNull() || minor == 0 ? "" : " amount=" + (minor / 100.0))
+                    + " granted " + rs.getString(6) + " UTC");
+            }
+        }
+        return out;
+    }
+
+    /** UUIDs with a live grant. For the row 12 audit. */
+    java.util.Set<UUID> liveGrantUuids() throws SQLException {
+        assertOffMainThread();
+        java.util.Set<UUID> out = new java.util.HashSet<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT DISTINCT uuid FROM access_grants WHERE revoked_at IS NULL "
+               + "AND (expires_at IS NULL OR expires_at > UTC_TIMESTAMP(3))");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) out.add(UUID.fromString(rs.getString(1)));
+        }
+        return out;
+    }
+
     // ---- seasons -------------------------------------------------------------
 
     /** The active season number, or -1 when none is active. */

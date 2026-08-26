@@ -515,3 +515,13 @@ Done: five worlds, borders, gamerules. **Not** done, each for a stated reason:
 ### Owner actions that block whole phases
 
 **OA-02** no git remote - 42 commits exist on one PC. **OA-03** no host snapshot. **OA-10/12/13** store, price, legal text - Phase 1's paywall cannot start. **OA-16** Discord webhook - monitoring detects but cannot alert. **OA-27** anti-cheat. **Q-10** the economy has no numbers anywhere in the specification, which blocks Phase 3 and everything behind it.
+
+---
+
+## Post-launch roadmap addition - a roleplay layer (D-0033)
+
+The owner's direction: "when everything is done, then we are also introduce roleplay system here. real roleplay."
+
+Recorded as a future pillar and deliberately not designed. Section 25 is explicit about scope discipline and 74 of 81 acceptance rows are still untouched; a second product before the first works would guarantee neither works.
+
+**One structural tension to settle before any design work**, because it is not cosmetic: PvP-everywhere with `keepInventory=false` (7.2) is hostile to sustained roleplay, and rank-from-PvP-only (Law 1) gives a roleplayer no progression at all. Those are reconcilable - separate worlds, or a distinct season format - but the reconciliation is a product decision and should be made deliberately rather than discovered when the two systems first collide.

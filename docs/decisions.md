@@ -585,3 +585,71 @@ Fixed twice over: the confirmation token is parsed and sent, **and** the directo
 **Verified end to end:** all refusals passed, the one online player was evacuated (`Teleported IgnisClaw to laughtail`), a 213 KB backup was taken and confirmed listable, token 440 was sent, Multiverse replied `World 'laughtail_resource' regenerated!`, the directory mtime advanced from 1787728685 to 1787729480, all three permanent dimensions were still present at their original sizes, and the owner's original world's `level.dat` mtime was unchanged.
 
 **Not done, and visibly so:** 7.4 also wants escalating warnings on the 9.5 schedule. That belongs to the season clock in the plugin, which does not exist yet. Faking it with `sleep` in a shell script would be worse than leaving it undone.
+
+
+---
+
+## D-0031 | 2026-08-26 | The owner delegated the numeric decisions; P1 to P13 are now decisions
+
+**The owner's instruction:** "whatever decision are best do it."
+
+That is a delegation of the thirteen proposals in `docs/proposals.md`, so they stop being proposals and become decisions. Recorded here with the owner's instruction as their authority, because a value nobody can trace back to a decision gets re-litigated.
+
+**Approved as written**, with two amendments noted below:
+
+| # | Value | Now |
+| --- | --- | --- |
+| P2 | `target_berries_per_hour` = 1,200 | decided |
+| P3 | minimum spread 12% | decided |
+| P4 | elasticity 0.15 per 1,000 units, band ±40% | decided |
+| P5 | recovery 5% of the gap per hour | decided |
+| P6 | daily sell cap 3,600 per category | decided |
+| P7 | balance alert at 4× median active balance | decided |
+| P8 | anti-snipe window 30 s | decided |
+| P9 | 6 auction slots, +2 per tier above 4 | decided |
+| P10 | 5% transfer tax above 5,000 Berries | decided |
+| P11 | `MAX_GAIN` = 24, keeping `raw = 24 * (1 - E)` | decided |
+| P12 | death floor is the bottom of the LADDER, not the tier - demotion exists | decided |
+| P13 | decay 1% per week of the distance above the tier floor, none in week one | decided |
+
+**P1 is amended, not approved as written.** The access price stays at **₹199** as the recommended figure, but it is no longer a build input - see D-0032. With payment collected manually there is no store field to configure, so the price can change whenever the owner likes without touching anything.
+
+**What I am NOT treating as delegated.** "Whatever decision is best" covers numbers and technical rulings. It does not cover things that are legally binding or that would spend the owner's money: the Terms, Privacy and Refund text (OA-13), buying an anti-cheat licence, growing the EBS volume, or changing the EC2 instance type. Those still stop and ask. A delegation of judgement is not a delegation of signature or of spend.
+
+---
+
+## D-0032 | 2026-08-26 | No payment integration. Access is granted manually against payment received
+
+**The owner's instruction:** "realmoney stuff remove for now. this is paid server whoever pay me i just add him whitelisted. thats it."
+
+**What this removes from the build**, and it is a lot:
+
+* No store platform, no product configuration, no checkout (was OA-10).
+* No payment provider, no INR settlement account, no webhook endpoint (was OA-11).
+* No automated grant pipeline, no refund automation, no chargeback handling.
+* Section 18.3's store pipeline and the payment half of rows 16 and 18 are out of scope for now.
+
+**What it keeps, and must keep.** The `access_grants` table stays and stays mandatory, because acceptance row 12 does not care how the money arrived: "the whitelist matches paid transactions exactly, with zero unexplained entries." Manual collection makes that *easier* to satisfy and *easier* to get wrong - easier because the owner knows every payment personally, easier to get wrong because a whitelist edit with no matching grant row leaves no trace at all.
+
+**So the flow becomes:** the owner receives payment out of band, runs one command, and the command does both halves - it writes the `access_grants` row **and** adds the whitelist entry, in that order, so a whitelisted player without a grant record cannot exist. That is the whole value of doing it in a command rather than by hand in the Panel: the audit trail is not optional.
+
+`source` is recorded as `manual` and `transaction_ref` takes whatever reference the owner has - a UPI reference, a screenshot filename, a date and name. `amount_minor` and `currency` stay nullable because a manual process will not always have a clean figure.
+
+**Why this is a good decision and not just a simpler one.** Mojang's Commercial Usage Guidelines are satisfied either way, but a manual whitelist removes an entire class of risk at this stage: no card data anywhere near the server, no webhook to secure, no chargeback flow to get wrong, and no PCI-adjacent surface. At 20 to 24 players the manual work is a few minutes a week. The automated pipeline is worth building when the player count makes it worth it, and 26.x's roadmap is the right place for it.
+
+**Recorded as reversible.** `access_grants.expires_at` is still nullable (D-0002), `transaction_ref` still has its unique constraint so a webhook could later be made idempotent against it, and nothing about the schema assumes manual entry. Adding a store later needs no migration.
+
+---
+
+## D-0033 | 2026-08-26 | A roleplay layer is recorded as a future direction, not started
+
+**The owner's instruction:** "when everything is done, then we are also introduce roleplay system here. real roleplay."
+
+**Recorded and deliberately not designed.** Noted here so it is not lost, and left undesigned because designing it now would be the wrong order twice over:
+
+* Section 25 is explicit about scope discipline, and the current build has 74 of 81 acceptance rows untouched. A new pillar before the existing ones work would guarantee neither works.
+* A roleplay layer is not a feature, it is a second product. It touches identity, chat, economy, world and moderation - every system currently half-built. Whatever gets designed now against a half-built economy will be redesigned once the economy is real.
+
+**One thing worth flagging early, because it is structural rather than cosmetic.** A serious roleplay layer and the current competitive-PvP framing pull in different directions: PvP-everywhere with `keepInventory=false` (7.2) is hostile to sustained roleplay, and rank-from-PvP-only (Law 1) gives a roleplayer no progression at all. Those are reconcilable - separate worlds, or a roleplay season format - but the reconciliation is a **product decision**, and it should be made deliberately rather than discovered when the two systems first collide.
+
+Added to the post-launch roadmap in `docs/progress.md` rather than to any current phase.

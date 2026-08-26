@@ -27,7 +27,8 @@ $files = @(
   'src/main/java/gg/laughtail/core/WorldRules.java',
   'src/main/java/gg/laughtail/core/StatsTracker.java',
   'src/main/java/gg/laughtail/core/CombatTracker.java',
-  'src/main/java/gg/laughtail/core/Moderation.java'
+  'src/main/java/gg/laughtail/core/Moderation.java',
+  'src/main/java/gg/laughtail/core/AccessGrants.java'
 )
 
 foreach ($f in $files) {
