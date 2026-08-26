@@ -5,9 +5,19 @@
 # Nothing is pushed anywhere. No remote is configured (owner action OA-02).
 
 $ErrorActionPreference = 'Stop'
-$git = 'C:\Program Files\Git\cmd\git.exe'
-if (-not (Test-Path -LiteralPath $git)) { throw "git not found at $git" }
-Set-Location 'C:\Laugh-Tale'
+
+# Resolve git without hardcoding a host path (acceptance row 2).
+$git = (Get-Command git.exe -ErrorAction SilentlyContinue).Source
+if (-not $git) {
+  foreach ($c in @(
+      (Join-Path $env:ProgramFiles 'Git\cmd\git.exe'),
+      (Join-Path ${env:ProgramFiles(x86)} 'Git\cmd\git.exe'),
+      (Join-Path $env:LOCALAPPDATA 'Programs\Git\cmd\git.exe'))) {
+    if ($c -and (Test-Path -LiteralPath $c)) { $git = $c; break }
+  }
+}
+if (-not $git) { throw "git not found. See docs/owner-actions.md OA-01" }
+Set-Location (Split-Path -Parent $PSScriptRoot)
 
 function Git { param([Parameter(ValueFromRemainingArguments=$true)]$a) & $git @a; if ($LASTEXITCODE -ne 0) { throw ("git " + ($a -join ' ') + " failed with " + $LASTEXITCODE) } }
 

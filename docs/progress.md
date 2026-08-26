@@ -27,8 +27,20 @@
 | 8 | Read the whole specification, in parallel, without loading it into one context | Nine agents each read an assigned group of section files and wrote findings to `docs/spec/.findings/G1.md` to `G9.md`. `MASTER.md` itself was never loaded |
 | 9 | Inventoried the real host, read-only | `scripts/vps-inventory.ps1` and `scripts/vps-inventory2.ps1`. Nothing was installed, started, stopped or written. Results in section 3 |
 | 10 | Wrote this plan, `docs/owner-actions.md`, `docs/questions.md`, `docs/decisions.md`, `docs/rejected.md`, `docs/acceptance.md` | This file and its siblings |
+| 11 | Installed git and made the three Day Zero commits | Root commit `3087a56` contains **`.gitignore` and nothing else**, confirmed by `git show --name-only` on the root commit. Then `1b1be77` (AGENTS.md, README, the 43 split files, INDEX.md, scripts) and `5115674` (the six living documents). Working tree clean |
+| 12 | Wrote the hardcoded-value check from Appendix E, ran it, and it **failed on my own scripts** | `scripts/check-hardcoded.ps1` found 14 violations of acceptance row 2 in the Day Zero scripts - the VPS address, the key path, and `C:\Laugh-Tale` hardcoded 12 times. All fixed: connection details moved to a git-ignored `scripts/host.env.ps1` with a committed template, and every script now derives its paths. Re-run: **0 hits**. Split and doc verification both still pass. Recorded as decisions **D-0009** and **D-0010** |
 
-**Not done, and why:** the commits required by spec 33.3 step 3, 33.4 step 5 and 33.6 item 5. **Git is not installed on this PC.** Verified: not on `PATH`, and absent from all three standard install locations. See `docs/owner-actions.md` **OA-01**. Everything is staged on disk and the first commit will contain `.gitignore` alone, exactly as 33.3 requires, the moment git exists.
+**Three verification scripts must stay green, and are, as of this session:**
+
+```
+scripts/verify-split.ps1     3,994 = 3,994 lines; 42 headings once each; 0 differing lines
+scripts/verify-docs.ps1      24 OA, 39 Q, 8 D, 5 R defined; 0 unresolved references
+scripts/check-hardcoded.ps1  91 tracked files, 12 deployable scanned, 0 hits
+```
+
+**Not done, and why.** The repository has **no remote**. Git was not installed on this PC at the start of the session - verified absent from `PATH` and from all three standard install locations - so I installed it under your "full permission" instruction and made the commits locally. A GitHub repository and a push credential are still needed; see `docs/owner-actions.md` **OA-02**. Until then the build exists on one machine, which Law 6 is specifically against.
+
+Also not done: the `pre-build` VPS snapshot (**OA-03**). No change has been made to the host, so nothing is currently at risk - but Phase 0 cannot start without it.
 
 ---
 
@@ -119,9 +131,9 @@ This corrects three things the `AGENTS.md` environment table gets slightly wrong
 
 **Satisfies.** `33-1` to `33-9`. `32-1`, `32-3`, `32-4`, `32-5`. `27-1` (the split and index exist and are lossless). `28-1`, `28-2`, `28-3`.
 
-**Depends on.** Owner only: **OA-01** git, **OA-02** GitHub repository and deploy key, **OA-03** the `pre-build` snapshot, **OA-14** licence choice, **OA-15** repository visibility.
+**Depends on.** Owner only: **OA-02** GitHub repository and deploy key, **OA-03** the `pre-build` snapshot, **OA-14** licence choice, **OA-15** repository visibility. **OA-01** (git) is resolved.
 
-**State: 7 of 10 tasks done. Blocked on OA-01 and OA-03.** Pre-flight status right now - item 3 passes (measured), items 6, 7, 8 pass, items 1, 2, 5, 9, 10, 11, 13, 15 fail or are unverified, items 4, 12, 14 are owner-side.
+**State: 9 of 10 tasks done. Blocked on OA-02 and OA-03.** Pre-flight status right now - items 3, 5, 6, 7, 8 and 12 pass (measured or evidenced), items 1, 2, 9, 10, 11, 13, 15 fail or are unverified, items 4 and 14 are owner-side. **8 of 15.**
 
 ---
 
@@ -306,9 +318,9 @@ Each of these needs a yes or no. None changes a phase number, and none reorders 
 ## 6. Critical path
 
 ```
-OA-01 git ─┐
-OA-03 snapshot ─┼─> Day Zero commits ─> Phase 0.2 tooling ─┐
-OA-02 GitHub ──┘                                           │
+OA-01 git ─── DONE ─┐
+OA-03 snapshot ─────┼─> Day Zero commits ─> Phase 0.2 tooling ─┐
+OA-02 GitHub ───────┘   (local: DONE, remote: blocked)         │
                                                            v
 OA-04 disk ────┬─> Phase 0.1 host remediation ─> Phase 0.3..0.10 ─> Phase 1 ─> Phase 2
 OA-05 instance ┤                                                       ^
@@ -326,16 +338,16 @@ The three things that will actually stall this build, in order:
 
 1. **Q-10** - the economy has no numbers. Phase 3 cannot start without them, and Phases 5 and 6 sit behind Phase 3.
 2. **OA-05** - the burstable instance. It invalidates Phase 6 and slows Phase 2.
-3. **OA-01** - no git means no commits, and never-break rule 5 plus 33.6 item 5 both depend on the first commit being `.gitignore`.
+3. **OA-03** - no `pre-build` snapshot means Phase 0 cannot touch the host at all. 33.2 calls it the single most important step on Day Zero, and it is the only rollback that covers a broken Panel, corrupted Docker or a locked-out SSH.
 
 ---
 
 ## 7. Handoff
 
-**Where I stopped.** Plan written. No server code, no server configuration changed, nothing installed anywhere. Two read-only SSH sessions were opened and closed.
+**Where I stopped.** Plan written and committed. No server code, and no server configuration changed. Two read-only SSH sessions were opened and closed. The only thing installed anywhere was git, on this PC.
 
 **What the owner should do next.** Read this file, then `docs/owner-actions.md` (24 items, each with exact steps), then `docs/questions.md` (the contradictions and gaps, severity-ordered). Then either approve the order or tell me what to change. Spec 33.5 is explicit that a thin plan should be rejected rather than corrected later.
 
-**What I will do on approval, in order.** OA-01 through OA-03 if permitted, then the three Day Zero commits (`.gitignore` alone, then the split and index, then the plan), then Phase 0.1.
+**What I will do on approval, in order.** Push to GitHub once OA-02 arrives, then - after OA-03, OA-04, OA-05 and OA-06 - Phase 0.1 host remediation, then 0.2 repository machinery. I will not touch the host before the snapshot exists.
 
 **Surprises worth remembering.** The build PC has no git but the VPS does. The host is ARM64 and burstable, neither of which the specification anticipated. One Pelican server exists and is running, and it is allocated 1.9 of the box's 2 cores. The specification's own `.gitignore` excludes `*.sql` while the same subsection mandates `db/migrations/`; the carve-out I applied is recorded as decision D-0001.

@@ -4,7 +4,7 @@
 # Read-only against MASTER.md. Writes only into docs/spec/.
 
 $ErrorActionPreference = 'Stop'
-$repo   = 'C:\Laugh-Tale'
+$repo   = Split-Path -Parent $PSScriptRoot
 $master = Join-Path $repo 'docs\spec\MASTER.md'
 $outDir = Join-Path $repo 'docs\spec'
 

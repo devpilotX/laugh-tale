@@ -1,7 +1,8 @@
 # verify-docs.ps1 - checks that every cross-reference in docs/ resolves.
 # Catches the failure mode where a plan cites OA-17 or Q-12 that was never written.
 $ErrorActionPreference = 'Stop'
-$docs = 'C:\Laugh-Tale\docs'
+$repo = Split-Path -Parent $PSScriptRoot
+$docs = Join-Path $repo 'docs'
 $fail = 0
 
 function Get-Defined($file, $pattern) {
@@ -14,7 +15,7 @@ function Get-Defined($file, $pattern) {
 
 # Definitions: OA-nn appears in a "BLOCKED - OA-nn" line; Q-nn in a "### Q-nn" heading;
 # D-nnnn in a "## D-nnnn" heading; R-nnnn in a "## R-nnnn" heading.
-$defOA = Get-Defined (Join-Path $docs 'owner-actions.md') 'BLOCKED - (OA-\d+)'
+$defOA = Get-Defined (Join-Path $docs 'owner-actions.md') '^(?:BLOCKED|RESOLVED).*?- (OA-\d+)'
 $defQ  = Get-Defined (Join-Path $docs 'questions.md')     '^### (Q-\d+)'
 $defD  = Get-Defined (Join-Path $docs 'decisions.md')     '^## (D-\d+)'
 $defR  = Get-Defined (Join-Path $docs 'rejected.md')      '^## (R-\d+)'
@@ -48,7 +49,7 @@ foreach ($r in $required) {
 }
 
 # .gitignore must exclude the secret set from 33.3 step 2
-$gi = Get-Content -LiteralPath 'C:\Laugh-Tale\.gitignore' -Raw
+$gi = Get-Content -LiteralPath (Join-Path $repo '.gitignore') -Raw
 foreach ($pat in '.env','*.env','docs/private/','*.key','*.pem','id_rsa*','*.sql','backups/','logs/','world*/','*.log') {
   if ($gi -notmatch [regex]::Escape($pat)) { Write-Output ("GITIGNORE MISSING PATTERN: $pat"); $fail++ }
 }

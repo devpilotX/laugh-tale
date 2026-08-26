@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$specDir  = 'C:\Laugh-Tale\docs\spec'
+$specDir  = Join-Path (Split-Path -Parent $PSScriptRoot) 'docs\spec'
 $manifest = Join-Path $specDir '.split-manifest.csv'
 $parts = Import-Csv -LiteralPath $manifest
 

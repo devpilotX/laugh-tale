@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
-$specDir = 'C:\Laugh-Tale\docs\spec'
+$repo    = Split-Path -Parent $PSScriptRoot
+$specDir = Join-Path $repo 'docs\spec'
 $hdr  = Get-Content -LiteralPath (Join-Path $specDir '.acceptance-header.md')
 $body = Get-Content -LiteralPath (Join-Path $specDir '.acceptance-body.md')
 
@@ -67,7 +68,8 @@ Sections 7, 10, 15, 16 and 19 define no criteria of their own and are covered en
 '@
 
 $all = @($hdr) + @($body) + ($footer -split "`r?`n")
-Set-Content -LiteralPath 'C:\Laugh-Tale\docs\acceptance.md' -Value $all -Encoding UTF8
+$dest = Join-Path $repo 'docs\acceptance.md'
+Set-Content -LiteralPath $dest -Value $all -Encoding UTF8
 Write-Output ("acceptance.md lines: " + $all.Count)
-$chk = Get-Content -LiteralPath 'C:\Laugh-Tale\docs\acceptance.md'
+$chk = Get-Content -LiteralPath $dest
 Write-Output ("Section 21 rows present: " + (($chk | Where-Object { $_ -match '^\| \*\*[0-9]+[abc]?\*\* \|' }).Count))

@@ -130,8 +130,8 @@ Sections 7, 10, 15, 16 and 19 define no criteria of their own and are covered en
 | ID | Criterion | Status | Evidence |
 | --- | --- | --- | --- |
 | `33-1` | A verified `pre-build` VPS snapshot exists before any change | **BLOCKED** | `docs/owner-actions.md` OA-03. No host change has been made, so nothing is at risk yet |
-| `33-2` | The first commit contains `.gitignore` and nothing secret | **BLOCKED** | `.gitignore` written first, 63 lines, staged. Git is not installed - OA-01 |
-| `33-3` | `AGENTS.md` is in the root, under 200 lines, loaded at session start | **PASS** | File present at root; its rules are cited throughout `docs/progress.md` |
+| `33-2` | The first commit contains `.gitignore` and nothing secret | **PASS** | Root commit `3087a56`. `git show --name-only` on `git rev-list --max-parents=0 HEAD` lists `.gitignore` and nothing else. 63 lines, 1 file changed |
+| `33-3` | `AGENTS.md` is in the root, under 200 lines, loaded at session start | **PASS** | File present at root, 128 lines; its rules are cited throughout `docs/progress.md` |
 | `33-4` to `33-9` | Remaining Day Zero criteria | Not started | Read from `docs/spec/33-day-zero-the-bootstrap-procedure.md` and filled in when actioned |
 
 ## Pre-flight checklist - Section 33.6, measured 2026-08-26
@@ -142,7 +142,7 @@ Sections 7, 10, 15, 16 and 19 define no criteria of their own and are covered en
 | 2 | The restore procedure has been located | **FAIL** - OA-03 step 6 |
 | 3 | SSH works with a key and password authentication is disabled | **PASS** - measured: `passwordauthentication no`, `permitrootlogin without-password` |
 | 4 | 2FA on the Panel, GitHub, registrar, host and email | Unverified - OA-23 |
-| 5 | `.gitignore` is committed and is the first commit | **FAIL** - OA-01 |
+| 5 | `.gitignore` is committed and is the first commit | **PASS** - root commit `3087a56` contains `.gitignore` alone |
 | 6 | `AGENTS.md` is in the repository root | **PASS** |
 | 7 | The specification is at `docs/spec/MASTER.md` | **PASS** - 3,994 lines, and split losslessly |
 | 8 | The six living documents exist | **PASS** - progress, decisions, rejected, owner-actions, questions, acceptance |
@@ -154,4 +154,4 @@ Sections 7, 10, 15, 16 and 19 define no criteria of their own and are covered en
 | 14 | The owner knows how to read the Panel console and where logs are | Unverified - ask at approval |
 | 15 | The first session's output was a plan, read and approved by the owner | **Plan written. Approval pending** |
 
-**7 of 15 pass. None of the failures is a defect; each is an owner action or a Phase 0 task.**
+**8 of 15 pass. None of the failures is a defect; each is an owner action or a Phase 0 task.**

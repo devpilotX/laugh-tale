@@ -4,7 +4,7 @@
 # document order. Reports any heading that has no summary row.
 
 $ErrorActionPreference = 'Stop'
-$specDir = 'C:\Laugh-Tale\docs\spec'
+$specDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'docs\spec'
 $parts   = Import-Csv -LiteralPath (Join-Path $specDir '.split-manifest.csv')
 $subs    = Import-Csv -LiteralPath (Join-Path $specDir '.subsections.csv')
 

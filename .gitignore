@@ -24,6 +24,9 @@ world*/
 !db/migrations/**/*.sql
 
 # --- Additional exclusions (spec 33.3 says "at minimum") ---
+# Local connection details. Acceptance row 2: no IP addresses or absolute host
+# paths anywhere in the repository. The committed template is host.env.example.ps1.
+scripts/host.env.ps1
 *.jar
 *.jar.sha256.tmp
 *.p12

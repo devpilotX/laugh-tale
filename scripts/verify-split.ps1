@@ -6,7 +6,7 @@
 # Read-only. Exits non-zero on any failure.
 
 $ErrorActionPreference = 'Stop'
-$repo     = 'C:\Laugh-Tale'
+$repo     = Split-Path -Parent $PSScriptRoot
 $specDir  = Join-Path $repo 'docs\spec'
 $master   = Join-Path $specDir 'MASTER.md'
 $manifest = Join-Path $specDir '.split-manifest.csv'

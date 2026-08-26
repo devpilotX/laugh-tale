@@ -13,25 +13,21 @@ Nothing here is guesswork on my part. Where the specification supplies a recomme
 ## Tier 1 - blocks the very next step
 
 ```
-BLOCKED - OA-01 Git is not installed on this PC
-What I need: Git for Windows installed on the machine Kiro runs on.
+RESOLVED 2026-08-26 - OA-01 Git is not installed on this PC
+What I needed: Git for Windows installed on the machine Kiro runs on.
 Why: Spec 33.3 step 3 requires the first commit in history to be .gitignore alone;
      33.4 step 5 requires the split to be committed; 33.6 item 5 makes this a
-     pre-flight gate; never-break rule 5 depends on the guard existing before
-     anything else is added. Acceptance 33-2 and 32-6 cannot pass without it.
-     Verified absent: not on PATH, and not in "C:\Program Files\Git\cmd",
-     "C:\Program Files (x86)\Git\cmd", or "%LOCALAPPDATA%\Programs\Git\cmd".
-Steps for the owner:
-  1. Either reply "install git" and I will run:
-       winget install --id Git.Git -e --source winget
-     (winget is present at C:\Users\devpi\AppData\Local\Microsoft\WindowsApps\winget.exe)
-  2. Or install it yourself from https://git-scm.com/download/win, accepting all
-     defaults, then reply "git installed".
-  3. Nothing to paste anywhere. I detect it automatically.
-What I will do when it arrives: run git init and make the three Day Zero commits -
-     .gitignore alone, then the split plus INDEX.md, then the planning documents.
-What I am doing meanwhile: everything is already staged on disk; the plan,
-     owner-actions and questions files are complete.
+     pre-flight gate. Acceptance 33-2 and 32-6 depend on it.
+How it was resolved: installed Git 2.55.0.3 with
+     winget install --id Git.Git -e --source winget
+     under the owner's "you have full permission" instruction. Local, reversible,
+     and touches nothing on the VPS - so it does not breach the snapshot-first
+     rule in 33.2, which protects the host, not the build PC.
+Evidence: three commits exist. The root commit 3087a56 contains .gitignore and
+     nothing else, confirmed by git show --name-only on git rev-list --max-parents=0.
+     Commit 1b1be77 carries AGENTS.md, README.md, the 43 split files, INDEX.md and
+     the scripts. Commit 5115674 carries the six living documents. Working tree clean.
+Still outstanding: no remote is configured. See OA-02.
 ```
 
 ```
@@ -226,8 +222,9 @@ Why: Spec 32.3 row 17, Section 5.5, Phase 0's "monitoring and alerting live".
 Steps for the owner:
   1. Sign up at any of uptimerobot.com, betterstack.com or healthchecks.io.
      The free tier is sufficient.
-  2. Create a monitor: type TCP port, host 13.206.200.102, port 25565,
-     interval 5 minutes, name "LaughTail Java".
+  2. Create a monitor: type TCP port, host = the server's public IP, port 25565,
+     interval 5 minutes, name "LaughTail Java". The IP is in
+     scripts/host.env.ps1 on this PC, or in the AWS console under EC2, Instances.
   3. Add your email, and later the Discord webhook from OA-16, as alert contacts.
   4. Reply "monitor live".
 What I will do when it arrives: wire the host health check to the same alert path

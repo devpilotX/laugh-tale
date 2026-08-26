@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$specDir = 'C:\Laugh-Tale\docs\spec'
+$specDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'docs\spec'
 $hdr  = Get-Content -LiteralPath (Join-Path $specDir '.index-header.md')
 $body = Get-Content -LiteralPath (Join-Path $specDir '.index-body.md')
 $all  = @($hdr) + @($body)

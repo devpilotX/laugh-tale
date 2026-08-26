@@ -4,7 +4,7 @@
 # of this file, not the Status column.
 
 $ErrorActionPreference = 'Stop'
-$repo    = 'C:\Laugh-Tale'
+$repo    = Split-Path -Parent $PSScriptRoot
 $specDir = Join-Path $repo 'docs\spec'
 $src     = Join-Path $specDir '21-the-master-acceptance-test-table.md'
 

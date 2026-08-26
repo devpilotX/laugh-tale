@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$repo = 'C:\Laugh-Tale'
+$repo = Split-Path -Parent $PSScriptRoot
 
 foreach ($d in @('docs\spec','docs\private','server','scripts','db\migrations')) {
   New-Item -ItemType Directory -Force -Path (Join-Path $repo $d) | Out-Null
