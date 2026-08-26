@@ -108,7 +108,19 @@ final class Chronicles {
     void start() {
         plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, this::flush,
             20L * 40, 20L * 30);
-        plugin.getServer().getScheduler().runTaskLaterAsynchronously(plugin, this::seed, 20L * 15);
+        // SEEDING RUNS ON A TIMER, NOT ONCE AFTER A DELAY.
+        //
+        // The first version seeded once, 15 seconds after enable. That RACED the season scheduler,
+        // which opens a season on its own schedule - so on a database with no season, seeding found
+        // nothing to attach chapters to, gave up, and the server ran with an empty Chronicle. It
+        // happened for real the first time seasons were reset to 1: season 1 opened correctly and the
+        // story silently did not exist.
+        //
+        // A one-shot task that depends on another task having finished is a race whichever delay is
+        // chosen. Retrying is cheap - one COUNT when already seeded - and it also covers the case
+        // that matters most: a NEW season needs its own chapters, and that happens long after boot.
+        plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, this::seed,
+            20L * 10, 20L * 30);
     }
 
     /** Advances a metric. Batched; safe to call from any thread and from hot events. */
@@ -128,6 +140,8 @@ final class Chronicles {
         try {
             int season = db.activeSeason();
             if (season <= 0) return;
+            // Cheap early exit so running every 30 seconds costs one COUNT rather than five SELECTs.
+            if (db.chapterCount(season) >= STORY.length) return;
             int created = 0;
             for (Chapter ch : STORY) {
                 if (db.ensureChapter(season, ch.number(), ch.title(), ch.narrative(),

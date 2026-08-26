@@ -2473,4 +2473,17 @@ public final class Database {
             }
         }
         return out;
+    }
+    /** How many chapters exist for a season. Lets the seeder exit cheaply once it has run. */
+    int chapterCount(int season) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT COUNT(*) FROM chronicle_chapters WHERE season_number = ?")) {
+            ps.setInt(1, season);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1);
+            }
+        }
     }}
