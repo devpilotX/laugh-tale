@@ -252,6 +252,80 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
             return true;
         }
 
+        if (name.equals("season")) {
+            // Season control is OWNER-ONLY by permission, and that is not a convenience:
+            // 17.3 puts "season management, manual reset or manual Champion assignment" on
+            // the never-grant-to-Admin list because "the integrity of the competition
+            // depends on this being untouchable by staff".
+            if (!sender.hasPermission("laughtail.season.reset")) {
+                sender.sendMessage(Component.text(
+                    "Season management is Owner and Console only (17.3).", NamedTextColor.RED));
+                return true;
+            }
+            String sub = args.length > 0 ? args[0].toLowerCase() : "status";
+            switch (sub) {
+                case "status" -> getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                    try {
+                        java.util.List<String> lines = database.seasonSummary();
+                        int active = database.activeSeason();
+                        getServer().getScheduler().runTask(this, () -> {
+                            sender.sendMessage(Component.text("Seasons (active: "
+                                + (active < 0 ? "none" : active) + ")", NamedTextColor.GOLD));
+                            if (lines.isEmpty()) {
+                                sender.sendMessage(Component.text("  no seasons yet - /season start",
+                                    NamedTextColor.GRAY));
+                            }
+                            for (String l : lines) {
+                                sender.sendMessage(Component.text("  " + l, NamedTextColor.GRAY));
+                            }
+                        });
+                    } catch (SQLException e) {
+                        getLogger().log(Level.SEVERE, "season status failed: " + e.getMessage());
+                    }
+                });
+                case "start" -> {
+                    // 31.1 makes seasons monthly. 30 days rather than a calendar month so
+                    // every season is the same length - a February champion should not have
+                    // had three fewer days than a March one.
+                    final int days = 30;
+                    getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                        try {
+                            int n = database.startSeason(days);
+                            database.audit(null, sender.getName(), "season.start", null, null,
+                                n < 0 ? "refused - a season is already running" : "season " + n, null);
+                            getServer().getScheduler().runTask(this, () -> sender.sendMessage(
+                                Component.text(n < 0
+                                    ? "Refused: a season is already active, in finale or resetting."
+                                    : "Season " + n + " started, ending in " + days + " days.",
+                                    n < 0 ? NamedTextColor.RED : NamedTextColor.GREEN)));
+                        } catch (SQLException e) {
+                            getLogger().log(Level.SEVERE, "season start failed: " + e.getMessage());
+                        }
+                    });
+                }
+                case "end" -> getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                    try {
+                        int active = database.activeSeason();
+                        if (active < 0) {
+                            getServer().getScheduler().runTask(this, () -> sender.sendMessage(
+                                Component.text("No active season.", NamedTextColor.RED)));
+                            return;
+                        }
+                        String result = database.endSeason(active);
+                        database.audit(null, sender.getName(), "season.end", null, null,
+                            "season " + active + ": " + result, null);
+                        getServer().getScheduler().runTask(this, () -> sender.sendMessage(
+                            Component.text("Season " + active + ": " + result,
+                                result.startsWith("REFUSED") ? NamedTextColor.RED : NamedTextColor.GREEN)));
+                    } catch (SQLException e) {
+                        getLogger().log(Level.SEVERE, "season end failed: " + e.getMessage());
+                    }
+                });
+                default -> sender.sendMessage(Component.text(
+                    "Usage: /season <status|start|end>", NamedTextColor.GRAY));
+            }
+            return true;
+        }
         if (name.equals("laughtail")) {
             if (args.length == 0 || args[0].equalsIgnoreCase("status")) {
                 if (!sender.hasPermission("laughtail.status")) {

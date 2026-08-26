@@ -39,6 +39,9 @@ commands:
   unban:
     description: Overturn a ban.
     usage: /unban <player> [reason]
+  season:
+    description: Season lifecycle. Owner and Console only (17.3).
+    usage: /season <status|start|end>
   history:
     description: View a player's punishment history. Viewing is itself audited.
     usage: /history <player>

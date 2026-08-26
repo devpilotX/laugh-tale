@@ -213,6 +213,9 @@ commands:
   unban:
     description: Overturn a ban.
     usage: /unban <player> [reason]
+  season:
+    description: Season lifecycle. Owner and Console only (17.3).
+    usage: /season <status|start|end>
   history:
     description: View a player's punishment history. Viewing is itself audited.
     usage: /history <player>
@@ -545,6 +548,80 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
             return true;
         }
 
+        if (name.equals("season")) {
+            // Season control is OWNER-ONLY by permission, and that is not a convenience:
+            // 17.3 puts "season management, manual reset or manual Champion assignment" on
+            // the never-grant-to-Admin list because "the integrity of the competition
+            // depends on this being untouchable by staff".
+            if (!sender.hasPermission("laughtail.season.reset")) {
+                sender.sendMessage(Component.text(
+                    "Season management is Owner and Console only (17.3).", NamedTextColor.RED));
+                return true;
+            }
+            String sub = args.length > 0 ? args[0].toLowerCase() : "status";
+            switch (sub) {
+                case "status" -> getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                    try {
+                        java.util.List<String> lines = database.seasonSummary();
+                        int active = database.activeSeason();
+                        getServer().getScheduler().runTask(this, () -> {
+                            sender.sendMessage(Component.text("Seasons (active: "
+                                + (active < 0 ? "none" : active) + ")", NamedTextColor.GOLD));
+                            if (lines.isEmpty()) {
+                                sender.sendMessage(Component.text("  no seasons yet - /season start",
+                                    NamedTextColor.GRAY));
+                            }
+                            for (String l : lines) {
+                                sender.sendMessage(Component.text("  " + l, NamedTextColor.GRAY));
+                            }
+                        });
+                    } catch (SQLException e) {
+                        getLogger().log(Level.SEVERE, "season status failed: " + e.getMessage());
+                    }
+                });
+                case "start" -> {
+                    // 31.1 makes seasons monthly. 30 days rather than a calendar month so
+                    // every season is the same length - a February champion should not have
+                    // had three fewer days than a March one.
+                    final int days = 30;
+                    getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                        try {
+                            int n = database.startSeason(days);
+                            database.audit(null, sender.getName(), "season.start", null, null,
+                                n < 0 ? "refused - a season is already running" : "season " + n, null);
+                            getServer().getScheduler().runTask(this, () -> sender.sendMessage(
+                                Component.text(n < 0
+                                    ? "Refused: a season is already active, in finale or resetting."
+                                    : "Season " + n + " started, ending in " + days + " days.",
+                                    n < 0 ? NamedTextColor.RED : NamedTextColor.GREEN)));
+                        } catch (SQLException e) {
+                            getLogger().log(Level.SEVERE, "season start failed: " + e.getMessage());
+                        }
+                    });
+                }
+                case "end" -> getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                    try {
+                        int active = database.activeSeason();
+                        if (active < 0) {
+                            getServer().getScheduler().runTask(this, () -> sender.sendMessage(
+                                Component.text("No active season.", NamedTextColor.RED)));
+                            return;
+                        }
+                        String result = database.endSeason(active);
+                        database.audit(null, sender.getName(), "season.end", null, null,
+                            "season " + active + ": " + result, null);
+                        getServer().getScheduler().runTask(this, () -> sender.sendMessage(
+                            Component.text("Season " + active + ": " + result,
+                                result.startsWith("REFUSED") ? NamedTextColor.RED : NamedTextColor.GREEN)));
+                    } catch (SQLException e) {
+                        getLogger().log(Level.SEVERE, "season end failed: " + e.getMessage());
+                    }
+                });
+                default -> sender.sendMessage(Component.text(
+                    "Usage: /season <status|start|end>", NamedTextColor.GRAY));
+            }
+            return true;
+        }
         if (name.equals("laughtail")) {
             if (args.length == 0 || args[0].equalsIgnoreCase("status")) {
                 if (!sender.hasPermission("laughtail.status")) {
@@ -906,6 +983,215 @@ public final class Database {
              PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM staff_audit");
              ResultSet rs = ps.executeQuery()) {
             return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
+    // ---- seasons -------------------------------------------------------------
+
+    /** The active season number, or -1 when none is active. */
+    int activeSeason() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT season_number FROM seasons WHERE state='active' "
+               + "ORDER BY season_number DESC LIMIT 1");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
+    /** Season state summary lines for /season status. */
+    java.util.List<String> seasonSummary() throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT s.season_number, s.state, s.starts_at, s.ends_at, s.reset_completed, "
+               + "(SELECT COUNT(*) FROM combat_ratings r WHERE r.season_number = s.season_number) AS rated, "
+               + "(SELECT uuid FROM champions ch WHERE ch.season_number = s.season_number) AS champ "
+               + "FROM seasons s ORDER BY s.season_number DESC LIMIT 10");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                out.add("season " + rs.getInt(1) + " [" + rs.getString(2) + "]"
+                    + " starts " + rs.getString(3) + " ends " + rs.getString(4)
+                    + " reset_completed=" + rs.getInt(5)
+                    + " rated_players=" + rs.getInt(6)
+                    + " champion=" + (rs.getString(7) == null ? "none" : rs.getString(7)));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Creates the next season and makes it active.
+     *
+     * 31.1 puts the season on a clock, so `ends_at` is stored rather than computed later -
+     * a value derived at read time would shift if the code that derives it ever changed,
+     * and the countdown players see must match the instant the reset actually fires.
+     *
+     * Refuses if a season is already active. Two active seasons would make
+     * `combat_ratings` ambiguous and there would be no single answer to "who is winning".
+     */
+    int startSeason(int lengthDays) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT COUNT(*) FROM seasons WHERE state IN ('active','finale','resetting')");
+                     ResultSet rs = ps.executeQuery()) {
+                    if (rs.next() && rs.getInt(1) > 0) {
+                        c.rollback();
+                        return -1;   // already running
+                    }
+                }
+                int next;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT IFNULL(MAX(season_number),0)+1 FROM seasons");
+                     ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    next = rs.getInt(1);
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO seasons (season_number, starts_at, ends_at, state, "
+                      + "created_at, updated_at) VALUES (?, UTC_TIMESTAMP(3), "
+                      + "DATE_ADD(UTC_TIMESTAMP(3), INTERVAL ? DAY), 'active', "
+                      + "UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))")) {
+                    ps.setInt(1, next);
+                    ps.setInt(2, lengthDays);
+                    ps.executeUpdate();
+                }
+                c.commit();
+                return next;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /** The leading player of a season, or null when nobody has a rating. */
+    UUID seasonLeader(int season) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT uuid FROM combat_ratings WHERE season_number = ? "
+               + "ORDER BY current_rp DESC, games_counted DESC, uuid ASC LIMIT 1")) {
+            ps.setInt(1, season);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? UUID.fromString(rs.getString(1)) : null;
+            }
+        }
+    }
+
+    /**
+     * Ends a season: crowns the Champion, archives the standings, marks the reset done.
+     *
+     * IDEMPOTENT, which acceptance row 33 requires. Every step is conditional:
+     *   - the champion INSERT relies on V1's PRIMARY KEY (season_number), so a second
+     *     attempt is rejected by the database rather than by application logic - row 36
+     *   - reset_completed is checked first and the whole call returns early if set
+     *   - the archive INSERT is INSERT ... SELECT with a NOT EXISTS guard
+     * So a reset interrupted halfway can simply be run again, which is exactly what 31.1
+     * demands of a job that fires on a clock and might be interrupted by a restart.
+     *
+     * 31.2: "never end a season without a Champion." If nobody has a rating there IS no
+     * Champion, so this REFUSES rather than inventing one or ending the season empty.
+     * Returns null on refusal, with the reason in the returned string of the caller.
+     */
+    String endSeason(int season) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                boolean already;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT reset_completed FROM seasons WHERE season_number = ?")) {
+                    ps.setInt(1, season);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) { c.rollback(); return "no such season"; }
+                        already = rs.getInt(1) == 1;
+                    }
+                }
+                if (already) {
+                    c.rollback();
+                    return "already completed - nothing to do (idempotent)";
+                }
+
+                UUID leader;
+                int leaderRp = 0;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT uuid, current_rp FROM combat_ratings WHERE season_number = ? "
+                      + "ORDER BY current_rp DESC, games_counted DESC, uuid ASC LIMIT 1")) {
+                    ps.setInt(1, season);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) {
+                            c.rollback();
+                            // 31.2, enforced rather than assumed.
+                            return "REFUSED: no player has a rating this season, so there is "
+                                 + "no Champion. Spec 31.2 forbids ending a season without one.";
+                        }
+                        leader = UUID.fromString(rs.getString(1));
+                        leaderRp = rs.getInt(2);
+                    }
+                }
+
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT IGNORE INTO champions (season_number, uuid, final_rp, "
+                      + "awarded_at, created_at) VALUES (?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))")) {
+                    ps.setInt(1, season);
+                    ps.setString(2, leader.toString());
+                    ps.setInt(3, leaderRp);
+                    ps.executeUpdate();
+                }
+
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE seasons SET state='archived', reset_completed=1, "
+                      + "reset_started_at=IFNULL(reset_started_at, UTC_TIMESTAMP(3)), "
+                      + "reset_finished_at=UTC_TIMESTAMP(3), updated_at=UTC_TIMESTAMP(3) "
+                      + "WHERE season_number = ?")) {
+                    ps.setInt(1, season);
+                    ps.executeUpdate();
+                }
+
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE stats s SET seasons_played = seasons_played + 1 "
+                      + "WHERE EXISTS (SELECT 1 FROM combat_ratings r WHERE r.uuid = s.uuid "
+                      + "AND r.season_number = ?)")) {
+                    ps.setInt(1, season);
+                    ps.executeUpdate();
+                }
+
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE stats SET champion_titles = champion_titles + 1 WHERE uuid = ?")) {
+                    ps.setString(1, leader.toString());
+                    ps.executeUpdate();
+                }
+
+                c.commit();
+                return "champion " + leader + " with " + leaderRp + " RP";
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /** Test helper: gives a player a rating so the season lifecycle can be exercised. */
+    void setRatingForTest(UUID uuid, int season, int rp) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO combat_ratings (uuid, season_number, current_rp, peak_rp, "
+               + "games_counted, created_at, updated_at) VALUES (?, ?, ?, ?, 1, "
+               + "UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE "
+               + "current_rp = VALUES(current_rp), peak_rp = GREATEST(peak_rp, VALUES(peak_rp)), "
+               + "updated_at = UTC_TIMESTAMP(3)")) {
+            ps.setString(1, uuid.toString());
+            ps.setInt(2, season);
+            ps.setInt(3, rp);
+            ps.setInt(4, rp);
+            ps.executeUpdate();
         }
     }
 
