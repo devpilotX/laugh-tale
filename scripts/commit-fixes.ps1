@@ -14,7 +14,8 @@ Remove hardcoded host values and add the row 2 check (spec 5.1, Appendix E)
 
 scripts/check-hardcoded.ps1 implements the acceptance row 2 grep and failed
 on 14 violations in this session's own Day Zero scripts: the VPS address, an
-absolute path to the SSH key, and C:\Laugh-Tale hardcoded twelve times.
+absolute path to the SSH key, and the repository root path hardcoded twelve
+times.
 
 Fixed:
   connection details moved to scripts/host.env.ps1, git-ignored, with
