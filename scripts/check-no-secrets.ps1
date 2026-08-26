@@ -11,7 +11,11 @@ Write-Output '--- is scripts/host.env.ps1 ignored? ---'
 if ($LASTEXITCODE -ne 0) { Write-Output 'NOT IGNORED - this is a defect' } else { Write-Output 'ignored, correct' }
 
 $tracked = @(& $git ls-files)
-$patterns = '\.pem$','\.key$','\.env$','\.sql$','\.jar$','\.log$','^docs/private/','host\.env\.ps1$','\.dump$','credentials','secrets'
+# Patterns for files that must never be tracked. The credentials/secrets words are
+# anchored to data-file extensions so this script's own name does not match itself.
+$patterns = '\.pem$','\.key$','\.env$','\.sql$','\.jar$','\.log$','^docs/private/',
+            'host\.env\.ps1$','\.dump$',
+            '(^|/)(credentials|secrets|token|password)[^/]*\.(txt|json|ya?ml|cfg|ini|conf)$'
 $bad = @()
 foreach ($t in $tracked) {
   foreach ($p in $patterns) { if ($t -match $p) { $bad += ("{0}  (matched {1})" -f $t, $p) } }

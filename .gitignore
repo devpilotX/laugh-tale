@@ -27,6 +27,11 @@ world*/
 # Local connection details. Acceptance row 2: no IP addresses or absolute host
 # paths anywhere in the repository. The committed template is host.env.example.ps1.
 scripts/host.env.ps1
+
+# Local artefact cache written by scripts/verify-manifest.ps1. Jars are pinned
+# in server/manifest.yml with publisher checksums; they are never committed.
+.cache/
+
 *.jar
 *.jar.sha256.tmp
 *.p12
