@@ -150,8 +150,11 @@ final class Menu implements Listener {
             "Both sides must agree.",
             "Grants no advantage - Law 1.",
             "/friend add, accept, remove, requests")));
-        inv.setItem(23, notBuilt(Material.ARMOR_STAND, "Cosmetics",
-            "Unlocked by rank. Never bought with money.", "Waiting on: Phase 7"));
+        inv.setItem(23, item(Material.WRITTEN_BOOK, "Paths and Story", NamedTextColor.LIGHT_PURPLE,
+            List.of("Six Paths, four Houses, and the",
+                    "season Chronicle.",
+                    "Titles and recognition only -",
+                    "never an advantage in a fight.")));
         inv.setItem(24, item(Material.OAK_SIGN, "Leaderboards", NamedTextColor.YELLOW, List.of(
             "Rank, kills, streak, playtime.",
             "No richest list, deliberately.")));
@@ -443,6 +446,78 @@ final class Menu implements Listener {
             });
         });
     }
+    /**
+     * The roleplay page: Paths, House, titles and the Chronicle.
+     *
+     * The six Path buttons show level and progress, and clicking one focuses it on the HUD - which is
+     * the only action on this page that changes anything, and it changes a display. That is the whole
+     * system in miniature: everything here is identity, nothing is power.
+     */
+    void openRoleplay(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final java.util.Map<Path, long[]> paths;
+            final String house;
+            final int titleCount;
+            final Database.ChapterView chapter;
+            try {
+                paths = plugin.database().allPaths(p.getUniqueId());
+                house = plugin.database().myHouse(p.getUniqueId());
+                titleCount = plugin.database().ownedTitles(p.getUniqueId()).size();
+                chapter = plugin.database().currentChapter();
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read your roleplay progress.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                Inventory inv = Bukkit.createInventory(new MenuHolder("roleplay"), 45,
+                    Component.text("Paths, House and Story", NamedTextColor.LIGHT_PURPLE));
+                Material[] icons = {
+                    Material.IRON_PICKAXE, Material.WHEAT, Material.BOW,
+                    Material.COMPASS, Material.CRAFTING_TABLE, Material.EMERALD
+                };
+                int i = 0;
+                for (Path path : Path.values()) {
+                    long[] v = paths.getOrDefault(path, new long[] { 0, 0 });
+                    long xp = v[0];
+                    int level = (int) v[1];
+                    inv.setItem(10 + i, item(icons[i], path.display() + "  level " + level,
+                        NamedTextColor.WHITE, List.of(
+                            path.blurb(),
+                            "",
+                            Path.bar(xp) + "  " + xp + " xp",
+                            level >= Path.MAX_LEVEL ? "Mastered."
+                                : "Next level at " + Path.xpForLevel(level + 1) + " xp",
+                            "",
+                            "Click to show this on your HUD.",
+                            "Grants titles only - never an advantage.")));
+                    i++;
+                }
+                inv.setItem(29, item(Material.WHITE_BANNER,
+                    house == null ? "No House" : house,
+                    NamedTextColor.GOLD, house == null
+                        ? List.of("Four Houses: Ember, Tide,", "Verdant, Ashen.",
+                                  "/house join <name>")
+                        : List.of("Standing comes from everything",
+                                  "members do, not only fighting.",
+                                  "/house to see the standings")));
+                inv.setItem(31, item(Material.NAME_TAG, "Titles: " + titleCount,
+                    NamedTextColor.AQUA, List.of("Earned from Paths, Chronicles",
+                        "and Champion wins.", "/title to choose one")));
+                inv.setItem(33, item(Material.WRITTEN_BOOK,
+                    chapter == null ? "The Chronicle has not begun"
+                        : "Chapter " + chapter.chapter() + " - " + chapter.title(),
+                    NamedTextColor.LIGHT_PURPLE, List.of(
+                        "The season story. Everyone's",
+                        "work counts toward it.",
+                        "Click to read.")));
+                inv.setItem(36, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(44, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
     private void openAdmin(Player p) {
         Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
             Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
@@ -522,6 +597,27 @@ final class Menu implements Listener {
             return;
         }
 
+        if (holder.page.equals("roleplay")) {
+            switch (clicked.getType()) {
+                case ARROW -> openMain(p);
+                case WRITTEN_BOOK -> { p.closeInventory(); run(p, "chronicle"); }
+                case WHITE_BANNER -> { p.closeInventory(); run(p, "house"); }
+                case NAME_TAG -> { p.closeInventory(); run(p, "title"); }
+                default -> {
+                    // A Path button. The display name starts with the Path name, so it is matched by
+                    // prefix rather than by exact text - the label carries a level that changes.
+                    for (Path path : Path.values()) {
+                        if (name.startsWith(path.display())) {
+                            p.closeInventory();
+                            run(p, "path focus " + path.key());
+                            return;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         if (holder.page.equals("bazaar")) {
             switch (name) {
                 case "Back" -> openMain(p);
@@ -569,6 +665,7 @@ final class Menu implements Listener {
             case "Your rank", "Your stats" -> openStats(p);
             case "Shop"                -> openShop(p, null);
             case "Orders / Bazaar"     -> openBazaar(p);
+            case "Paths and Story"     -> openRoleplay(p);
             case "Friends"             -> { p.closeInventory(); run(p, "friend list"); }
             case "Leaderboards"        -> { p.closeInventory(); run(p, "top rank"); }
             case "Berries"             -> run(p, "berries");

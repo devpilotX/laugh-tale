@@ -9,6 +9,19 @@ description: The LaughTail core. Access, rules gate, player registry.
 # otherwise would let it load on a server it cannot run correctly on.
 
 commands:
+  me:
+    description: Describe what you are doing, to people nearby.
+    usage: /me <action>
+  local:
+    description: Speak only to players within 100 blocks.
+    usage: /local <message>
+  hc:
+    description: Speak to your House, wherever they are.
+    usage: /hc <message>
+  chronicle:
+    description: The season story and how far the server has got.
+    usage: /chronicle
+    aliases: [story]
   path:
     description: Your six Paths and their progress. Titles only, never an advantage.
     usage: /path [focus <name>]

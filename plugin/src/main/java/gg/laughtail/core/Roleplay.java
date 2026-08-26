@@ -48,6 +48,13 @@ final class Roleplay implements Listener {
 
     private final LaughTailPlugin plugin;
     private final Database db;
+    /**
+     * The Chronicle is fed from the SAME events, rather than from its own listeners.
+     *
+     * Two listeners on BlockBreakEvent would double the cost of the hottest event on the server for no
+     * benefit. One listener, two consumers.
+     */
+    private Chronicles chronicles;
 
     /** Pending XP per player per Path, awaiting a flush. */
     private final Map<UUID, Map<Path, Long>> pending = new ConcurrentHashMap<>();
@@ -57,6 +64,12 @@ final class Roleplay implements Listener {
     Roleplay(LaughTailPlugin plugin, Database db) {
         this.plugin = plugin;
         this.db = db;
+    }
+
+    void setChronicles(Chronicles c) { this.chronicles = c; }
+
+    private void chronicle(String metric, long amount) {
+        if (chronicles != null) chronicles.advance(metric, amount);
     }
 
     void start() {
@@ -90,8 +103,14 @@ final class Roleplay implements Listener {
         };
         if (isCrop(m)) {
             award(e.getPlayer().getUniqueId(), Path.CULTIVATOR, 3);
+            chronicle("crops_harvested", 1);
         } else {
             award(e.getPlayer().getUniqueId(), Path.DELVER, xp);
+            chronicle("blocks_mined", 1);
+            // Deepslate is the marker for "deep", which is what chapter 3 asks for.
+            if (m.name().startsWith("DEEPSLATE") || m == Material.ANCIENT_DEBRIS) {
+                chronicle("deep_mined", 1);
+            }
         }
     }
 
@@ -106,6 +125,7 @@ final class Roleplay implements Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPlace(BlockPlaceEvent e) {
         award(e.getPlayer().getUniqueId(), Path.ARTIFICER, 1);
+        chronicle("items_crafted", 1);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -124,6 +144,9 @@ final class Roleplay implements Listener {
             default -> 2;
         };
         award(killer.getUniqueId(), Path.HUNTER, xp);
+        chronicle("mobs_killed", 1);
+        // "Elite" is defined by the XP weight rather than a second list, so the two cannot drift.
+        if (xp >= 15) chronicle("elite_kills", 1);
     }
 
     /** Called by ShopService and Market so market activity has a ladder too. */
@@ -132,6 +155,8 @@ final class Roleplay implements Listener {
         // than one large transaction, and cannot be farmed by moving Berries back and forth - the
         // shop's 12% spread makes that lose money faster than it earns XP.
         award(id, Path.BROKER, Math.max(1, berriesMoved / 1000));
+        chronicle("berries_traded", berriesMoved);
+        chronicle("orders_filled", 1);
     }
 
     private void sampleMovement() {
@@ -144,6 +169,7 @@ final class Roleplay implements Listener {
             // would be the fastest Wayfinder XP on the server.
             if (d < 2 || d > 200) continue;
             award(p.getUniqueId(), Path.WAYFINDER, (long) Math.max(1, d / 10));
+            chronicle("distance_travelled", (long) d);
         }
     }
 
@@ -219,6 +245,9 @@ final class Roleplay implements Listener {
             case "path", "paths": return paths(p, args);
             case "house": return house(p, args);
             case "title", "titles": return titles(p, args);
+            case "me": return emote(p, args);
+            case "local": return local(p, args);
+            case "hc": return houseChat(p, args);
             default: return false;
         }
     }
@@ -353,4 +382,101 @@ final class Roleplay implements Listener {
         });
         return true;
     }
-}
+
+    // ---- in-character chat ---------------------------------------------------
+    //
+    // SOFT RP, NOT HARD RP (D-0038). Breaking character is not punishable. Hard-RP enforcement needs
+    // constant staff attention this server does not have, and it turns moderation into taste policing -
+    // which is the fastest way to make a small server feel hostile. These are tools for people who WANT
+    // to roleplay, not rules imposed on people who do not.
+
+    /** `/me <action>` - the oldest roleplay verb there is. */
+    boolean emote(Player p, String[] args) {
+        if (args.length == 0) {
+            p.sendMessage(Component.text("Usage: /me <what you are doing>", NamedTextColor.GRAY));
+            return true;
+        }
+        String action = String.join(" ", args);
+        if (action.length() > 160) action = action.substring(0, 160);
+        // Radius-limited, like local chat: an emote broadcast server-wide is indistinguishable from
+        // chat and stops meaning anything.
+        Component msg = Component.text("* " + p.getName() + " " + action, NamedTextColor.LIGHT_PURPLE)
+            .decoration(TextDecoration.ITALIC, true);
+        int heard = 0;
+        for (Player other : plugin.getServer().getOnlinePlayers()) {
+            if (other.getWorld().equals(p.getWorld())
+                    && other.getLocation().distance(p.getLocation()) <= LOCAL_RADIUS) {
+                other.sendMessage(msg);
+                heard++;
+            }
+        }
+        if (heard == 1) {
+            p.sendMessage(Component.text("  (nobody nearby heard that)", NamedTextColor.DARK_GRAY));
+        }
+        return true;
+    }
+
+    /** How far local chat and emotes carry. 100 blocks is roughly a shout across a build. */
+    private static final int LOCAL_RADIUS = 100;
+
+    /** `/local <message>` - speak to people who can actually see you. */
+    boolean local(Player p, String[] args) {
+        if (args.length == 0) {
+            p.sendMessage(Component.text("Usage: /local <message>", NamedTextColor.GRAY));
+            return true;
+        }
+        String said = String.join(" ", args);
+        if (said.length() > 200) said = said.substring(0, 200);
+        Component msg = Component.text("[local] ", NamedTextColor.DARK_AQUA)
+            .append(Component.text(p.getName() + ": ", NamedTextColor.WHITE))
+            .append(Component.text(said, NamedTextColor.GRAY));
+        int heard = 0;
+        for (Player other : plugin.getServer().getOnlinePlayers()) {
+            if (other.getWorld().equals(p.getWorld())
+                    && other.getLocation().distance(p.getLocation()) <= LOCAL_RADIUS) {
+                other.sendMessage(msg);
+                heard++;
+            }
+        }
+        if (heard == 1) {
+            p.sendMessage(Component.text("  (nobody within " + LOCAL_RADIUS + " blocks)",
+                NamedTextColor.DARK_GRAY));
+        }
+        return true;
+    }
+
+    /** `/hc <message>` - the House channel, reaching members wherever they are. */
+    boolean houseChat(Player p, String[] args) {
+        if (args.length == 0) {
+            p.sendMessage(Component.text("Usage: /hc <message>", NamedTextColor.GRAY));
+            return true;
+        }
+        final String said = args.length > 0
+            ? (String.join(" ", args).length() > 200
+                ? String.join(" ", args).substring(0, 200) : String.join(" ", args))
+            : "";
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                String house = db.houseKeyOf(p.getUniqueId());
+                if (house == null) {
+                    plugin.getServer().getScheduler().runTask(plugin, () -> p.sendMessage(
+                        Component.text("You are not in a House. /house join <name>",
+                            NamedTextColor.RED)));
+                    return;
+                }
+                java.util.List<UUID> members = db.houseMemberIds(house);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    Component msg = Component.text("[" + house + "] ", NamedTextColor.GOLD)
+                        .append(Component.text(p.getName() + ": ", NamedTextColor.WHITE))
+                        .append(Component.text(said, NamedTextColor.GRAY));
+                    for (UUID id : members) {
+                        Player m = plugin.getServer().getPlayer(id);
+                        if (m != null) m.sendMessage(msg);
+                    }
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().warning("house chat failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }}

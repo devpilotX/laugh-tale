@@ -53,6 +53,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Market market;
     private SeasonScheduler seasonScheduler;
     private Roleplay roleplay;
+    private Chronicles chronicles;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -100,6 +101,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.market = new Market(this, database);
         this.roleplay = new Roleplay(this, database);
         getServer().getPluginManager().registerEvents(roleplay, this);
+        this.chronicles = new Chronicles(this, database);
+        roleplay.setChronicles(chronicles);
+        chronicles.start();
         roleplay.start();
         this.seasonScheduler = new SeasonScheduler(this, database);
         seasonScheduler.start();
@@ -465,6 +469,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (social.handle(sender, name, args)) return true;
         if (market.handle(sender, name, args)) return true;
         if (roleplay.handle(sender, name, args)) return true;
+        if (chronicles.handle(sender, name)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }

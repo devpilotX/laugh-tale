@@ -315,3 +315,25 @@ its setup succeeded before drawing conclusions from it - the same lesson as the 
 * **There is no richest leaderboard.** It would reward hoarding over playing and tell every thief
   who to target. Rank is the competitive axis, so rank is what is ranked. The leaderboard says so
   itself rather than leaving players to wonder.
+## Roleplay - Paths, Houses, Chronicles (D-0038), 2026-08-26
+
+`scripts/remote/test-roleplay.sh`, all pass, re-run after the Chronicle tables were added:
+
+* Four Houses seeded with mottos.
+* **No column in any roleplay table could hold a combat or economic advantage.** The test searches
+  every roleplay table for a column resembling damage, health, speed, bonus, multiplier, discount,
+  permission or drop, and requires **zero hits**. Law 1 is structural here, not a promise in a comment -
+  adding one would need a migration somebody has to review.
+* **No table references `combat_ratings`**, so no roleplay write can reach the PvP ladder. That is row
+  30's guarantee held by the schema rather than by discipline.
+* An invented Path name was refused by the enum.
+
+Chronicle seeded and verified: **5 chapters for season 2, chapter 1 active**, 3 objectives at 0
+progress, chapters 2-5 locked. Boot log 15:02:50.
+
+### What is deliberately absent, and why it is not an omission
+
+There is no Path bonus, no House perk, no Chronicle item reward and no cosmetic that changes a
+statistic. **If a roleplay reward ever changes a number that matters in a fight, the design has
+failed** - because rank would then measure who ground a profession rather than who fought better, and
+the ladder is the product.

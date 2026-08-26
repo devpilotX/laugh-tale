@@ -183,6 +183,19 @@ description: The LaughTail core. Access, rules gate, player registry.
 # otherwise would let it load on a server it cannot run correctly on.
 
 commands:
+  me:
+    description: Describe what you are doing, to people nearby.
+    usage: /me <action>
+  local:
+    description: Speak only to players within 100 blocks.
+    usage: /local <message>
+  hc:
+    description: Speak to your House, wherever they are.
+    usage: /hc <message>
+  chronicle:
+    description: The season story and how far the server has got.
+    usage: /chronicle
+    aliases: [story]
   path:
     description: Your six Paths and their progress. Titles only, never an advantage.
     usage: /path [focus <name>]
@@ -432,6 +445,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Market market;
     private SeasonScheduler seasonScheduler;
     private Roleplay roleplay;
+    private Chronicles chronicles;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -479,6 +493,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.market = new Market(this, database);
         this.roleplay = new Roleplay(this, database);
         getServer().getPluginManager().registerEvents(roleplay, this);
+        this.chronicles = new Chronicles(this, database);
+        roleplay.setChronicles(chronicles);
+        chronicles.start();
         roleplay.start();
         this.seasonScheduler = new SeasonScheduler(this, database);
         seasonScheduler.start();
@@ -844,6 +861,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (social.handle(sender, name, args)) return true;
         if (market.handle(sender, name, args)) return true;
         if (roleplay.handle(sender, name, args)) return true;
+        if (chronicles.handle(sender, name)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }
@@ -3389,6 +3407,217 @@ public final class Database {
                     out.add(rs.getString(1) + "  " + rs.getLong(2) + " points  "
                         + rs.getInt(3) + " member(s)");
                 }
+            }
+        }
+        return out;
+    }
+    // ---- chronicles --------------------------------------------------------------
+
+    record ChapterView(int id, int chapter, String title, String narrative) { }
+    record ChapterCompletion(int season, int chapter, String title, String nextTitle) { }
+
+    /** Creates a chapter and its objectives if absent. Returns true when it created one. */
+    boolean ensureChapter(int season, int chapter, String title, String narrative,
+                          String[][] objectives) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                int id;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT id FROM chronicle_chapters WHERE season_number = ? "
+                      + "AND chapter = ?")) {
+                    ps.setInt(1, season);
+                    ps.setInt(2, chapter);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            c.rollback();
+                            return false;
+                        }
+                    }
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO chronicle_chapters (season_number, chapter, title, narrative, "
+                      + "state, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        java.sql.Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setInt(1, season);
+                    ps.setInt(2, chapter);
+                    ps.setString(3, title);
+                    ps.setString(4, narrative);
+                    // Chapter 1 opens immediately; the rest wait. A story where every chapter is
+                    // available at once is a checklist, not a story.
+                    ps.setString(5, chapter == 1 ? "active" : "locked");
+                    if (chapter == 1) {
+                        ps.setTimestamp(6, new java.sql.Timestamp(System.currentTimeMillis()));
+                    } else {
+                        ps.setNull(6, java.sql.Types.TIMESTAMP);
+                    }
+                    ps.executeUpdate();
+                    try (ResultSet rs = ps.getGeneratedKeys()) {
+                        rs.next();
+                        id = rs.getInt(1);
+                    }
+                }
+                for (String[] o : objectives) {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "INSERT INTO chronicle_objectives (chapter_id, description, metric, "
+                          + "target, progress) VALUES (?, ?, ?, ?, 0)")) {
+                        ps.setInt(1, id);
+                        ps.setString(2, o[0]);
+                        ps.setString(3, o[1]);
+                        ps.setLong(4, Long.parseLong(o[2]));
+                        ps.executeUpdate();
+                    }
+                }
+                c.commit();
+                return true;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Advances every objective of the ACTIVE chapter that tracks this metric.
+     *
+     * Capped at the target with LEAST, so progress cannot exceed 100% - an objective showing 140%
+     * looks like a bug even when the arithmetic is fine, and a cap costs nothing.
+     */
+    void advanceObjectives(String metric, long amount) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE chronicle_objectives o "
+               + "JOIN chronicle_chapters ch ON ch.id = o.chapter_id AND ch.state = 'active' "
+               + "SET o.progress = LEAST(o.target, o.progress + ?) WHERE o.metric = ?")) {
+            ps.setLong(1, amount);
+            ps.setString(2, metric);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Completes the active chapter when every objective is met, and unlocks the next.
+     *
+     * Both happen in one transaction. Completing without unlocking would leave the Chronicle stalled
+     * with nothing active, which reads to players as the story being over.
+     */
+    ChapterCompletion completeChapterIfDone() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                int id = -1, season = 0, chapter = 0;
+                String title = null;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT ch.id, ch.season_number, ch.chapter, ch.title "
+                      + "FROM chronicle_chapters ch WHERE ch.state = 'active' "
+                      + "AND NOT EXISTS (SELECT 1 FROM chronicle_objectives o "
+                      + "WHERE o.chapter_id = ch.id AND o.progress < o.target) "
+                      + "LIMIT 1 FOR UPDATE")) {
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) {
+                            c.rollback();
+                            return null;
+                        }
+                        id = rs.getInt(1);
+                        season = rs.getInt(2);
+                        chapter = rs.getInt(3);
+                        title = rs.getString(4);
+                    }
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE chronicle_chapters SET state = 'complete', "
+                      + "completed_at = UTC_TIMESTAMP(3) WHERE id = ?")) {
+                    ps.setInt(1, id);
+                    ps.executeUpdate();
+                }
+                String nextTitle = null;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT id, title FROM chronicle_chapters WHERE season_number = ? "
+                      + "AND chapter = ? AND state = 'locked'")) {
+                    ps.setInt(1, season);
+                    ps.setInt(2, chapter + 1);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            int nextId = rs.getInt(1);
+                            nextTitle = rs.getString(2);
+                            try (PreparedStatement up = c.prepareStatement(
+                                    "UPDATE chronicle_chapters SET state = 'active', "
+                                  + "started_at = UTC_TIMESTAMP(3) WHERE id = ?")) {
+                                up.setInt(1, nextId);
+                                up.executeUpdate();
+                            }
+                        }
+                    }
+                }
+                c.commit();
+                return new ChapterCompletion(season, chapter, title, nextTitle);
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    ChapterView currentChapter() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT id, chapter, title, narrative FROM chronicle_chapters "
+               + "WHERE state = 'active' LIMIT 1")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                return new ChapterView(rs.getInt(1), rs.getInt(2), rs.getString(3),
+                    rs.getString(4));
+            }
+        }
+    }
+
+    java.util.List<String> chapterObjectives(int chapterId) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT description, progress, target FROM chronicle_objectives "
+               + "WHERE chapter_id = ? ORDER BY id")) {
+            ps.setInt(1, chapterId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long prog = rs.getLong(2), target = rs.getLong(3);
+                    int pct = (int) Math.round(100.0 * prog / target);
+                    int filled = pct / 10;
+                    StringBuilder bar = new StringBuilder();
+                    for (int i = 0; i < 10; i++) bar.append(i < filled ? '\u25AC' : '\u00B7');
+                    out.add(bar + "  " + pct + "%  " + rs.getString(1)
+                        + "  (" + prog + "/" + target + ")");
+                }
+            }
+        }
+        return out;
+    }
+    String houseKeyOf(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT house FROM house_members WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    java.util.List<UUID> houseMemberIds(String house) throws SQLException {
+        assertOffMainThread();
+        java.util.List<UUID> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT uuid FROM house_members WHERE house = ?")) {
+            ps.setString(1, house);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(UUID.fromString(rs.getString(1)));
             }
         }
         return out;
@@ -6068,8 +6297,11 @@ final class Menu implements Listener {
             "Both sides must agree.",
             "Grants no advantage - Law 1.",
             "/friend add, accept, remove, requests")));
-        inv.setItem(23, notBuilt(Material.ARMOR_STAND, "Cosmetics",
-            "Unlocked by rank. Never bought with money.", "Waiting on: Phase 7"));
+        inv.setItem(23, item(Material.WRITTEN_BOOK, "Paths and Story", NamedTextColor.LIGHT_PURPLE,
+            List.of("Six Paths, four Houses, and the",
+                    "season Chronicle.",
+                    "Titles and recognition only -",
+                    "never an advantage in a fight.")));
         inv.setItem(24, item(Material.OAK_SIGN, "Leaderboards", NamedTextColor.YELLOW, List.of(
             "Rank, kills, streak, playtime.",
             "No richest list, deliberately.")));
@@ -6361,6 +6593,78 @@ final class Menu implements Listener {
             });
         });
     }
+    /**
+     * The roleplay page: Paths, House, titles and the Chronicle.
+     *
+     * The six Path buttons show level and progress, and clicking one focuses it on the HUD - which is
+     * the only action on this page that changes anything, and it changes a display. That is the whole
+     * system in miniature: everything here is identity, nothing is power.
+     */
+    void openRoleplay(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final java.util.Map<Path, long[]> paths;
+            final String house;
+            final int titleCount;
+            final Database.ChapterView chapter;
+            try {
+                paths = plugin.database().allPaths(p.getUniqueId());
+                house = plugin.database().myHouse(p.getUniqueId());
+                titleCount = plugin.database().ownedTitles(p.getUniqueId()).size();
+                chapter = plugin.database().currentChapter();
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read your roleplay progress.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                Inventory inv = Bukkit.createInventory(new MenuHolder("roleplay"), 45,
+                    Component.text("Paths, House and Story", NamedTextColor.LIGHT_PURPLE));
+                Material[] icons = {
+                    Material.IRON_PICKAXE, Material.WHEAT, Material.BOW,
+                    Material.COMPASS, Material.CRAFTING_TABLE, Material.EMERALD
+                };
+                int i = 0;
+                for (Path path : Path.values()) {
+                    long[] v = paths.getOrDefault(path, new long[] { 0, 0 });
+                    long xp = v[0];
+                    int level = (int) v[1];
+                    inv.setItem(10 + i, item(icons[i], path.display() + "  level " + level,
+                        NamedTextColor.WHITE, List.of(
+                            path.blurb(),
+                            "",
+                            Path.bar(xp) + "  " + xp + " xp",
+                            level >= Path.MAX_LEVEL ? "Mastered."
+                                : "Next level at " + Path.xpForLevel(level + 1) + " xp",
+                            "",
+                            "Click to show this on your HUD.",
+                            "Grants titles only - never an advantage.")));
+                    i++;
+                }
+                inv.setItem(29, item(Material.WHITE_BANNER,
+                    house == null ? "No House" : house,
+                    NamedTextColor.GOLD, house == null
+                        ? List.of("Four Houses: Ember, Tide,", "Verdant, Ashen.",
+                                  "/house join <name>")
+                        : List.of("Standing comes from everything",
+                                  "members do, not only fighting.",
+                                  "/house to see the standings")));
+                inv.setItem(31, item(Material.NAME_TAG, "Titles: " + titleCount,
+                    NamedTextColor.AQUA, List.of("Earned from Paths, Chronicles",
+                        "and Champion wins.", "/title to choose one")));
+                inv.setItem(33, item(Material.WRITTEN_BOOK,
+                    chapter == null ? "The Chronicle has not begun"
+                        : "Chapter " + chapter.chapter() + " - " + chapter.title(),
+                    NamedTextColor.LIGHT_PURPLE, List.of(
+                        "The season story. Everyone's",
+                        "work counts toward it.",
+                        "Click to read.")));
+                inv.setItem(36, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(44, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
     private void openAdmin(Player p) {
         Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
             Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
@@ -6440,6 +6744,27 @@ final class Menu implements Listener {
             return;
         }
 
+        if (holder.page.equals("roleplay")) {
+            switch (clicked.getType()) {
+                case ARROW -> openMain(p);
+                case WRITTEN_BOOK -> { p.closeInventory(); run(p, "chronicle"); }
+                case WHITE_BANNER -> { p.closeInventory(); run(p, "house"); }
+                case NAME_TAG -> { p.closeInventory(); run(p, "title"); }
+                default -> {
+                    // A Path button. The display name starts with the Path name, so it is matched by
+                    // prefix rather than by exact text - the label carries a level that changes.
+                    for (Path path : Path.values()) {
+                        if (name.startsWith(path.display())) {
+                            p.closeInventory();
+                            run(p, "path focus " + path.key());
+                            return;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         if (holder.page.equals("bazaar")) {
             switch (name) {
                 case "Back" -> openMain(p);
@@ -6487,6 +6812,7 @@ final class Menu implements Listener {
             case "Your rank", "Your stats" -> openStats(p);
             case "Shop"                -> openShop(p, null);
             case "Orders / Bazaar"     -> openBazaar(p);
+            case "Paths and Story"     -> openRoleplay(p);
             case "Friends"             -> { p.closeInventory(); run(p, "friend list"); }
             case "Leaderboards"        -> { p.closeInventory(); run(p, "top rank"); }
             case "Berries"             -> run(p, "berries");
@@ -9608,6 +9934,13 @@ final class Roleplay implements Listener {
 
     private final LaughTailPlugin plugin;
     private final Database db;
+    /**
+     * The Chronicle is fed from the SAME events, rather than from its own listeners.
+     *
+     * Two listeners on BlockBreakEvent would double the cost of the hottest event on the server for no
+     * benefit. One listener, two consumers.
+     */
+    private Chronicles chronicles;
 
     /** Pending XP per player per Path, awaiting a flush. */
     private final Map<UUID, Map<Path, Long>> pending = new ConcurrentHashMap<>();
@@ -9617,6 +9950,12 @@ final class Roleplay implements Listener {
     Roleplay(LaughTailPlugin plugin, Database db) {
         this.plugin = plugin;
         this.db = db;
+    }
+
+    void setChronicles(Chronicles c) { this.chronicles = c; }
+
+    private void chronicle(String metric, long amount) {
+        if (chronicles != null) chronicles.advance(metric, amount);
     }
 
     void start() {
@@ -9650,8 +9989,14 @@ final class Roleplay implements Listener {
         };
         if (isCrop(m)) {
             award(e.getPlayer().getUniqueId(), Path.CULTIVATOR, 3);
+            chronicle("crops_harvested", 1);
         } else {
             award(e.getPlayer().getUniqueId(), Path.DELVER, xp);
+            chronicle("blocks_mined", 1);
+            // Deepslate is the marker for "deep", which is what chapter 3 asks for.
+            if (m.name().startsWith("DEEPSLATE") || m == Material.ANCIENT_DEBRIS) {
+                chronicle("deep_mined", 1);
+            }
         }
     }
 
@@ -9666,6 +10011,7 @@ final class Roleplay implements Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPlace(BlockPlaceEvent e) {
         award(e.getPlayer().getUniqueId(), Path.ARTIFICER, 1);
+        chronicle("items_crafted", 1);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -9684,6 +10030,9 @@ final class Roleplay implements Listener {
             default -> 2;
         };
         award(killer.getUniqueId(), Path.HUNTER, xp);
+        chronicle("mobs_killed", 1);
+        // "Elite" is defined by the XP weight rather than a second list, so the two cannot drift.
+        if (xp >= 15) chronicle("elite_kills", 1);
     }
 
     /** Called by ShopService and Market so market activity has a ladder too. */
@@ -9692,6 +10041,8 @@ final class Roleplay implements Listener {
         // than one large transaction, and cannot be farmed by moving Berries back and forth - the
         // shop's 12% spread makes that lose money faster than it earns XP.
         award(id, Path.BROKER, Math.max(1, berriesMoved / 1000));
+        chronicle("berries_traded", berriesMoved);
+        chronicle("orders_filled", 1);
     }
 
     private void sampleMovement() {
@@ -9704,6 +10055,7 @@ final class Roleplay implements Listener {
             // would be the fastest Wayfinder XP on the server.
             if (d < 2 || d > 200) continue;
             award(p.getUniqueId(), Path.WAYFINDER, (long) Math.max(1, d / 10));
+            chronicle("distance_travelled", (long) d);
         }
     }
 
@@ -9779,6 +10131,9 @@ final class Roleplay implements Listener {
             case "path", "paths": return paths(p, args);
             case "house": return house(p, args);
             case "title", "titles": return titles(p, args);
+            case "me": return emote(p, args);
+            case "local": return local(p, args);
+            case "hc": return houseChat(p, args);
             default: return false;
         }
     }
@@ -9913,8 +10268,361 @@ final class Roleplay implements Listener {
         });
         return true;
     }
-}
+
+    // ---- in-character chat ---------------------------------------------------
+    //
+    // SOFT RP, NOT HARD RP (D-0038). Breaking character is not punishable. Hard-RP enforcement needs
+    // constant staff attention this server does not have, and it turns moderation into taste policing -
+    // which is the fastest way to make a small server feel hostile. These are tools for people who WANT
+    // to roleplay, not rules imposed on people who do not.
+
+    /** `/me <action>` - the oldest roleplay verb there is. */
+    boolean emote(Player p, String[] args) {
+        if (args.length == 0) {
+            p.sendMessage(Component.text("Usage: /me <what you are doing>", NamedTextColor.GRAY));
+            return true;
+        }
+        String action = String.join(" ", args);
+        if (action.length() > 160) action = action.substring(0, 160);
+        // Radius-limited, like local chat: an emote broadcast server-wide is indistinguishable from
+        // chat and stops meaning anything.
+        Component msg = Component.text("* " + p.getName() + " " + action, NamedTextColor.LIGHT_PURPLE)
+            .decoration(TextDecoration.ITALIC, true);
+        int heard = 0;
+        for (Player other : plugin.getServer().getOnlinePlayers()) {
+            if (other.getWorld().equals(p.getWorld())
+                    && other.getLocation().distance(p.getLocation()) <= LOCAL_RADIUS) {
+                other.sendMessage(msg);
+                heard++;
+            }
+        }
+        if (heard == 1) {
+            p.sendMessage(Component.text("  (nobody nearby heard that)", NamedTextColor.DARK_GRAY));
+        }
+        return true;
+    }
+
+    /** How far local chat and emotes carry. 100 blocks is roughly a shout across a build. */
+    private static final int LOCAL_RADIUS = 100;
+
+    /** `/local <message>` - speak to people who can actually see you. */
+    boolean local(Player p, String[] args) {
+        if (args.length == 0) {
+            p.sendMessage(Component.text("Usage: /local <message>", NamedTextColor.GRAY));
+            return true;
+        }
+        String said = String.join(" ", args);
+        if (said.length() > 200) said = said.substring(0, 200);
+        Component msg = Component.text("[local] ", NamedTextColor.DARK_AQUA)
+            .append(Component.text(p.getName() + ": ", NamedTextColor.WHITE))
+            .append(Component.text(said, NamedTextColor.GRAY));
+        int heard = 0;
+        for (Player other : plugin.getServer().getOnlinePlayers()) {
+            if (other.getWorld().equals(p.getWorld())
+                    && other.getLocation().distance(p.getLocation()) <= LOCAL_RADIUS) {
+                other.sendMessage(msg);
+                heard++;
+            }
+        }
+        if (heard == 1) {
+            p.sendMessage(Component.text("  (nobody within " + LOCAL_RADIUS + " blocks)",
+                NamedTextColor.DARK_GRAY));
+        }
+        return true;
+    }
+
+    /** `/hc <message>` - the House channel, reaching members wherever they are. */
+    boolean houseChat(Player p, String[] args) {
+        if (args.length == 0) {
+            p.sendMessage(Component.text("Usage: /hc <message>", NamedTextColor.GRAY));
+            return true;
+        }
+        final String said = args.length > 0
+            ? (String.join(" ", args).length() > 200
+                ? String.join(" ", args).substring(0, 200) : String.join(" ", args))
+            : "";
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                String house = db.houseKeyOf(p.getUniqueId());
+                if (house == null) {
+                    plugin.getServer().getScheduler().runTask(plugin, () -> p.sendMessage(
+                        Component.text("You are not in a House. /house join <name>",
+                            NamedTextColor.RED)));
+                    return;
+                }
+                java.util.List<UUID> members = db.houseMemberIds(house);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    Component msg = Component.text("[" + house + "] ", NamedTextColor.GOLD)
+                        .append(Component.text(p.getName() + ": ", NamedTextColor.WHITE))
+                        .append(Component.text(said, NamedTextColor.GRAY));
+                    for (UUID id : members) {
+                        Player m = plugin.getServer().getPlayer(id);
+                        if (m != null) m.sendMessage(msg);
+                    }
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().warning("house chat failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Roleplay_java
+
+# ---- src/main/java/gg/laughtail/core/Chronicles.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Chronicles.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Chronicles_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
+
+import java.sql.SQLException;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
+
+/**
+ * Chronicles: the server-wide story. See docs/roleplay-design.md.
+ *
+ * PROGRESS IS SERVER-WIDE, NOT PER PLAYER, and that is the central decision. Per-player quest chains
+ * need NPCs, dialogue trees and a state machine for every player - which is what makes roleplay
+ * plugins expensive, and none of it fits in the memory this box has. Server-wide progress instead:
+ *
+ *   - makes strangers cooperate without a party system, because everyone's mining counts toward the
+ *     same number;
+ *   - costs one row per objective rather than one row per player per objective;
+ *   - produces the thing this server has no other source of - a sense that something is happening.
+ *
+ * EVERY CHAPTER NEEDS MORE THAN ONE KIND OF PLAYER. A chapter might require blocks mined AND mobs
+ * killed AND orders filled, so no single play style can finish it alone. That is deliberate: it makes
+ * the farmer and the fighter useful to each other, which is the only honest way to build cooperation
+ * without mechanical coercion.
+ *
+ * REWARDS ARE LORE AND A TITLE. Never an item, never Berries, never a bonus - same rule as the rest of
+ * the roleplay system (D-0038). A Chronicle that paid out gear would turn the story into a farm.
+ *
+ * COUNTERS ARE BATCHED for the same reason Path XP is: these hook block breaks and mob deaths, and a
+ * database write per event would be the heaviest thing on the server.
+ */
+final class Chronicles {
+
+    /** The season's story. Written here rather than in the database so it is version-controlled. */
+    private record Chapter(int number, String title, String narrative, String[][] objectives) { }
+
+    /**
+     * Five chapters, following the server's own name.
+     *
+     * The arc is deliberately about *searching* rather than fighting, because the PvP ladder already
+     * supplies conflict and a story that also demanded conflict would just be the ladder again with
+     * extra words.
+     */
+    private static final Chapter[] STORY = {
+        new Chapter(1, "The Rumour",
+            "Someone came back. Nobody agrees from where. They spoke of an island at the end of "
+          + "every chart, where the last people to arrive were laughing. Then they stopped talking "
+          + "about it, which is how everyone knew it was true. The first thing any expedition needs "
+          + "is not courage. It is supplies.",
+            new String[][] {
+                { "Mine 25,000 blocks", "blocks_mined", "25000" },
+                { "Harvest 2,000 crops", "crops_harvested", "2000" },
+                { "Fill 25 market orders", "orders_filled", "25" }
+            }),
+        new Chapter(2, "The First Marker",
+            "A stone, half-buried, cut by hands that did not use iron. The marks on it are not "
+          + "writing. They are a distance - and the distance points away from everything anyone has "
+          + "mapped. Whoever follows it will need to survive what lives out there.",
+            new String[][] {
+                { "Travel 500,000 blocks between you", "distance_travelled", "500000" },
+                { "Defeat 5,000 hostile creatures", "mobs_killed", "5000" },
+                { "Craft 5,000 items", "items_crafted", "5000" }
+            }),
+        new Chapter(3, "Deep Water",
+            "The charts end here and the water does not. Three expeditions have turned back. The "
+          + "fourth sent one message before the silence: 'It is not empty. It is waiting.' Someone "
+          + "has to go deeper than is sensible, and someone has to keep the ones who do alive.",
+            new String[][] {
+                { "Reach the depths: mine 5,000 deep blocks", "deep_mined", "5000" },
+                { "Defeat 500 dangerous creatures", "elite_kills", "500" },
+                { "Move 250,000 Berries through the market", "berries_traded", "250000" }
+            }),
+        new Chapter(4, "What the Stones Remember",
+            "The markers are not directions. They are a record - of everyone who tried this before, "
+          + "and there have been many. None of them were the first. The joke at the end of the world "
+          + "is that the island has been found before, and forgotten every time, because whoever "
+          + "arrives stops wanting to leave.",
+            new String[][] {
+                { "Mine 100,000 blocks", "blocks_mined", "100000" },
+                { "Defeat 20,000 hostile creatures", "mobs_killed", "20000" },
+                { "Fill 250 market orders", "orders_filled", "250" }
+            }),
+        new Chapter(5, "Laugh Tale",
+            "You arrive. It is smaller than the stories. There is no treasure, no throne, nothing to "
+          + "carry home - only the evidence that the crossing is possible, left by people who wanted "
+          + "someone else to know it. That is the whole of it. And standing there, everyone who "
+          + "reaches it does the same thing, for the same reason, which is why it has the name it has.",
+            new String[][] {
+                { "Everyone: 250,000 blocks mined", "blocks_mined", "250000" },
+                { "Everyone: 50,000 creatures defeated", "mobs_killed", "50000" },
+                { "Everyone: 1,000,000 Berries traded", "berries_traded", "1000000" }
+            })
+    };
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+    private final Map<String, Long> pending = new ConcurrentHashMap<>();
+
+    Chronicles(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+    }
+
+    void start() {
+        plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, this::flush,
+            20L * 40, 20L * 30);
+        plugin.getServer().getScheduler().runTaskLaterAsynchronously(plugin, this::seed, 20L * 15);
+    }
+
+    /** Advances a metric. Batched; safe to call from any thread and from hot events. */
+    void advance(String metric, long amount) {
+        if (amount <= 0) return;
+        pending.merge(metric, amount, Long::sum);
+    }
+
+    /**
+     * Creates this season's chapters if they do not exist, and activates chapter 1.
+     *
+     * Idempotent by the unique key on (season, chapter), so it can run on every boot. Chapters are
+     * seeded per SEASON so the story restarts with each one - a story that only ever runs once leaves
+     * every later season with nothing to discover.
+     */
+    private void seed() {
+        try {
+            int season = db.activeSeason();
+            if (season <= 0) return;
+            int created = 0;
+            for (Chapter ch : STORY) {
+                if (db.ensureChapter(season, ch.number(), ch.title(), ch.narrative(),
+                        ch.objectives())) {
+                    created++;
+                }
+            }
+            if (created > 0) {
+                plugin.getLogger().info("Chronicle seeded for season " + season + ": "
+                    + created + " chapter(s). Chapter 1 is active.");
+            }
+        } catch (SQLException e) {
+            plugin.getLogger().log(Level.WARNING, "chronicle seed failed: " + e.getMessage());
+        }
+    }
+
+    private void flush() {
+        if (pending.isEmpty()) return;
+        Map<String, Long> batch = new ConcurrentHashMap<>(pending);
+        pending.clear();
+        try {
+            for (Map.Entry<String, Long> e : batch.entrySet()) {
+                db.advanceObjectives(e.getKey(), e.getValue());
+            }
+            Database.ChapterCompletion done = db.completeChapterIfDone();
+            if (done != null) announceCompletion(done);
+        } catch (SQLException e) {
+            plugin.getLogger().log(Level.WARNING, "chronicle flush failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Announces a completed chapter loudly.
+     *
+     * A server-wide story whose milestones pass quietly is a story nobody is in. This is the payoff
+     * for thousands of blocks of collective work, so it interrupts.
+     */
+    private void announceCompletion(Database.ChapterCompletion done) {
+        plugin.getServer().getScheduler().runTask(plugin, () -> {
+            plugin.getServer().broadcast(Component.empty());
+            plugin.getServer().broadcast(Component.text("  THE CHRONICLE ADVANCES",
+                NamedTextColor.GOLD).decoration(TextDecoration.BOLD, true));
+            plugin.getServer().broadcast(Component.text("  Chapter " + done.chapter() + " - "
+                + done.title() + " is complete.", NamedTextColor.YELLOW));
+            if (done.nextTitle() != null) {
+                plugin.getServer().broadcast(Component.text("  Next: " + done.nextTitle(),
+                    NamedTextColor.WHITE));
+                plugin.getServer().broadcast(Component.text("  /chronicle to read it",
+                    NamedTextColor.DARK_GRAY));
+            } else {
+                plugin.getServer().broadcast(Component.text("  The Chronicle is finished. "
+                    + "This season's story is complete.", NamedTextColor.GREEN));
+            }
+            plugin.getServer().broadcast(Component.empty());
+            for (org.bukkit.entity.Player p : plugin.getServer().getOnlinePlayers()) {
+                p.playSound(p.getLocation(), org.bukkit.Sound.UI_TOAST_CHALLENGE_COMPLETE,
+                    1.0f, 0.8f);
+            }
+        });
+        // Everyone online when a chapter lands gets the title. Presence is the contribution that
+        // matters for a collective goal, and per-player contribution accounting would need a row per
+        // player per objective - the exact cost this design avoids.
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            for (org.bukkit.entity.Player p : plugin.getServer().getOnlinePlayers()) {
+                try {
+                    db.grantTitle(p.getUniqueId(), "chronicle." + done.season() + "."
+                        + done.chapter(), done.title(), "#C77DFF", "chronicle");
+                } catch (SQLException ignored) { }
+            }
+        });
+    }
+
+    /** `/chronicle` - read the story and see where the server has got to. */
+    boolean handle(org.bukkit.command.CommandSender sender, String cmd) {
+        if (!cmd.equals("chronicle") && !cmd.equals("story")) return false;
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                Database.ChapterView v = db.currentChapter();
+                List<String> objectives = v == null ? List.of() : db.chapterObjectives(v.id());
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    if (v == null) {
+                        sender.sendMessage(Component.text("The Chronicle has not begun.",
+                            NamedTextColor.GRAY));
+                        return;
+                    }
+                    sender.sendMessage(Component.text("Chapter " + v.chapter() + " - " + v.title(),
+                        NamedTextColor.GOLD).decoration(TextDecoration.BOLD, true));
+                    // The narrative is wrapped rather than sent as one long line, because chat wraps
+                    // mid-word and unreadable lore is lore nobody reads.
+                    for (String line : wrap(v.narrative(), 62)) {
+                        sender.sendMessage(Component.text("  " + line, NamedTextColor.GRAY)
+                            .decoration(TextDecoration.ITALIC, true));
+                    }
+                    sender.sendMessage(Component.empty());
+                    for (String o : objectives) {
+                        sender.sendMessage(Component.text("  " + o, NamedTextColor.WHITE));
+                    }
+                    sender.sendMessage(Component.text("  Everyone's work counts toward these.",
+                        NamedTextColor.DARK_GRAY));
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "chronicle read failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private static List<String> wrap(String text, int width) {
+        List<String> out = new java.util.ArrayList<>();
+        StringBuilder line = new StringBuilder();
+        for (String word : text.split(" ")) {
+            if (line.length() + word.length() + 1 > width) {
+                out.add(line.toString());
+                line.setLength(0);
+            }
+            if (line.length() > 0) line.append(' ');
+            line.append(word);
+        }
+        if (line.length() > 0) out.add(line.toString());
+        return out;
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Chronicles_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do

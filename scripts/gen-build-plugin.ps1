@@ -46,7 +46,8 @@ $files = @(
   'src/main/java/gg/laughtail/core/Market.java',
   'src/main/java/gg/laughtail/core/SeasonScheduler.java',
   'src/main/java/gg/laughtail/core/Path.java',
-  'src/main/java/gg/laughtail/core/Roleplay.java'
+  'src/main/java/gg/laughtail/core/Roleplay.java',
+  'src/main/java/gg/laughtail/core/Chronicles.java'
 )
 
 foreach ($f in $files) {

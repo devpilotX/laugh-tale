@@ -2262,4 +2262,215 @@ public final class Database {
             }
         }
         return out;
+    }
+    // ---- chronicles --------------------------------------------------------------
+
+    record ChapterView(int id, int chapter, String title, String narrative) { }
+    record ChapterCompletion(int season, int chapter, String title, String nextTitle) { }
+
+    /** Creates a chapter and its objectives if absent. Returns true when it created one. */
+    boolean ensureChapter(int season, int chapter, String title, String narrative,
+                          String[][] objectives) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                int id;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT id FROM chronicle_chapters WHERE season_number = ? "
+                      + "AND chapter = ?")) {
+                    ps.setInt(1, season);
+                    ps.setInt(2, chapter);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            c.rollback();
+                            return false;
+                        }
+                    }
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO chronicle_chapters (season_number, chapter, title, narrative, "
+                      + "state, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        java.sql.Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setInt(1, season);
+                    ps.setInt(2, chapter);
+                    ps.setString(3, title);
+                    ps.setString(4, narrative);
+                    // Chapter 1 opens immediately; the rest wait. A story where every chapter is
+                    // available at once is a checklist, not a story.
+                    ps.setString(5, chapter == 1 ? "active" : "locked");
+                    if (chapter == 1) {
+                        ps.setTimestamp(6, new java.sql.Timestamp(System.currentTimeMillis()));
+                    } else {
+                        ps.setNull(6, java.sql.Types.TIMESTAMP);
+                    }
+                    ps.executeUpdate();
+                    try (ResultSet rs = ps.getGeneratedKeys()) {
+                        rs.next();
+                        id = rs.getInt(1);
+                    }
+                }
+                for (String[] o : objectives) {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "INSERT INTO chronicle_objectives (chapter_id, description, metric, "
+                          + "target, progress) VALUES (?, ?, ?, ?, 0)")) {
+                        ps.setInt(1, id);
+                        ps.setString(2, o[0]);
+                        ps.setString(3, o[1]);
+                        ps.setLong(4, Long.parseLong(o[2]));
+                        ps.executeUpdate();
+                    }
+                }
+                c.commit();
+                return true;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Advances every objective of the ACTIVE chapter that tracks this metric.
+     *
+     * Capped at the target with LEAST, so progress cannot exceed 100% - an objective showing 140%
+     * looks like a bug even when the arithmetic is fine, and a cap costs nothing.
+     */
+    void advanceObjectives(String metric, long amount) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE chronicle_objectives o "
+               + "JOIN chronicle_chapters ch ON ch.id = o.chapter_id AND ch.state = 'active' "
+               + "SET o.progress = LEAST(o.target, o.progress + ?) WHERE o.metric = ?")) {
+            ps.setLong(1, amount);
+            ps.setString(2, metric);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Completes the active chapter when every objective is met, and unlocks the next.
+     *
+     * Both happen in one transaction. Completing without unlocking would leave the Chronicle stalled
+     * with nothing active, which reads to players as the story being over.
+     */
+    ChapterCompletion completeChapterIfDone() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                int id = -1, season = 0, chapter = 0;
+                String title = null;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT ch.id, ch.season_number, ch.chapter, ch.title "
+                      + "FROM chronicle_chapters ch WHERE ch.state = 'active' "
+                      + "AND NOT EXISTS (SELECT 1 FROM chronicle_objectives o "
+                      + "WHERE o.chapter_id = ch.id AND o.progress < o.target) "
+                      + "LIMIT 1 FOR UPDATE")) {
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) {
+                            c.rollback();
+                            return null;
+                        }
+                        id = rs.getInt(1);
+                        season = rs.getInt(2);
+                        chapter = rs.getInt(3);
+                        title = rs.getString(4);
+                    }
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE chronicle_chapters SET state = 'complete', "
+                      + "completed_at = UTC_TIMESTAMP(3) WHERE id = ?")) {
+                    ps.setInt(1, id);
+                    ps.executeUpdate();
+                }
+                String nextTitle = null;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT id, title FROM chronicle_chapters WHERE season_number = ? "
+                      + "AND chapter = ? AND state = 'locked'")) {
+                    ps.setInt(1, season);
+                    ps.setInt(2, chapter + 1);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            int nextId = rs.getInt(1);
+                            nextTitle = rs.getString(2);
+                            try (PreparedStatement up = c.prepareStatement(
+                                    "UPDATE chronicle_chapters SET state = 'active', "
+                                  + "started_at = UTC_TIMESTAMP(3) WHERE id = ?")) {
+                                up.setInt(1, nextId);
+                                up.executeUpdate();
+                            }
+                        }
+                    }
+                }
+                c.commit();
+                return new ChapterCompletion(season, chapter, title, nextTitle);
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    ChapterView currentChapter() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT id, chapter, title, narrative FROM chronicle_chapters "
+               + "WHERE state = 'active' LIMIT 1")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                return new ChapterView(rs.getInt(1), rs.getInt(2), rs.getString(3),
+                    rs.getString(4));
+            }
+        }
+    }
+
+    java.util.List<String> chapterObjectives(int chapterId) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT description, progress, target FROM chronicle_objectives "
+               + "WHERE chapter_id = ? ORDER BY id")) {
+            ps.setInt(1, chapterId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long prog = rs.getLong(2), target = rs.getLong(3);
+                    int pct = (int) Math.round(100.0 * prog / target);
+                    int filled = pct / 10;
+                    StringBuilder bar = new StringBuilder();
+                    for (int i = 0; i < 10; i++) bar.append(i < filled ? '\u25AC' : '\u00B7');
+                    out.add(bar + "  " + pct + "%  " + rs.getString(1)
+                        + "  (" + prog + "/" + target + ")");
+                }
+            }
+        }
+        return out;
+    }
+    String houseKeyOf(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT house FROM house_members WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    java.util.List<UUID> houseMemberIds(String house) throws SQLException {
+        assertOffMainThread();
+        java.util.List<UUID> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT uuid FROM house_members WHERE house = ?")) {
+            ps.setString(1, house);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(UUID.fromString(rs.getString(1)));
+            }
+        }
+        return out;
     }}
