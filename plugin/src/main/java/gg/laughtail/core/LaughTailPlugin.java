@@ -51,6 +51,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private CombatTag combatTag;
     private Social social;
     private Market market;
+    private SeasonScheduler seasonScheduler;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -96,6 +97,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.shopService = new ShopService(this, database);
         this.social = new Social(this, database);
         this.market = new Market(this, database);
+        this.seasonScheduler = new SeasonScheduler(this, database);
+        seasonScheduler.start();
         this.combatTag = new CombatTag(this, database);
         getServer().getPluginManager().registerEvents(combatTag, this);
         combatTag.start();

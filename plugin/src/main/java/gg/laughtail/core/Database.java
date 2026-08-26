@@ -1944,4 +1944,33 @@ public final class Database {
             ps.setString(2, "#selftest-b");
             ps.executeUpdate();
         }
+    }
+    // ---- season scheduling ------------------------------------------------------
+
+    record SeasonTiming(int season, java.time.Instant startsAt, java.time.Instant endsAt) { }
+
+    /** The active season and its window, or null when no season is running. */
+    SeasonTiming activeSeasonTiming() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT season_number, starts_at, ends_at FROM seasons "
+               + "WHERE state IN ('active','finale') ORDER BY season_number DESC LIMIT 1")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                return new SeasonTiming(rs.getInt(1),
+                    rs.getTimestamp(2).toInstant(), rs.getTimestamp(3).toInstant());
+            }
+        }
+    }
+
+    boolean anySeasonExists() throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM seasons")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getInt(1) > 0;
+            }
+        }
     }}

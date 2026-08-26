@@ -142,8 +142,10 @@ final class Menu implements Listener {
             "Daily sell limit: 3600 Berries per category.")));
         inv.setItem(20, notBuilt(Material.GOLD_BLOCK, "Auction House",
             "List items for other players to buy.", "Waiting on: Phase 3"));
-        inv.setItem(21, notBuilt(Material.PAPER, "Orders / Bazaar",
-            "Buy and sell orders, matched atomically.", "Waiting on: Phase 3"));
+        inv.setItem(21, item(Material.PAPER, "Orders / Bazaar", NamedTextColor.AQUA, List.of(
+            "Buy and sell orders between players.",
+            "They fill even when you are offline.",
+            "The order that waited sets the price.")));
         inv.setItem(22, item(Material.PLAYER_HEAD, "Friends", NamedTextColor.AQUA, List.of(
             "Both sides must agree.",
             "Grants no advantage - Law 1.",
@@ -379,7 +381,70 @@ final class Menu implements Listener {
         });
     }
 
-    private void openAdmin(Player p) {        Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
+    /**
+     * The bazaar page. Your orders, and how to make one.
+     *
+     * Deliberately does NOT place an order by clicking. An order needs a quantity AND a price, and a
+     * chest GUI has no way to ask for a number - every plugin that tries ends up with a
+     * click-to-increment mess where setting 347 takes forty clicks. The page shows what exists, lets
+     * you collect winnings, and names the one command that creates an order. That is honest about
+     * where a chest interface stops being the right tool.
+     */
+    void openBazaar(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final List<String> mine;
+            try {
+                mine = plugin.database().myOrders(p.getUniqueId());
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read your orders.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                Inventory inv = Bukkit.createInventory(new MenuHolder("bazaar"), 54,
+                    Component.text("Bazaar - " + mine.size() + " of your orders",
+                        NamedTextColor.GOLD));
+                int slot = 0;
+                for (String line : mine) {
+                    if (slot >= 45) break;
+                    boolean collectable = line.contains("to collect");
+                    inv.setItem(slot++, item(
+                        collectable ? Material.GOLD_INGOT : Material.PAPER,
+                        line.length() > 32 ? line.substring(0, 32) : line,
+                        collectable ? NamedTextColor.GOLD : NamedTextColor.WHITE,
+                        List.of(line, "", collectable
+                            ? "Click Collect below to take this."
+                            : "Cancel with /order cancel <id>.")));
+                }
+                if (mine.isEmpty()) {
+                    inv.setItem(22, item(Material.BARRIER, "You have no orders",
+                        NamedTextColor.GRAY, List.of(
+                            "An order needs a quantity and a price,",
+                            "which a chest cannot ask for. Use:",
+                            "/order buy <item> <qty> <price>",
+                            "/order sell <item> <qty> <price>")));
+                }
+                inv.setItem(48, item(Material.HOPPER, "Collect everything",
+                    NamedTextColor.GREEN, List.of("Takes the Berries and items",
+                        "your filled orders earned.")));
+                inv.setItem(49, item(Material.COMPASS, "How the bazaar works",
+                    NamedTextColor.AQUA, List.of(
+                        "Orders fill even when you are offline.",
+                        "The order that waited sets the price,",
+                        "so patience is rewarded, not punished.",
+                        "You cannot trade with yourself.")));
+                inv.setItem(50, item(Material.CHEST, "Shop instead", NamedTextColor.YELLOW,
+                    List.of("Instant, at the server price.",
+                        "The bazaar is player to player.")));
+                inv.setItem(52, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(53, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
+    private void openAdmin(Player p) {
+        Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
             Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
 
         inv.setItem(10, item(Material.NAME_TAG, "Access audit", NamedTextColor.GREEN, List.of(
@@ -457,6 +522,16 @@ final class Menu implements Listener {
             return;
         }
 
+        if (holder.page.equals("bazaar")) {
+            switch (name) {
+                case "Back" -> openMain(p);
+                case "Collect everything" -> { p.closeInventory(); run(p, "order claim"); }
+                case "Shop instead" -> openShop(p, null);
+                default -> { }
+            }
+            return;
+        }
+
         if (holder.page.equals("stats")) {
             switch (name) {
                 case "Back" -> openMain(p);
@@ -493,6 +568,7 @@ final class Menu implements Listener {
             case "Homes"               -> openHomes(p);
             case "Your rank", "Your stats" -> openStats(p);
             case "Shop"                -> openShop(p, null);
+            case "Orders / Bazaar"     -> openBazaar(p);
             case "Friends"             -> { p.closeInventory(); run(p, "friend list"); }
             case "Leaderboards"        -> { p.closeInventory(); run(p, "top rank"); }
             case "Berries"             -> run(p, "berries");
