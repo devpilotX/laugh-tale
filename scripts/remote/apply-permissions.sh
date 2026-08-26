@@ -120,6 +120,7 @@ lp group admin permission set laughtail.event.start true
 lp group admin permission set laughtail.event.stop true
 lp group admin permission set laughtail.arena.manage true
 lp group admin permission set laughtail.reload true
+lp group admin permission set laughtail.status true
 lp group admin permission set laughtail.claims.admin true
 lp group admin permission set laughtail.cosmetics.grant true
 lp group admin permission set laughtail.cosmetics.revoke true

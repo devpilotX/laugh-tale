@@ -653,3 +653,31 @@ That is a delegation of the thirteen proposals in `docs/proposals.md`, so they s
 **One thing worth flagging early, because it is structural rather than cosmetic.** A serious roleplay layer and the current competitive-PvP framing pull in different directions: PvP-everywhere with `keepInventory=false` (7.2) is hostile to sustained roleplay, and rank-from-PvP-only (Law 1) gives a roleplayer no progression at all. Those are reconcilable - separate worlds, or a roleplay season format - but the reconciliation is a **product decision**, and it should be made deliberately rather than discovered when the two systems first collide.
 
 Added to the post-launch roadmap in `docs/progress.md` rather than to any current phase.
+
+
+---
+
+## D-0034 | 2026-08-26 | A wildcard denial makes `default: op` grant nothing — every node must be granted by name
+
+**The symptom.** The owner ran `/laughtail rating` and got "No permission", while being both server op and a member of the `owner` LuckPerms group.
+
+**The cause, which generalises.** `plugin.yml` declared `laughtail.status` as `default: op`, and it was never granted to any group. That looked safe because the owner *is* op. But:
+
+1. The `admin` group carries an explicit **`* = false`**, required because 17.3 forbids a wildcard for Admin.
+2. `owner` **inherits** `admin`.
+3. In LuckPerms an explicit wildcard denial beats an op-based default.
+
+So every node not granted by name somewhere in the chain resolved to denied — for the Owner as well as for Admin. The wildcard denial that protects 17.3 also swallowed a harmless diagnostic command.
+
+**The rule that follows:** *once any group in the inheritance chain denies the wildcard, `default: op` in `plugin.yml` grants nothing.* Every permission the ladder needs must be granted explicitly by name.
+
+That is a better posture regardless. It means the permission set is legible from `server/permissions.yml` alone, rather than depending on who happens to be opped — and op status is exactly the thing 17.3 wants to stop mattering.
+
+**Why the existing verification missed it, which is the more useful failure.** `verify-permissions.sh` tested 31 never-grant nodes (all explicitly denied, all correct) and a 12-row inheritance matrix (all nodes that *were* explicitly granted). Both passed. Neither could notice a node that was **missing entirely** — the tests only asked "are the things I listed correct", never "can the Owner actually operate the server".
+
+**So the fix is two things, not one:**
+
+* `laughtail.status` is now granted by name to `admin`.
+* A new **operator sanity** check asserts that the `owner` group resolves **true** for the ten nodes required to run the server at all — status, reload, season, access grant and revoke, ban, history, unban, rules bypass, audit read. It was written before the fix was applied and correctly reported `laughtail.status owner=None FAIL   <-- the Owner cannot use this`, then passed after. A check that has only ever been seen passing has not been tested.
+
+**One honest limitation of the analyser.** It reported the node as `None` (undefined) rather than `false`, because `effective()` treats only `* = true` as a grant and does not model `* = false` as a denial for undefined nodes. Both readings produce the correct verdict — unusable either way, and the sanity check fails on both — but the analyser's *explanation* is less precise than LuckPerms' actual behaviour. Worth knowing before trusting its wording on a future puzzle.

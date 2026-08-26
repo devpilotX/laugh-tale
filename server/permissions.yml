@@ -83,6 +83,20 @@ groups:
       # Two different nodes; one granted here, the other denied below. Never-break
       # rule 7 also forbids vanilla /reload outright, for everyone.
       - laughtail.reload
+      # laughtail.status must be granted EXPLICITLY, and this is the important lesson from
+      # the bug that made /laughtail rating reply "No permission" for the Owner.
+      #
+      # plugin.yml declares it `default: op`, and the Owner IS op - but the admin group
+      # carries an explicit `* = false` (required by 17.3, which forbids a wildcard for
+      # Admin), and `owner` INHERITS from admin. In LuckPerms an explicit denial on a
+      # wildcard beats an op-based default, so every node not explicitly granted somewhere
+      # in the chain was denied - including this one.
+      #
+      # The general rule that follows: with a wildcard denial anywhere in the inheritance
+      # chain, `default: op` in plugin.yml grants nothing. Every node the ladder needs must
+      # be granted by name. That is a better posture anyway - it means the permission set is
+      # legible from server/permissions.yml alone rather than depending on who is opped.
+      - laughtail.status
       - laughtail.claims.admin
       - laughtail.cosmetics.grant
       - laughtail.cosmetics.revoke

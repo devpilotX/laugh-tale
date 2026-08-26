@@ -207,7 +207,48 @@ for g in sorted(groups):
 if wfail == 0:
     print('  no group holds a wildcard')
 
-total = len(fails) + mfail + wfail
+print()
+print('=== operator sanity: every node the Owner MUST hold to run the server ===')
+# THIS CHECK EXISTS BECAUSE THE MATRIX ABOVE WAS NOT ENOUGH. It only tested nodes that were
+# explicitly granted, so it could not notice one that was missing entirely - which is exactly
+# how /laughtail rating came to reply "No permission" for the Owner.
+#
+# The cause is worth stating because it generalises: `admin` carries an explicit `* = false`
+# (17.3 forbids a wildcard for Admin), `owner` inherits admin, and in LuckPerms an explicit
+# wildcard denial beats an op-based default. So `default: op` in plugin.yml grants NOTHING once
+# a wildcard denial exists anywhere in the chain, and every node must be granted by name.
+#
+# This list is therefore the set of things that must be true for the server to be operable at
+# all. If any of them is false, the Owner cannot run their own server.
+MUST_HOLD = [
+    'laughtail.status',            # /laughtail status and /laughtail rating
+    'laughtail.reload',            # /laughtail reload - the replacement for vanilla /reload
+    'laughtail.season.reset',      # /season
+    'laughtail.whitelist.add',     # /access grant - the paywall
+    'laughtail.whitelist.remove',  # /access revoke
+    'laughtail.punish.permban',    # /ban
+    'laughtail.punish.history',    # /history
+    'laughtail.punish.overturn',   # /unban
+    'laughtail.rules.bypass',      # the Owner is not held by their own rules gate
+    'laughtail.audit.read',        # reading the audit trail
+]
+ofail = 0
+for node in MUST_HOLD:
+    val, src = effective('owner', node)
+    ok = (val is True)
+    if not ok:
+        ofail += 1
+    print('  %-30s owner=%-5s %s%s' % (node, val, 'ok' if ok else 'FAIL',
+        '' if ok else '   <-- the Owner cannot use this'))
+print()
+if ofail == 0:
+    print('OPERATOR SANITY PASS - the Owner holds all %d nodes needed to run the server' % len(MUST_HOLD))
+else:
+    print('OPERATOR SANITY FAIL - %d node(s) the Owner needs are not granted.' % ofail)
+    print('Grant them by name in server/permissions.yml. Relying on `default: op` does not')
+    print('work once any group in the chain denies the wildcard.')
+
+total = len(fails) + mfail + wfail + ofail
 print()
 print('TOTAL FAILURES: %d' % total)
 sys.exit(1 if total else 0)
