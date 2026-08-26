@@ -61,12 +61,18 @@ final class Teleports {
     boolean handle(CommandSender sender, String cmd, String[] args) {
         if (!(sender instanceof Player p)) return false;
         switch (cmd) {
-            case "tpa":      return request(p, args, false);
-            case "tpahere":  return request(p, args, true);
-            case "tpaccept": return accept(p);
+            case "tpa":      return plugin.combatTag().refuse(p, "request a teleport")
+                                    || request(p, args, false);
+            case "tpahere":  return plugin.combatTag().refuse(p, "request a teleport")
+                                    || request(p, args, true);
+            // The ACCEPTER is checked too: accepting is what moves someone, and a player being
+            // chased could otherwise be pulled out of a fight by a friend's waiting request.
+            case "tpaccept": return plugin.combatTag().refuse(p, "accept a teleport")
+                                    || accept(p);
             case "tpdeny":   return deny(p);
             case "rtp":
-            case "wild":     return rtp(p);
+            case "wild":     return plugin.combatTag().refuse(p, "use random teleport")
+                                    || rtp(p);
             default:         return false;
         }
     }

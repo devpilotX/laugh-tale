@@ -755,3 +755,22 @@ the correct implementation - not a hand-tuned price.
 **Consequence accepted.** A player holding ingots cannot sell them directly; they sell raw ore. This
 is a small loss of convenience against a guarantee that the economy cannot be printed, which
 Law 1 and row 26 both rank higher.
+## D-0037 - the combat tag lasts 15 seconds
+
+**Decision.** A player who deals or takes PvP damage is tagged for **15 seconds**. While tagged they
+cannot use `/home`, `/tpa`, `/tpahere`, `/tpaccept` or `/rtp`, and logging out drops their inventory
+and records a death.
+
+**Why 15.** The specification names no figure, so this is decided under D-0031. A sprinting player
+covers roughly 80 blocks in 15 seconds, which is inside render distance - so the fight can actually
+continue rather than the tag merely being a penalty. Ten seconds is escapable with a single ender
+pearl, which makes the tag decorative. Thirty punishes the survivor of an ambush they never wanted.
+
+**What is deliberately not tagged.** Mob damage. Being hit by a zombie must not stop someone going
+home, and tagging on mob damage is the most common complaint levelled at combat-tag plugins.
+
+**The attacker is tagged too.** Tagging only the victim would let an attacker strike and teleport out
+with their advantage intact, which turns the rule into a weapon.
+
+**Bookkeeping commands stay open.** `/sethome`, `/homes`, `/delhome` and `/buyhome` are not blocked.
+The exploit being closed is escaping a fight, not administration.

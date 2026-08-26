@@ -48,6 +48,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Hud hud;
     private ShopService shopService;
     private SellBox sellBox;
+    private CombatTag combatTag;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -91,6 +92,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.menu = new Menu(this);
         getServer().getPluginManager().registerEvents(menu, this);
         this.shopService = new ShopService(this, database);
+        this.combatTag = new CombatTag(this, database);
+        getServer().getPluginManager().registerEvents(combatTag, this);
+        combatTag.start();
         this.sellBox = new SellBox(this, shopService);
         getServer().getPluginManager().registerEvents(sellBox, this);
         // Seed the price table at boot rather than lazily on first trade. A price table that
@@ -267,6 +271,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     Database database() { return database; }
 
     SellBox sellBox() { return sellBox; }
+
+    CombatTag combatTag() { return combatTag; }
 
     Menu menu() { return menu; }
 

@@ -1495,4 +1495,32 @@ public final class Database {
             for (int i = 0; i < keep.size(); i++) ps.setString(i + 1, keep.get(i));
             return ps.executeUpdate();
         }
+    }
+    /**
+     * Records a combat log as a death, and as a loss if an attacker is known.
+     *
+     * Row 33 says disconnecting while tagged is "resolved as a death". Resolved means the ladder
+     * must not be able to tell the difference - otherwise the optimal play on a losing fight is
+     * always to disconnect, and every close fight ends with someone pulling the plug.
+     *
+     * When the attacker is known this goes through the SAME rating path as a real kill, so the
+     * winner is credited and the quitter demoted exactly as if the blow had landed. When it is not
+     * known - the tag came from a projectile whose shooter has since left - only the death is
+     * recorded. Crediting nobody is correct there; inventing a killer would be worse.
+     */
+    void recordCombatLog(UUID quitter, UUID attacker) throws SQLException {
+        assertOffMainThread();
+        int season = activeSeason();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE stats SET deaths = deaths + 1 WHERE uuid = ?")) {
+            ps.setString(1, quitter.toString());
+            ps.executeUpdate();
+        }
+        if (attacker == null || season <= 0) return;
+        int rpKiller = currentRp(attacker, season);
+        int rpVictim = currentRp(quitter, season);
+        // suppressedReason null means the kill COUNTS - a combat log is a real loss, not a
+        // suppressed one. sameIp false because the quitter is gone and cannot be compared.
+        recordCombatEvent(attacker, quitter, rpKiller, rpVictim, null, false, "combat_log", 0, 0, 0);
     }}

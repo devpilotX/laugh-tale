@@ -77,7 +77,10 @@ final class Homes {
         }
         switch (cmd) {
             case "sethome": return setHome(p, args);
-            case "home":    return goHome(p, args);
+            // Only the routes that MOVE a player are gated. /sethome, /homes, /delhome and
+            // /buyhome are bookkeeping and blocking them mid-fight would be punishment without
+            // purpose - the exploit is escaping, not administration.
+            case "home":    return plugin.combatTag().refuse(p, "teleport home") || goHome(p, args);
             case "homes":   return listHomes(p);
             case "delhome": return delHome(p, args);
             case "buyhome": return buySlot(p);
@@ -141,10 +144,8 @@ final class Homes {
             return true;
         }
 
-        // COMBAT TAG HOOK. Row 33 and 15.x want this blocked while tagged. The tag is not built
-        // - its duration is stated nowhere in the specification - so this is the one place it
-        // must be added, marked rather than forgotten.
-        // if (combatTag.isTagged(p)) { refuse; return true; }
+        // Gated at the command entry above, in the switch, so a future caller of goHome cannot
+        // bypass the check by not knowing about it.
 
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             try {
