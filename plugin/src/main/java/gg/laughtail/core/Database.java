@@ -303,6 +303,133 @@ public final class Database {
         }
     }
 
+    // ---- homes (V4) ----------------------------------------------------------
+
+    record HomeRow(String name, String world, double x, double y, double z,
+                   float yaw, float pitch) { }
+
+    java.util.List<String> homeNames(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT name FROM homes WHERE uuid = ? ORDER BY name")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(rs.getString(1));
+            }
+        }
+        return out;
+    }
+
+    HomeRow getHome(UUID uuid, String name) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT name, world, x, y, z, yaw, pitch FROM homes WHERE uuid = ? AND name = ?")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                return new HomeRow(rs.getString(1), rs.getString(2), rs.getDouble(3),
+                    rs.getDouble(4), rs.getDouble(5), rs.getFloat(6), rs.getFloat(7));
+            }
+        }
+    }
+
+    void setHome(UUID uuid, String name, String world, double x, double y, double z,
+                 float yaw, float pitch) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO homes (uuid, name, world, x, y, z, yaw, pitch, created_at, updated_at) "
+               + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) "
+               + "ON DUPLICATE KEY UPDATE world=VALUES(world), x=VALUES(x), y=VALUES(y), "
+               + "z=VALUES(z), yaw=VALUES(yaw), pitch=VALUES(pitch), updated_at=UTC_TIMESTAMP(3)")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, name);
+            ps.setString(3, world);
+            ps.setDouble(4, x);
+            ps.setDouble(5, y);
+            ps.setDouble(6, z);
+            ps.setFloat(7, yaw);
+            ps.setFloat(8, pitch);
+            ps.executeUpdate();
+        }
+    }
+
+    boolean deleteHome(UUID uuid, String name) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "DELETE FROM homes WHERE uuid = ? AND name = ?")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, name);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    int purchasedSlots(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT purchased_slots FROM home_slots WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        }
+    }
+
+    /**
+     * Buys one home slot. Returns null on success, or a message explaining the refusal.
+     *
+     * The charge, the slot and the ledger row are ONE transaction. A charge without a slot is
+     * theft and a slot without a charge is free money, so neither may happen alone - and the
+     * balance is locked FOR UPDATE so two simultaneous purchases cannot both pass the same
+     * affordability check.
+     */
+    String buyHomeSlot(UUID uuid, long cost) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, uuid);
+                lockBalance(c, uuid);
+                long bal = readLocked(c, uuid);
+                if (bal < cost) {
+                    c.rollback();
+                    return "You have " + bal + " Berries and the next slot costs " + cost + ".";
+                }
+                long after = bal - cost;
+                writeBalance(c, uuid, after, 0, cost);
+                ledger(c, uuid, -cost, after, "sink_fee", null, "home_slot", 1,
+                    "bought a home slot");
+
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO home_slots (uuid, purchased_slots, total_spent, updated_at) "
+                      + "VALUES (?, 1, ?, UTC_TIMESTAMP(3)) "
+                      + "ON DUPLICATE KEY UPDATE purchased_slots = purchased_slots + 1, "
+                      + "total_spent = total_spent + VALUES(total_spent), "
+                      + "updated_at = UTC_TIMESTAMP(3)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setLong(2, cost);
+                    ps.executeUpdate();
+                }
+                c.commit();
+                return null;
+            } catch (java.sql.SQLIntegrityConstraintViolationException cap) {
+                // chk_slots_range: 18 purchased is the maximum, since 2 are free and 15.x caps
+                // homes at 20. The database refusing is better than trusting the caller's count.
+                c.rollback();
+                return "You already own the maximum number of purchasable home slots.";
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
     // ---- economy (V3) --------------------------------------------------------
 
     enum Outcome { OK, INSUFFICIENT, NO_SENDER_ACCOUNT }

@@ -213,6 +213,21 @@ commands:
   unban:
     description: Overturn a ban.
     usage: /unban <player> [reason]
+  sethome:
+    description: Set a home here. Two free, more with /buyhome.
+    usage: /sethome [name]
+  home:
+    description: Teleport to a home. 3s warmup, cancelled if you move.
+    usage: /home [name]
+  homes:
+    description: List your homes and slots.
+    usage: /homes
+  delhome:
+    description: Delete a home. The slot stays yours.
+    usage: /delhome <name>
+  buyhome:
+    description: Buy another home slot with Berries. The price rises with each slot.
+    usage: /buyhome
   balance:
     description: Your Berries balance.
     usage: /balance [player]
@@ -353,6 +368,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Moderation moderation;
     private AccessGrants accessGrants;
     private Economy economy;
+    private Homes homes;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -388,6 +404,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.moderation = new Moderation(this, database);
         this.accessGrants = new AccessGrants(this, database);
         this.economy = new Economy(this, database);
+        this.homes = new Homes(this, database);
         getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
@@ -519,6 +536,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (moderation.handle(sender, name, args)) return true;
         if (name.equals("access")) return accessGrants.handle(sender, args);
         if (economy.handle(sender, name, args)) return true;
+        if (homes.handle(sender, name, args)) return true;
 
         if (name.equals("rules")) {
             if (!(sender instanceof Player p)) {
@@ -1032,6 +1050,133 @@ public final class Database {
              PreparedStatement ps = c.prepareStatement("SELECT COUNT(*) FROM staff_audit");
              ResultSet rs = ps.executeQuery()) {
             return rs.next() ? rs.getInt(1) : -1;
+        }
+    }
+
+    // ---- homes (V4) ----------------------------------------------------------
+
+    record HomeRow(String name, String world, double x, double y, double z,
+                   float yaw, float pitch) { }
+
+    java.util.List<String> homeNames(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT name FROM homes WHERE uuid = ? ORDER BY name")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(rs.getString(1));
+            }
+        }
+        return out;
+    }
+
+    HomeRow getHome(UUID uuid, String name) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT name, world, x, y, z, yaw, pitch FROM homes WHERE uuid = ? AND name = ?")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                return new HomeRow(rs.getString(1), rs.getString(2), rs.getDouble(3),
+                    rs.getDouble(4), rs.getDouble(5), rs.getFloat(6), rs.getFloat(7));
+            }
+        }
+    }
+
+    void setHome(UUID uuid, String name, String world, double x, double y, double z,
+                 float yaw, float pitch) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO homes (uuid, name, world, x, y, z, yaw, pitch, created_at, updated_at) "
+               + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) "
+               + "ON DUPLICATE KEY UPDATE world=VALUES(world), x=VALUES(x), y=VALUES(y), "
+               + "z=VALUES(z), yaw=VALUES(yaw), pitch=VALUES(pitch), updated_at=UTC_TIMESTAMP(3)")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, name);
+            ps.setString(3, world);
+            ps.setDouble(4, x);
+            ps.setDouble(5, y);
+            ps.setDouble(6, z);
+            ps.setFloat(7, yaw);
+            ps.setFloat(8, pitch);
+            ps.executeUpdate();
+        }
+    }
+
+    boolean deleteHome(UUID uuid, String name) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "DELETE FROM homes WHERE uuid = ? AND name = ?")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, name);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    int purchasedSlots(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT purchased_slots FROM home_slots WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        }
+    }
+
+    /**
+     * Buys one home slot. Returns null on success, or a message explaining the refusal.
+     *
+     * The charge, the slot and the ledger row are ONE transaction. A charge without a slot is
+     * theft and a slot without a charge is free money, so neither may happen alone - and the
+     * balance is locked FOR UPDATE so two simultaneous purchases cannot both pass the same
+     * affordability check.
+     */
+    String buyHomeSlot(UUID uuid, long cost) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, uuid);
+                lockBalance(c, uuid);
+                long bal = readLocked(c, uuid);
+                if (bal < cost) {
+                    c.rollback();
+                    return "You have " + bal + " Berries and the next slot costs " + cost + ".";
+                }
+                long after = bal - cost;
+                writeBalance(c, uuid, after, 0, cost);
+                ledger(c, uuid, -cost, after, "sink_fee", null, "home_slot", 1,
+                    "bought a home slot");
+
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO home_slots (uuid, purchased_slots, total_spent, updated_at) "
+                      + "VALUES (?, 1, ?, UTC_TIMESTAMP(3)) "
+                      + "ON DUPLICATE KEY UPDATE purchased_slots = purchased_slots + 1, "
+                      + "total_spent = total_spent + VALUES(total_spent), "
+                      + "updated_at = UTC_TIMESTAMP(3)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setLong(2, cost);
+                    ps.executeUpdate();
+                }
+                c.commit();
+                return null;
+            } catch (java.sql.SQLIntegrityConstraintViolationException cap) {
+                // chk_slots_range: 18 purchased is the maximum, since 2 are free and 15.x caps
+                // homes at 20. The database refusing is better than trusting the caller's count.
+                c.rollback();
+                return "You already own the maximum number of purchasable home slots.";
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
         }
     }
 
@@ -3655,6 +3800,282 @@ final class Economy {
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Economy_java
+
+# ---- src/main/java/gg/laughtail/core/Homes.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Homes.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Homes_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.Location;
+import org.bukkit.World;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+
+import java.sql.SQLException;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
+
+/**
+ * Homes, per Section 15: up to 20, renameable, home-to-home, with slots bought using Berries.
+ *
+ * FREE SLOTS = 2. Section 15 caps homes at 20 and says slots are bought, but never states how
+ * many come free. Two is a decision under D-0031: one is not enough to be useful (a base and
+ * nowhere else), and more than two removes the reason to ever buy one.
+ *
+ * THE PRICE CURVE ESCALATES, and that is the point. Every slot costs
+ * 2 hours of play more than the last, priced against P2's 1,200 Berries per hour. So the first
+ * bought slot is 2,400 and the eighteenth is 43,200. A flat price would make the twentieth home
+ * as cheap as the third, and a player with a large balance would buy all of them in one go -
+ * which turns a progression into a formality.
+ *
+ * THE RESOURCE WORLD IS EXCLUDED. 7.4 is explicit that nothing is claimable there and it resets
+ * monthly. A home there would be silently destroyed every reset, and a player would rightly
+ * call that a bug. Setting one is refused with the reason, rather than allowed and then broken.
+ *
+ * WARMUP AND CANCEL-ON-MOVE. 15.x wants teleport guards. The warmup exists so a player losing a
+ * fight cannot escape instantly, and it is cancelled if they move - which means it costs nothing
+ * to an honest player standing still and everything to someone running.
+ *
+ * WHAT IS DELIBERATELY MISSING: the combat tag. 15.x and row 33 want a teleport blocked while
+ * tagged, and the tag itself is not built yet - its duration is not stated anywhere in the
+ * specification. The hook is marked below so it is obvious where it goes rather than being
+ * quietly forgotten.
+ */
+final class Homes {
+
+    static final int FREE_SLOTS = 2;
+    static final int MAX_HOMES = 20;
+    /** P2: 1,200 Berries per hour. Each slot costs two more hours than the last. */
+    static final long SLOT_HOURS_STEP = 2L;
+    static final long BERRIES_PER_HOUR = 1200L;
+
+    private static final long WARMUP_MILLIS = 3_000L;
+    private static final long COOLDOWN_MILLIS = 15_000L;
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+    private final Map<UUID, Long> lastTeleport = new ConcurrentHashMap<>();
+    private final Map<UUID, Location> warmupFrom = new ConcurrentHashMap<>();
+
+    Homes(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+    }
+
+    /** Cost of the next purchased slot, given how many are already owned. */
+    static long slotCost(int alreadyPurchased) {
+        return (alreadyPurchased + 1) * SLOT_HOURS_STEP * BERRIES_PER_HOUR;
+    }
+
+    boolean handle(CommandSender sender, String cmd, String[] args) {
+        if (!(sender instanceof Player p)) {
+            if (cmd.equals("home") || cmd.equals("sethome") || cmd.equals("homes")
+             || cmd.equals("delhome") || cmd.equals("buyhome")) {
+                sender.sendMessage(Component.text("Only a player has homes.", NamedTextColor.RED));
+                return true;
+            }
+            return false;
+        }
+        switch (cmd) {
+            case "sethome": return setHome(p, args);
+            case "home":    return goHome(p, args);
+            case "homes":   return listHomes(p);
+            case "delhome": return delHome(p, args);
+            case "buyhome": return buySlot(p);
+            default:        return false;
+        }
+    }
+
+    private boolean setHome(Player p, String[] args) {
+        final String name = (args.length > 0 ? args[0] : "home").toLowerCase();
+        if (!name.matches("[a-z0-9_]{1,24}")) {
+            p.sendMessage(Component.text(
+                "Home names may use letters, numbers and underscores, up to 24 characters.",
+                NamedTextColor.RED));
+            return true;
+        }
+        final World w = p.getWorld();
+        if (w.getName().contains("resource")) {
+            p.sendMessage(Component.text(
+                "You cannot set a home in the resource world - it is regenerated every month "
+              + "and the home would be destroyed with it (7.4).", NamedTextColor.RED));
+            return true;
+        }
+        if (w.getName().contains("arena")) {
+            p.sendMessage(Component.text("The arena is for events only.", NamedTextColor.RED));
+            return true;
+        }
+        final Location loc = p.getLocation();
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                int purchased = db.purchasedSlots(p.getUniqueId());
+                int allowed = Math.min(MAX_HOMES, FREE_SLOTS + purchased);
+                List<String> existing = db.homeNames(p.getUniqueId());
+                boolean replacing = existing.stream().anyMatch(n -> n.equalsIgnoreCase(name));
+                if (!replacing && existing.size() >= allowed) {
+                    reply(p, Component.text("You have " + existing.size() + " of " + allowed
+                        + " homes. Buy another slot with /buyhome ("
+                        + slotCost(purchased) + " Berries).", NamedTextColor.YELLOW));
+                    return;
+                }
+                db.setHome(p.getUniqueId(), name, w.getName(), loc.getX(), loc.getY(),
+                    loc.getZ(), loc.getYaw(), loc.getPitch());
+                reply(p, Component.text((replacing ? "Moved home '" : "Set home '") + name
+                    + "' here. " + (replacing ? existing.size() : existing.size() + 1)
+                    + " of " + allowed + " used.", NamedTextColor.GREEN));
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "sethome failed: " + e.getMessage());
+                reply(p, Component.text("The home was NOT saved.", NamedTextColor.RED));
+            }
+        });
+        return true;
+    }
+
+    private boolean goHome(Player p, String[] args) {
+        final String name = (args.length > 0 ? args[0] : "home").toLowerCase();
+
+        long since = System.currentTimeMillis()
+            - lastTeleport.getOrDefault(p.getUniqueId(), 0L);
+        if (since < COOLDOWN_MILLIS) {
+            p.sendMessage(Component.text("Wait " + ((COOLDOWN_MILLIS - since) / 1000 + 1)
+                + "s before teleporting again.", NamedTextColor.YELLOW));
+            return true;
+        }
+
+        // COMBAT TAG HOOK. Row 33 and 15.x want this blocked while tagged. The tag is not built
+        // - its duration is stated nowhere in the specification - so this is the one place it
+        // must be added, marked rather than forgotten.
+        // if (combatTag.isTagged(p)) { refuse; return true; }
+
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                Database.HomeRow h = db.getHome(p.getUniqueId(), name);
+                if (h == null) {
+                    List<String> names = db.homeNames(p.getUniqueId());
+                    reply(p, Component.text(names.isEmpty()
+                        ? "You have no homes. Use /sethome."
+                        : "No home called '" + name + "'. You have: " + String.join(", ", names),
+                        NamedTextColor.RED));
+                    return;
+                }
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    World w = plugin.getServer().getWorld(h.world());
+                    if (w == null) {
+                        // A home in a world that no longer exists. The resource world is
+                        // refused at set time, so this means a world was removed - say so
+                        // rather than throwing.
+                        p.sendMessage(Component.text("The world '" + h.world()
+                            + "' no longer exists, so that home cannot be reached.",
+                            NamedTextColor.RED));
+                        return;
+                    }
+                    final Location target = new Location(w, h.x(), h.y(), h.z(), h.yaw(), h.pitch());
+                    warmupFrom.put(p.getUniqueId(), p.getLocation());
+                    p.sendMessage(Component.text("Teleporting in "
+                        + (WARMUP_MILLIS / 1000) + "s - do not move.", NamedTextColor.GRAY));
+                    plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
+                        Location from = warmupFrom.remove(p.getUniqueId());
+                        if (!p.isOnline()) return;
+                        if (from != null && from.distanceSquared(p.getLocation()) > 1.0) {
+                            p.sendMessage(Component.text("Teleport cancelled - you moved.",
+                                NamedTextColor.RED));
+                            return;
+                        }
+                        lastTeleport.put(p.getUniqueId(), System.currentTimeMillis());
+                        p.teleportAsync(target).thenAccept(ok -> {
+                            if (ok) p.sendMessage(Component.text("Welcome home.",
+                                NamedTextColor.GREEN));
+                        });
+                    }, WARMUP_MILLIS / 50);
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "home failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private boolean listHomes(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                List<String> names = db.homeNames(p.getUniqueId());
+                int purchased = db.purchasedSlots(p.getUniqueId());
+                int allowed = Math.min(MAX_HOMES, FREE_SLOTS + purchased);
+                reply(p, Component.text("Homes " + names.size() + "/" + allowed
+                    + (names.isEmpty() ? "" : ": " + String.join(", ", names)),
+                    NamedTextColor.GOLD));
+                if (allowed < MAX_HOMES) {
+                    reply(p, Component.text("Next slot: " + slotCost(purchased)
+                        + " Berries (/buyhome)", NamedTextColor.GRAY));
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "homes failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private boolean delHome(Player p, String[] args) {
+        if (args.length < 1) {
+            p.sendMessage(Component.text("Usage: /delhome <name>", NamedTextColor.GRAY));
+            return true;
+        }
+        final String name = args[0].toLowerCase();
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                boolean gone = db.deleteHome(p.getUniqueId(), name);
+                reply(p, Component.text(gone
+                    ? ("Home '" + name + "' deleted. The slot stays yours.")
+                    : ("No home called '" + name + "'."),
+                    gone ? NamedTextColor.GREEN : NamedTextColor.RED));
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "delhome failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private boolean buySlot(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                int purchased = db.purchasedSlots(p.getUniqueId());
+                int allowed = Math.min(MAX_HOMES, FREE_SLOTS + purchased);
+                if (allowed >= MAX_HOMES) {
+                    reply(p, Component.text("You already have the maximum of " + MAX_HOMES
+                        + " home slots.", NamedTextColor.YELLOW));
+                    return;
+                }
+                long cost = slotCost(purchased);
+                // The purchase and the slot are one transaction. A charge without a slot is
+                // theft; a slot without a charge is free money.
+                String result = db.buyHomeSlot(p.getUniqueId(), cost);
+                if (result == null) {
+                    reply(p, Component.text("Home slot bought for " + cost
+                        + " Berries. You now have " + (allowed + 1) + " slots.",
+                        NamedTextColor.GREEN));
+                } else {
+                    reply(p, Component.text(result, NamedTextColor.RED));
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "buyhome failed: " + e.getMessage());
+                reply(p, Component.text("Nothing was charged and no slot was added.",
+                    NamedTextColor.RED));
+            }
+        });
+        return true;
+    }
+
+    private void reply(Player p, Component msg) {
+        plugin.getServer().getScheduler().runTask(plugin, () -> {
+            if (p.isOnline()) p.sendMessage(msg);
+        });
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Homes_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do

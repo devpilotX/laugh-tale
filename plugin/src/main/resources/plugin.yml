@@ -39,6 +39,21 @@ commands:
   unban:
     description: Overturn a ban.
     usage: /unban <player> [reason]
+  sethome:
+    description: Set a home here. Two free, more with /buyhome.
+    usage: /sethome [name]
+  home:
+    description: Teleport to a home. 3s warmup, cancelled if you move.
+    usage: /home [name]
+  homes:
+    description: List your homes and slots.
+    usage: /homes
+  delhome:
+    description: Delete a home. The slot stays yours.
+    usage: /delhome <name>
+  buyhome:
+    description: Buy another home slot with Berries. The price rises with each slot.
+    usage: /buyhome
   balance:
     description: Your Berries balance.
     usage: /balance [player]
