@@ -188,3 +188,22 @@ Also verified before committing to 1.21.11: Geyser **2.11.2 build 1232** (`Geyse
 **Revisit when:** GrimAC publishes a stable release supporting 26.x. Then re-run `scripts/plugin-support.ps1` and re-pin.
 
 **Verified:** all three scripts are in the repository and every number above is re-derivable. This decision was reached before any jar was downloaded or installed.
+
+
+---
+
+## D-0012 | 2026-08-26 | Requesting a Pelican Application API key, against 33.1
+
+**The specification says:** 33.1, and 32.3 rows 1 and 2, strike out both Pelican API keys as "**NOT REQUIRED**... Do not request it", on the stated grounds that root SSH is "the primary and **only required** access path" which "covers everything rows 1 to 3 would have done".
+
+**What I measured:** that premise is false. `php artisan list` on the Panel returns the complete `p:` namespace. It contains `p:node:make` and `p:user:make` but **no `p:server:make`** - Pelican has no CLI path to create a server, only `p:server:bulk-power`. The node also has exactly one allocation, already bound to the stock server, and allocations are creatable only through the Panel UI or the Application API.
+
+**Therefore:** `laughtail-dev` cannot be created over SSH. Pre-flight 33.6 items 9 and 10 and the whole of Section 20 Phase 0 sit behind it.
+
+**What I did:** raised `docs/owner-actions.md` **OA-25** offering two routes - the owner clicks, or the owner issues a narrowly-scoped Application API key. I recommended the key, and I did **not** proceed on either without an answer.
+
+**Why the key is the better route, beyond unblocking:** this project creates a server at least four times - `laughtail-dev` now, `laughtail` at launch, a scratch server for the Phase 0 restore drill, and a replacement after the Section 22 migration. Via the API each is a scripted, committed, reviewable action. Via the UI each is a sequence of clicks that cannot be committed, cannot be diffed, and cannot be replayed on a new box in under thirty minutes - which acceptance row 3 requires. Section 29's whole argument is that the repository reproduces the runtime.
+
+**What I refused to do:** create the server by writing to `/var/www/pelican/database/database.sqlite`. It is technically possible and it is exactly the class of change that breaks a Panel silently, which is the trap 33.1 itself warns about.
+
+**Verified:** the `p:` namespace listing and the allocation, node, server, egg and user counts are in this session's transcript and re-derivable with `scripts/remote/panel-capability.sh`.

@@ -328,6 +328,19 @@ This matters because **row 27** tests the spread "at both extremes of the dynami
 
 ---
 
+### Q-40 | BLOCKING | Root SSH does not cover what 32.3 and 33.1 claim it covers
+
+* **32.3 row 4** calls root SSH "**The primary and only required access path.** Covers everything rows 1 to 3 would have done". **33.1** and **32.3 rows 1-2** strike out both Pelican API keys as "**NOT REQUIRED**... Do not request it".
+* **Measured on the host this session:** `php artisan list` on the Panel shows the complete `p:` namespace. It contains `p:node:make` and `p:user:make`. **There is no `p:server:make`.** Pelican has no CLI path to create a server; the only server command is `p:server:bulk-power`. The node also has exactly **one allocation**, already bound to the stock server, and allocations are created only through the Panel UI or the Application API.
+
+So creating `laughtail-dev` - required by Section 20 Phase 0 and pre-flight 33.6 items 9 and 10 - is impossible over SSH. Every phase sits behind it.
+
+**Narrowest question:** may I request an Application API key after all, contrary to 33.1?
+**My recommendation:** yes, and not merely to unblock. Server creation via API is scripted, repeatable and reviewable; server creation by clicking is none of those. This project creates a server at least four times - `laughtail-dev` now, `laughtail` at launch, a scratch server for the restore drill, and a replacement after the Section 22 migration. Section 29's entire argument is that the repository should be able to reproduce the runtime. Clicks cannot be committed.
+**Meanwhile:** `docs/owner-actions.md` **OA-25** offers both routes, so the owner can click if they prefer. I will not create the server by editing `database.sqlite` directly.
+
+---
+
 ## B. Things the specification could not have known
 
 Not contradictions - the document was written before anyone looked at this machine. All five are in `docs/progress.md` section 3 with measurements.

@@ -546,3 +546,70 @@ One caveat on the combat-log penalty: 32.4 recommends 25 RP, but 31.3 requires t
 penalty be *published* and *strictly worse than dying*, and never states the normal
 death loss - so I cannot yet prove 25 RP satisfies its own rule. Recorded as
 `docs/questions.md` **Q-14**.
+
+
+---
+
+## Discovered 2026-08-26 after the plan was written
+
+```
+BLOCKED - OA-25 laughtail-dev cannot be created without Panel access
+What I need: either two minutes of you clicking in the Pelican Panel, or an
+     Application API key. Root SSH is genuinely not sufficient, and the
+     specification is wrong to say it is.
+Why: Section 20 Phase 0 and pre-flight 33.6 items 9 and 10 require laughtail-dev
+     to exist, with its own allocation and a heap 25 per cent below it. Nothing in
+     Phase 0 onward can be built or tested without it.
+     Evidence that SSH is not enough, gathered this session:
+       php artisan list on the Panel shows the full p: namespace. It contains
+       p:node:make and p:user:make but there is NO p:server:make. Pelican has no
+       CLI path to create a server. Only p:server:bulk-power exists.
+       The node also has exactly ONE allocation and it is already bound to the
+       stock server, so a second allocation is needed before a second server can
+       exist. Allocations are created in the Panel UI or the Application API.
+       Panel facts: Pelican on Laravel 13.25.0, SQLite at
+       /var/www/pelican/database/database.sqlite, APP_URL https://panel.devpilotx.com,
+       nodes=1 servers=1 allocations=1 eggs=1 users=1.
+     I will NOT create the server by editing database.sqlite directly. That is
+     exactly the class of change that breaks a Panel silently, and never-break
+     rule 6 plus the ownership trap in 33.1 both point the same way.
+Steps for the owner - OPTION A, you click (about two minutes):
+  1. Open https://panel.devpilotx.com and sign in.
+  2. Admin area, Nodes, open the existing node, Allocations tab.
+     Add an allocation: IP = the node's IP as already listed, Ports = 25566.
+     Add a second: Ports = 24455.   (dev uses 25566 and 24455 so it can never
+     collide with production on 25565 and 24454.)
+  3. Admin area, Servers, Create New.
+       Name: laughtail-dev
+       Owner: your account
+       Node: the existing node
+       Allocation: the 25566 one you just made
+       Memory: 1536 MB      Swap: 0       Disk: 6144 MB
+       CPU: 100  (one of the two cores; leaves the other for Wings and the Panel)
+       Egg: the Paper egg
+       Minecraft version / build: leave default, I will replace the jar with the
+         pinned Paper 1.21.11 build 132 from server/manifest.yml
+       Docker image: the java_21 image if offered, not java_25 - PaperMC states a
+         Java 21 minimum for this build and 21 is the most-tested runtime for it
+  4. Do NOT start it. Reply "dev server created".
+Steps for the owner - OPTION B, I do it and it stays repeatable (recommended):
+  1. https://panel.devpilotx.com, sign in, click your name, API Credentials -
+     or Admin area, Application API depending on the Panel build.
+  2. Create an Application API key with read and write on Servers, Nodes and
+     Allocations. Nothing else.
+  3. Paste it into C:\Laugh-Tale\docs\private\pelican-app-key.txt (git-ignored).
+  4. This deviates from spec 33.1, which struck API keys out as NOT REQUIRED.
+     That instruction rested on the claim that root SSH covers everything the
+     API would do. It does not - see the evidence above. Recorded as
+     docs/questions.md Q-40 and decisions.md D-0012.
+Why Option B is better: every server this project ever creates - laughtail-dev
+     now, laughtail at launch, a scratch server for the restore drill, a replacement
+     after the migration in Section 22 - becomes a scripted, repeatable, reviewable
+     action instead of a sequence of clicks nobody can audit. That is the whole
+     point of Section 29.
+What I will do when it arrives: create laughtail-dev with the allocation and heap
+     that satisfy pre-flight 9 and 10, install the pinned Paper 1.21.11 build 132,
+     and run the aarch64 load-proof on all nine manifest components (deviation D5).
+What I am doing meanwhile: repo-side Phase 0.2 work that needs no server -
+     deploy.sh, drift.sh, and the database schema in db/migrations/.
+```
