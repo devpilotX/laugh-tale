@@ -39,6 +39,22 @@ commands:
   unban:
     description: Overturn a ban.
     usage: /unban <player> [reason]
+  tpa:
+    description: Ask to teleport to a player. They must accept.
+    usage: /tpa <player>
+  tpahere:
+    description: Ask a player to teleport to you. They must accept.
+    usage: /tpahere <player>
+  tpaccept:
+    description: Accept a pending teleport request.
+    usage: /tpaccept
+  tpdeny:
+    description: Deny a pending teleport request.
+    usage: /tpdeny
+  rtp:
+    description: Random teleport into the resource world, which resets monthly.
+    usage: /rtp
+    aliases: [wild]
   sethome:
     description: Set a home here. Two free, more with /buyhome.
     usage: /sethome [name]

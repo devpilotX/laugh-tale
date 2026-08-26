@@ -42,6 +42,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private AccessGrants accessGrants;
     private Economy economy;
     private Homes homes;
+    private Teleports teleports;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -78,6 +79,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.accessGrants = new AccessGrants(this, database);
         this.economy = new Economy(this, database);
         this.homes = new Homes(this, database);
+        this.teleports = new Teleports(this);
         getServer().getPluginManager().registerEvents(moderation, this);
 
         // Connectivity is checked ASYNCHRONOUSLY. Doing it here on the main thread
@@ -155,6 +157,13 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     }
 
     @EventHandler
+    public void onQuitCleanup(org.bukkit.event.player.PlayerQuitEvent e) {
+        // Teleport state is in-memory only, so a leaving player must be forgotten or a
+        // pending request could resolve against someone who is no longer there.
+        teleports.forget(e.getPlayer().getUniqueId());
+    }
+
+    @EventHandler
     public void onJoin(PlayerJoinEvent e) {
         Player p = e.getPlayer();
 
@@ -210,6 +219,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (name.equals("access")) return accessGrants.handle(sender, args);
         if (economy.handle(sender, name, args)) return true;
         if (homes.handle(sender, name, args)) return true;
+        if (teleports.handle(sender, name, args)) return true;
 
         if (name.equals("rules")) {
             if (!(sender instanceof Player p)) {
