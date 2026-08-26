@@ -539,3 +539,49 @@ So the pin was not merely conservative, it was the cause of an unplayable server
 **And a real defect this surfaced:** Paper reported `Ambiguous plugin name 'Chunky'` because both 1.5.3 and 1.4.40 sat in `plugins/`, with load order decided by chance. The cause was a **bare `[ -f ]`** in the installer - the sixth instance of that class in this project. The `ubuntu` user cannot traverse the Pelican volume, so the test returned false for a file that existed and the quarantine was silently skipped. The same script also still contained the *original* instance, which had been reporting "server.jar.prebuild already exists, leaving it" for a rollback copy it had never checked. Both now use `sudo -n test -f`.
 
 **Verified:** Paper 26.2-119 running, API 26.2.build.119-stable, all 8 plugins loaded including Chunky 1.5.3 and LaughTail 0.1.0, boot in 45 s, **zero ERROR lines**, 31 of 31 deploy stages green.
+
+
+---
+
+## D-0029 | 2026-08-26 | Minecraft 26.2 unified world storage, and every world-path assumption had to change
+
+**What was found.** After the move to 26.2, only two directories existed at the volume root - `laughtail` and `world` - yet Multiverse listed five worlds and the plugin had successfully applied borders to all five. Paper had announced this on boot as "World storage migration is required during startup", which is easy to read as routine.
+
+**The actual layout:**
+
+```
+laughtail/
+  level.dat
+  dimensions/minecraft/overworld/region
+  dimensions/minecraft/the_nether/region
+  dimensions/minecraft/the_end/region
+  dimensions/minecraft/laughtail_resource/region
+  dimensions/minecraft/laughtail_arena/region
+```
+
+Every dimension now lives **inside one world folder**, addressed as a namespaced dimension. There is no longer a `laughtail_nether` directory. Multiverse records the old name as `legacy-world-name`.
+
+**Why this matters more than it looks.** Every script that treats a world as a top-level directory is silently wrong, and the two that did were the two where being wrong is worst:
+
+* `regen-resource-world.sh` looked for `$D/laughtail_resource` and refused to run. That refusal is the system working: it declined to operate on a path it could not confirm rather than deleting something adjacent to it.
+* `backup-run.sh` excluded `./world_nether` and `./world_the_end`, paths that no longer exist. Harmless in effect - and it turns out **better** than before, because including `laughtail/` now captures all five worlds in one archive. Verified: 333 entries, 26 region files, up from 12.
+
+**The dangerous consequence, and the mitigation.** Under the old layout, the resource world was a sibling of the main world. Under this one it is a sibling of `overworld`, `the_nether` and `the_end` *inside the same folder* - so a path mistake in the regeneration script is now one directory name away from deleting the permanent world rather than a whole level away. The script therefore checks the **dimension path** as well as the world name, refusing anything matching `overworld`, `the_nether` or `the_end`, and refusing anything that does not contain `laughtail_resource`.
+
+---
+
+## D-0030 | 2026-08-26 | The resource world regeneration takes no arguments, and proves it worked
+
+7.4 is unusually specific: "Deleting the wrong world folder is an unrecoverable, server-killing mistake, so the script must name the world explicitly and refuse to run against the main world."
+
+**So the script takes no parameters at all.** There is no `--world` flag to typo and no variable to expand wrongly. A script that *can* destroy the main world will eventually be pointed at it, and the destructive-command guard cannot help, because a variable is opaque to static analysis - a lesson this project already learned when the guard refused the restore drill for exactly that reason.
+
+**Five independent refusals**, any one of which stops the run: the literal name checked against a protected list; the dimension path checked against the permanent dimensions; not the server's default world, read from `server.properties` at runtime; the target must already exist, so a typo cannot be "created"; and a backup must complete **and be listable** before anything is destroyed.
+
+**A false pass caught before it mattered.** Multiverse 5 answers `mv regen` with "Run /mv confirm <id> to continue. This will expire in 30 seconds" and does nothing until that arrives. The first version printed that prompt as though it were a result and reported **"RESOURCE WORLD REGENERATED"** while the world was untouched - a false success on the single most destructive operation in the project.
+
+Fixed twice over: the confirmation token is parsed and sent, **and** the directory mtime is compared before and after, so the script fails if the world did not actually change. Reporting success without evidence is the failure this whole script exists to prevent, and it managed to do it to itself on the first attempt.
+
+**Verified end to end:** all refusals passed, the one online player was evacuated (`Teleported IgnisClaw to laughtail`), a 213 KB backup was taken and confirmed listable, token 440 was sent, Multiverse replied `World 'laughtail_resource' regenerated!`, the directory mtime advanced from 1787728685 to 1787729480, all three permanent dimensions were still present at their original sizes, and the owner's original world's `level.dat` mtime was unchanged.
+
+**Not done, and visibly so:** 7.4 also wants escalating warnings on the 9.5 schedule. That belongs to the season clock in the plugin, which does not exist yet. Faking it with `sleep` in a shell script would be worse than leaving it undone.

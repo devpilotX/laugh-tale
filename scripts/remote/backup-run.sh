@@ -15,13 +15,20 @@
 #
 # WHAT IS DELIBERATELY EXCLUDED, and why - stated because a backup whose contents
 # nobody knows is not a backup:
-#   world/ world_nether/ world_the_end/  the owner's pre-existing 26.2 world. It is
-#                                        immutable (D-0013, mtime proven unchanged)
-#                                        and already captured in the pre-build tar.
-#                                        Re-taring 749 MB hourly would fill the disk.
-#   _quarantine/                         non-manifest jars and prebuild copies,
-#                                        already backed up once.
+#   world/                               the owner's pre-existing 26.2 world, 490 MB. It is
+#                                        immutable (D-0013, mtime proven unchanged) and
+#                                        already captured in the pre-build tar. Re-taring
+#                                        it hourly would fill a 19 GB disk.
+#   _quarantine/                         non-manifest jars and prebuild copies, already
+#                                        backed up once.
 #   cache/ logs/ libraries/ versions/    regenerable. logs are kept live, not backed up.
+#
+# NOTE ON THE 26.2 LAYOUT: Minecraft 26.2 unified world storage, so ALL FIVE worlds now
+# live inside the single laughtail/ folder as
+# laughtail/dimensions/minecraft/<overworld|the_nether|the_end|laughtail_resource|laughtail_arena>.
+# That is why there are no world_nether or world_the_end exclusions any more - those paths
+# no longer exist. It also means including laughtail/ now captures every world in one
+# archive, which is simpler and harder to get wrong than the old per-folder approach.
 #
 # OA-08 IS STILL OPEN: there is no offsite destination. These backups sit on the
 # same EBS volume as the thing they protect, which means they survive a bad deploy
