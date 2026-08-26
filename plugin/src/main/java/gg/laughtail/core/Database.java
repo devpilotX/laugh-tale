@@ -1523,4 +1523,200 @@ public final class Database {
         // suppressedReason null means the kill COUNTS - a combat log is a real loss, not a
         // suppressed one. sameIp false because the quitter is gone and cannot be compared.
         recordCombatEvent(attacker, quitter, rpKiller, rpVictim, null, false, "combat_log", 0, 0, 0);
+    }
+    // ---- friends and leaderboards ---------------------------------------------
+
+    enum FriendResult { CREATED, ALREADY_PENDING, ALREADY_FRIENDS, ACCEPTED_EXISTING }
+
+    /**
+     * Sorts a pair so the same two players always produce the same key.
+     *
+     * The friends table keys on (uuid_low, uuid_high) rather than (owner, friend). Storing a
+     * friendship twice, once per direction, allows the two rows to disagree - A believes they are
+     * friends and B does not - and then every query has to choose which row to trust. One row cannot
+     * contradict itself.
+     */
+    private static String[] pair(UUID a, UUID b) {
+        String s1 = a.toString(), s2 = b.toString();
+        return s1.compareTo(s2) <= 0 ? new String[] { s1, s2 } : new String[] { s2, s1 };
+    }
+
+    FriendResult friendRequest(UUID from, UUID to) throws SQLException {
+        assertOffMainThread();
+        String[] k = pair(from, to);
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                String state = null, requestedBy = null;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT state, requested_by FROM friends WHERE uuid_low = ? "
+                      + "AND uuid_high = ? FOR UPDATE")) {
+                    ps.setString(1, k[0]);
+                    ps.setString(2, k[1]);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            state = rs.getString(1);
+                            requestedBy = rs.getString(2);
+                        }
+                    }
+                }
+                if ("accepted".equals(state)) {
+                    c.rollback();
+                    return FriendResult.ALREADY_FRIENDS;
+                }
+                if ("pending".equals(state)) {
+                    if (from.toString().equals(requestedBy)) {
+                        c.rollback();
+                        return FriendResult.ALREADY_PENDING;
+                    }
+                    // They asked first. Asking back IS accepting - requiring the exact command
+                    // when the intent is unambiguous is friction for its own sake.
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "UPDATE friends SET state = 'accepted', updated_at = UTC_TIMESTAMP(3) "
+                          + "WHERE uuid_low = ? AND uuid_high = ?")) {
+                        ps.setString(1, k[0]);
+                        ps.setString(2, k[1]);
+                        ps.executeUpdate();
+                    }
+                    c.commit();
+                    return FriendResult.ACCEPTED_EXISTING;
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO friends (uuid_low, uuid_high, requested_by, state, "
+                      + "created_at, updated_at) VALUES (?, ?, ?, 'pending', UTC_TIMESTAMP(3), "
+                      + "UTC_TIMESTAMP(3))")) {
+                    ps.setString(1, k[0]);
+                    ps.setString(2, k[1]);
+                    ps.setString(3, from.toString());
+                    ps.executeUpdate();
+                }
+                c.commit();
+                return FriendResult.CREATED;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /** Accepts only a request the OTHER player made. Returns false if there is none. */
+    boolean friendAccept(UUID me, UUID other) throws SQLException {
+        assertOffMainThread();
+        String[] k = pair(me, other);
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE friends SET state = 'accepted', updated_at = UTC_TIMESTAMP(3) "
+               + "WHERE uuid_low = ? AND uuid_high = ? AND state = 'pending' "
+               + "AND requested_by = ?")) {
+            ps.setString(1, k[0]);
+            ps.setString(2, k[1]);
+            // requested_by must be the OTHER player: without this a player could accept their own
+            // request and befriend anyone unilaterally, which is the consent rule defeated.
+            ps.setString(3, other.toString());
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    boolean friendRemove(UUID me, UUID other) throws SQLException {
+        assertOffMainThread();
+        String[] k = pair(me, other);
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "DELETE FROM friends WHERE uuid_low = ? AND uuid_high = ?")) {
+            ps.setString(1, k[0]);
+            ps.setString(2, k[1]);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    java.util.List<UUID> friendList(UUID me, String state) throws SQLException {
+        assertOffMainThread();
+        java.util.List<UUID> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT uuid_low, uuid_high FROM friends WHERE (uuid_low = ? OR uuid_high = ?) "
+               + "AND state = ?")) {
+            ps.setString(1, me.toString());
+            ps.setString(2, me.toString());
+            ps.setString(3, state);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String low = rs.getString(1), high = rs.getString(2);
+                    out.add(UUID.fromString(low.equals(me.toString()) ? high : low));
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Requests made BY somebody else TO me, which are the only ones I can accept. */
+    java.util.List<UUID> friendIncoming(UUID me) throws SQLException {
+        assertOffMainThread();
+        java.util.List<UUID> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT requested_by FROM friends WHERE (uuid_low = ? OR uuid_high = ?) "
+               + "AND state = 'pending' AND requested_by <> ?")) {
+            ps.setString(1, me.toString());
+            ps.setString(2, me.toString());
+            ps.setString(3, me.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(UUID.fromString(rs.getString(1)));
+            }
+        }
+        return out;
+    }
+
+    java.util.List<String> topByRating(int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        int season = activeSeason();
+        if (season <= 0) return out;
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT p.current_name, r.current_rp FROM combat_ratings r "
+               + "JOIN players p ON p.uuid = r.uuid WHERE r.season_number = ? "
+               + "ORDER BY r.current_rp DESC, p.current_name ASC LIMIT ?")) {
+            ps.setInt(1, season);
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    int rp = rs.getInt(2);
+                    out.add(rs.getString(1) + "  " + rp + " RP  " + Rating.tierName(rp));
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Top players by a stats column.
+     *
+     * The column name is validated against an allow-list rather than interpolated, because a column
+     * name cannot be a bound parameter. Interpolating a caller-supplied string into SQL is an
+     * injection even when every current caller is trusted - the next caller might not be.
+     */
+    java.util.List<String> topByStat(String column, int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.Set<String> allowed = java.util.Set.of(
+            "kills", "deaths", "killstreak_best", "blocks_mined", "playtime_seconds");
+        if (!allowed.contains(column)) {
+            throw new IllegalArgumentException("not a leaderboard column: " + column);
+        }
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT p.current_name, s." + column + " FROM stats s "
+               + "JOIN players p ON p.uuid = s.uuid WHERE s." + column + " > 0 "
+               + "ORDER BY s." + column + " DESC, p.current_name ASC LIMIT ?")) {
+            ps.setInt(1, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long v = rs.getLong(2);
+                    out.add(rs.getString(1) + "  " + (column.equals("playtime_seconds")
+                        ? (v / 3600) + "h " + ((v % 3600) / 60) + "m" : String.valueOf(v)));
+                }
+            }
+        }
+        return out;
     }}

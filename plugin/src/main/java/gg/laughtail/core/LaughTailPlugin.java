@@ -49,6 +49,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private ShopService shopService;
     private SellBox sellBox;
     private CombatTag combatTag;
+    private Social social;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -92,6 +93,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.menu = new Menu(this);
         getServer().getPluginManager().registerEvents(menu, this);
         this.shopService = new ShopService(this, database);
+        this.social = new Social(this, database);
         this.combatTag = new CombatTag(this, database);
         getServer().getPluginManager().registerEvents(combatTag, this);
         combatTag.start();
@@ -274,6 +276,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
 
     CombatTag combatTag() { return combatTag; }
 
+    Social social() { return social; }
+
     Menu menu() { return menu; }
 
     String rulesVersion() { return rulesVersion; }
@@ -412,6 +416,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (homes.handle(sender, name, args)) return true;
         if (teleports.handle(sender, name, args)) return true;
         if (shopService.handle(sender, name, args)) return true;
+        if (social.handle(sender, name, args)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }

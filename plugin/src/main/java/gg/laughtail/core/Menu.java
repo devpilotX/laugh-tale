@@ -144,12 +144,15 @@ final class Menu implements Listener {
             "List items for other players to buy.", "Waiting on: Phase 3"));
         inv.setItem(21, notBuilt(Material.PAPER, "Orders / Bazaar",
             "Buy and sell orders, matched atomically.", "Waiting on: Phase 3"));
-        inv.setItem(22, notBuilt(Material.PLAYER_HEAD, "Friends",
-            "Add friends and see who is online.", "Waiting on: the friends commands"));
+        inv.setItem(22, item(Material.PLAYER_HEAD, "Friends", NamedTextColor.AQUA, List.of(
+            "Both sides must agree.",
+            "Grants no advantage - Law 1.",
+            "/friend add, accept, remove, requests")));
         inv.setItem(23, notBuilt(Material.ARMOR_STAND, "Cosmetics",
             "Unlocked by rank. Never bought with money.", "Waiting on: Phase 7"));
-        inv.setItem(24, notBuilt(Material.OAK_SIGN, "Leaderboards",
-            "Season standings and the Hall of Fame.", "Waiting on: Phase 8"));
+        inv.setItem(24, item(Material.OAK_SIGN, "Leaderboards", NamedTextColor.YELLOW, List.of(
+            "Rank, kills, streak, playtime.",
+            "No richest list, deliberately.")));
         inv.setItem(25, notBuilt(Material.NOTE_BLOCK, "Settings",
             "Your personal toggles.", "Waiting on: Section 16"));
 
@@ -315,8 +318,68 @@ final class Menu implements Listener {
         return category == null || e.category().equals(category);
     }
 
-    private void openAdmin(Player p) {
-        Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
+    /**
+     * The stats page. Everything the server knows about you, in one place.
+     *
+     * Shows what is TRACKED rather than what flatters - deaths next to kills, and the K/D derived
+     * rather than stored, so it cannot disagree with its own inputs.
+     */
+    void openStats(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final int[] kd;
+            final int rp, season, champs;
+            final long berries;
+            try {
+                season = plugin.database().activeSeason();
+                rp = plugin.database().currentRp(p.getUniqueId(), season);
+                kd = plugin.database().killsAndDeaths(p.getUniqueId());
+                berries = plugin.database().balance(p.getUniqueId());
+                champs = plugin.database().championSeasons(p.getUniqueId()).size();
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read your stats.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                Inventory inv = Bukkit.createInventory(new MenuHolder("stats"), 27,
+                    Component.text("Your stats", NamedTextColor.AQUA));
+                String ratio = kd[1] == 0
+                    ? (kd[0] == 0 ? "no fights yet" : kd[0] + ".00 (no deaths)")
+                    : String.format("%.2f", (double) kd[0] / kd[1]);
+                inv.setItem(10, item(Material.IRON_SWORD, "Rank: " + Rating.tierName(rp),
+                    NamedTextColor.RED, List.of(rp + " RP",
+                        "Rank comes from PvP and nothing else.",
+                        "Mining and building change it by zero.")));
+                inv.setItem(11, item(Material.SKELETON_SKULL, "Kills " + kd[0]
+                    + " / Deaths " + kd[1], NamedTextColor.WHITE, List.of("K/D " + ratio,
+                        "Derived, not stored - it cannot",
+                        "disagree with its own inputs.")));
+                inv.setItem(12, item(Material.GOLD_NUGGET, "Berries: " + berries,
+                    NamedTextColor.GOLD, List.of("There is no richest leaderboard.",
+                        "It would reward hoarding and tell",
+                        "thieves who to target.")));
+                inv.setItem(13, item(Material.CLOCK, season > 0 ? "Season " + season
+                    : "No active season", NamedTextColor.LIGHT_PURPLE, List.of(
+                        "Seasons are monthly.",
+                        "Berries, stats and homes survive a reset.")));
+                if (champs > 0) {
+                    inv.setItem(14, item(Material.GOLDEN_HELMET, "Champion x" + champs,
+                        NamedTextColor.GOLD, List.of("Kept forever.",
+                            "Worth nothing in gameplay, deliberately -",
+                            "a Champion with an edge would make the",
+                            "next season unfair by construction.")));
+                }
+                inv.setItem(16, item(Material.PAPER, "Leaderboards", NamedTextColor.YELLOW,
+                    List.of("Rank, kills, streak and playtime.", "Runs /top.")));
+                inv.setItem(18, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(26, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
+
+    private void openAdmin(Player p) {        Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
             Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
 
         inv.setItem(10, item(Material.NAME_TAG, "Access audit", NamedTextColor.GREEN, List.of(
@@ -394,6 +457,15 @@ final class Menu implements Listener {
             return;
         }
 
+        if (holder.page.equals("stats")) {
+            switch (name) {
+                case "Back" -> openMain(p);
+                case "Leaderboards" -> { p.closeInventory(); run(p, "top rank"); }
+                default -> { }
+            }
+            return;
+        }
+
         if (holder.page.equals("homes")) {
             switch (clicked.getType()) {
                 case RED_BED -> { p.closeInventory(); run(p, "home " + name); }
@@ -419,7 +491,10 @@ final class Menu implements Listener {
 
         switch (name) {
             case "Homes"               -> openHomes(p);
+            case "Your rank", "Your stats" -> openStats(p);
             case "Shop"                -> openShop(p, null);
+            case "Friends"             -> { p.closeInventory(); run(p, "friend list"); }
+            case "Leaderboards"        -> { p.closeInventory(); run(p, "top rank"); }
             case "Berries"             -> run(p, "berries");
             case "Random Teleport"     -> { p.closeInventory(); run(p, "rtp"); }
             case "Teleport to a player" -> {
@@ -427,7 +502,6 @@ final class Menu implements Listener {
                 p.sendMessage(Component.text("Use /tpa <player>. They must accept.",
                     NamedTextColor.GRAY));
             }
-            case "Your rank"           -> run(p, "laughtail rating");
             case "Rules"               -> { p.closeInventory(); run(p, "rules"); }
             case "Staff and Owner tools" -> {
                 if (p.hasPermission("laughtail.status")) openAdmin(p);

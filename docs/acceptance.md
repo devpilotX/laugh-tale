@@ -285,3 +285,33 @@ UPDATE matched zero rows, so no constraint fired and the test reported the CHECK
 symptom: an UPDATE that matches nothing is indistinguishable from a refusal, so a test written this
 way can report a constraint as working when the row is simply absent. The test now asserts its
 target row exists before trying to violate it.
+## Friends, leaderboards and the stats page - 2026-08-26
+
+`scripts/remote/test-friends.sh`, all pass:
+
+* One row per pair, keyed `(uuid_low, uuid_high)` sorted. Inserting the reverse direction was
+  **REFUSED by the primary key**. Storing a friendship twice, once per direction, lets the two rows
+  disagree - A believes they are friends and B does not - and then every query has to choose which
+  row to trust. One row cannot contradict itself.
+* **Accepting requires the other player to have asked.** A accepting their own request changed
+  nothing (still `pending`); B accepting A''s request worked. Without that clause a player could
+  befriend anyone unilaterally, which defeats consent entirely.
+* The friendship is visible from **both sides** with only one row stored.
+
+### A false negative worth recording
+
+The first version of this test used a partner UUID that was not in `players`. Both inserts failed on
+the **foreign key**, so no rows existed - and the test reported the primary key as broken. That is a
+false negative which looks exactly like a real failure, and it was the schema doing its job: a
+friendship with somebody who has never joined is meaningless, so it is refused. The test now asserts
+its setup succeeded before drawing conclusions from it - the same lesson as the row 40 test that
+"succeeded" against a row that had been deleted.
+
+### Deliberate absences
+
+* **Friendship grants nothing.** No teleport bypass, no shared homes, no claim trust. Law 1 says
+  every player is equal, and a friends list that unlocks capability quietly makes a well-connected
+  player stronger than a lone one. Any future power granted through it needs its own decision.
+* **There is no richest leaderboard.** It would reward hoarding over playing and tell every thief
+  who to target. Rank is the competitive axis, so rank is what is ranked. The leaderboard says so
+  itself rather than leaving players to wonder.

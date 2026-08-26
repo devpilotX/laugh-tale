@@ -183,6 +183,14 @@ description: The LaughTail core. Access, rules gate, player registry.
 # otherwise would let it load on a server it cannot run correctly on.
 
 commands:
+  friend:
+    description: Friends list. Requires consent from both sides.
+    usage: /friend add|accept|remove|requests|list <player>
+    aliases: [friends]
+  top:
+    description: Leaderboards for rank, kills, killstreak and playtime.
+    usage: /top [rank|kills|streak|playtime]
+    aliases: [leaderboard]
   shop:
     description: Show your shop tier and how to buy and sell.
     usage: /shop
@@ -405,6 +413,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private ShopService shopService;
     private SellBox sellBox;
     private CombatTag combatTag;
+    private Social social;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -448,6 +457,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.menu = new Menu(this);
         getServer().getPluginManager().registerEvents(menu, this);
         this.shopService = new ShopService(this, database);
+        this.social = new Social(this, database);
         this.combatTag = new CombatTag(this, database);
         getServer().getPluginManager().registerEvents(combatTag, this);
         combatTag.start();
@@ -630,6 +640,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
 
     CombatTag combatTag() { return combatTag; }
 
+    Social social() { return social; }
+
     Menu menu() { return menu; }
 
     String rulesVersion() { return rulesVersion; }
@@ -768,6 +780,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (homes.handle(sender, name, args)) return true;
         if (teleports.handle(sender, name, args)) return true;
         if (shopService.handle(sender, name, args)) return true;
+        if (social.handle(sender, name, args)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }
@@ -2577,6 +2590,202 @@ public final class Database {
         // suppressedReason null means the kill COUNTS - a combat log is a real loss, not a
         // suppressed one. sameIp false because the quitter is gone and cannot be compared.
         recordCombatEvent(attacker, quitter, rpKiller, rpVictim, null, false, "combat_log", 0, 0, 0);
+    }
+    // ---- friends and leaderboards ---------------------------------------------
+
+    enum FriendResult { CREATED, ALREADY_PENDING, ALREADY_FRIENDS, ACCEPTED_EXISTING }
+
+    /**
+     * Sorts a pair so the same two players always produce the same key.
+     *
+     * The friends table keys on (uuid_low, uuid_high) rather than (owner, friend). Storing a
+     * friendship twice, once per direction, allows the two rows to disagree - A believes they are
+     * friends and B does not - and then every query has to choose which row to trust. One row cannot
+     * contradict itself.
+     */
+    private static String[] pair(UUID a, UUID b) {
+        String s1 = a.toString(), s2 = b.toString();
+        return s1.compareTo(s2) <= 0 ? new String[] { s1, s2 } : new String[] { s2, s1 };
+    }
+
+    FriendResult friendRequest(UUID from, UUID to) throws SQLException {
+        assertOffMainThread();
+        String[] k = pair(from, to);
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                String state = null, requestedBy = null;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT state, requested_by FROM friends WHERE uuid_low = ? "
+                      + "AND uuid_high = ? FOR UPDATE")) {
+                    ps.setString(1, k[0]);
+                    ps.setString(2, k[1]);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            state = rs.getString(1);
+                            requestedBy = rs.getString(2);
+                        }
+                    }
+                }
+                if ("accepted".equals(state)) {
+                    c.rollback();
+                    return FriendResult.ALREADY_FRIENDS;
+                }
+                if ("pending".equals(state)) {
+                    if (from.toString().equals(requestedBy)) {
+                        c.rollback();
+                        return FriendResult.ALREADY_PENDING;
+                    }
+                    // They asked first. Asking back IS accepting - requiring the exact command
+                    // when the intent is unambiguous is friction for its own sake.
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "UPDATE friends SET state = 'accepted', updated_at = UTC_TIMESTAMP(3) "
+                          + "WHERE uuid_low = ? AND uuid_high = ?")) {
+                        ps.setString(1, k[0]);
+                        ps.setString(2, k[1]);
+                        ps.executeUpdate();
+                    }
+                    c.commit();
+                    return FriendResult.ACCEPTED_EXISTING;
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO friends (uuid_low, uuid_high, requested_by, state, "
+                      + "created_at, updated_at) VALUES (?, ?, ?, 'pending', UTC_TIMESTAMP(3), "
+                      + "UTC_TIMESTAMP(3))")) {
+                    ps.setString(1, k[0]);
+                    ps.setString(2, k[1]);
+                    ps.setString(3, from.toString());
+                    ps.executeUpdate();
+                }
+                c.commit();
+                return FriendResult.CREATED;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /** Accepts only a request the OTHER player made. Returns false if there is none. */
+    boolean friendAccept(UUID me, UUID other) throws SQLException {
+        assertOffMainThread();
+        String[] k = pair(me, other);
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "UPDATE friends SET state = 'accepted', updated_at = UTC_TIMESTAMP(3) "
+               + "WHERE uuid_low = ? AND uuid_high = ? AND state = 'pending' "
+               + "AND requested_by = ?")) {
+            ps.setString(1, k[0]);
+            ps.setString(2, k[1]);
+            // requested_by must be the OTHER player: without this a player could accept their own
+            // request and befriend anyone unilaterally, which is the consent rule defeated.
+            ps.setString(3, other.toString());
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    boolean friendRemove(UUID me, UUID other) throws SQLException {
+        assertOffMainThread();
+        String[] k = pair(me, other);
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "DELETE FROM friends WHERE uuid_low = ? AND uuid_high = ?")) {
+            ps.setString(1, k[0]);
+            ps.setString(2, k[1]);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    java.util.List<UUID> friendList(UUID me, String state) throws SQLException {
+        assertOffMainThread();
+        java.util.List<UUID> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT uuid_low, uuid_high FROM friends WHERE (uuid_low = ? OR uuid_high = ?) "
+               + "AND state = ?")) {
+            ps.setString(1, me.toString());
+            ps.setString(2, me.toString());
+            ps.setString(3, state);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String low = rs.getString(1), high = rs.getString(2);
+                    out.add(UUID.fromString(low.equals(me.toString()) ? high : low));
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Requests made BY somebody else TO me, which are the only ones I can accept. */
+    java.util.List<UUID> friendIncoming(UUID me) throws SQLException {
+        assertOffMainThread();
+        java.util.List<UUID> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT requested_by FROM friends WHERE (uuid_low = ? OR uuid_high = ?) "
+               + "AND state = 'pending' AND requested_by <> ?")) {
+            ps.setString(1, me.toString());
+            ps.setString(2, me.toString());
+            ps.setString(3, me.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(UUID.fromString(rs.getString(1)));
+            }
+        }
+        return out;
+    }
+
+    java.util.List<String> topByRating(int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        int season = activeSeason();
+        if (season <= 0) return out;
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT p.current_name, r.current_rp FROM combat_ratings r "
+               + "JOIN players p ON p.uuid = r.uuid WHERE r.season_number = ? "
+               + "ORDER BY r.current_rp DESC, p.current_name ASC LIMIT ?")) {
+            ps.setInt(1, season);
+            ps.setInt(2, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    int rp = rs.getInt(2);
+                    out.add(rs.getString(1) + "  " + rp + " RP  " + Rating.tierName(rp));
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Top players by a stats column.
+     *
+     * The column name is validated against an allow-list rather than interpolated, because a column
+     * name cannot be a bound parameter. Interpolating a caller-supplied string into SQL is an
+     * injection even when every current caller is trusted - the next caller might not be.
+     */
+    java.util.List<String> topByStat(String column, int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.Set<String> allowed = java.util.Set.of(
+            "kills", "deaths", "killstreak_best", "blocks_mined", "playtime_seconds");
+        if (!allowed.contains(column)) {
+            throw new IllegalArgumentException("not a leaderboard column: " + column);
+        }
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT p.current_name, s." + column + " FROM stats s "
+               + "JOIN players p ON p.uuid = s.uuid WHERE s." + column + " > 0 "
+               + "ORDER BY s." + column + " DESC, p.current_name ASC LIMIT ?")) {
+            ps.setInt(1, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long v = rs.getLong(2);
+                    out.add(rs.getString(1) + "  " + (column.equals("playtime_seconds")
+                        ? (v / 3600) + "h " + ((v % 3600) / 60) + "m" : String.valueOf(v)));
+                }
+            }
+        }
+        return out;
     }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Database_java
 
@@ -5247,12 +5456,15 @@ final class Menu implements Listener {
             "List items for other players to buy.", "Waiting on: Phase 3"));
         inv.setItem(21, notBuilt(Material.PAPER, "Orders / Bazaar",
             "Buy and sell orders, matched atomically.", "Waiting on: Phase 3"));
-        inv.setItem(22, notBuilt(Material.PLAYER_HEAD, "Friends",
-            "Add friends and see who is online.", "Waiting on: the friends commands"));
+        inv.setItem(22, item(Material.PLAYER_HEAD, "Friends", NamedTextColor.AQUA, List.of(
+            "Both sides must agree.",
+            "Grants no advantage - Law 1.",
+            "/friend add, accept, remove, requests")));
         inv.setItem(23, notBuilt(Material.ARMOR_STAND, "Cosmetics",
             "Unlocked by rank. Never bought with money.", "Waiting on: Phase 7"));
-        inv.setItem(24, notBuilt(Material.OAK_SIGN, "Leaderboards",
-            "Season standings and the Hall of Fame.", "Waiting on: Phase 8"));
+        inv.setItem(24, item(Material.OAK_SIGN, "Leaderboards", NamedTextColor.YELLOW, List.of(
+            "Rank, kills, streak, playtime.",
+            "No richest list, deliberately.")));
         inv.setItem(25, notBuilt(Material.NOTE_BLOCK, "Settings",
             "Your personal toggles.", "Waiting on: Section 16"));
 
@@ -5418,8 +5630,68 @@ final class Menu implements Listener {
         return category == null || e.category().equals(category);
     }
 
-    private void openAdmin(Player p) {
-        Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
+    /**
+     * The stats page. Everything the server knows about you, in one place.
+     *
+     * Shows what is TRACKED rather than what flatters - deaths next to kills, and the K/D derived
+     * rather than stored, so it cannot disagree with its own inputs.
+     */
+    void openStats(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final int[] kd;
+            final int rp, season, champs;
+            final long berries;
+            try {
+                season = plugin.database().activeSeason();
+                rp = plugin.database().currentRp(p.getUniqueId(), season);
+                kd = plugin.database().killsAndDeaths(p.getUniqueId());
+                berries = plugin.database().balance(p.getUniqueId());
+                champs = plugin.database().championSeasons(p.getUniqueId()).size();
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read your stats.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                Inventory inv = Bukkit.createInventory(new MenuHolder("stats"), 27,
+                    Component.text("Your stats", NamedTextColor.AQUA));
+                String ratio = kd[1] == 0
+                    ? (kd[0] == 0 ? "no fights yet" : kd[0] + ".00 (no deaths)")
+                    : String.format("%.2f", (double) kd[0] / kd[1]);
+                inv.setItem(10, item(Material.IRON_SWORD, "Rank: " + Rating.tierName(rp),
+                    NamedTextColor.RED, List.of(rp + " RP",
+                        "Rank comes from PvP and nothing else.",
+                        "Mining and building change it by zero.")));
+                inv.setItem(11, item(Material.SKELETON_SKULL, "Kills " + kd[0]
+                    + " / Deaths " + kd[1], NamedTextColor.WHITE, List.of("K/D " + ratio,
+                        "Derived, not stored - it cannot",
+                        "disagree with its own inputs.")));
+                inv.setItem(12, item(Material.GOLD_NUGGET, "Berries: " + berries,
+                    NamedTextColor.GOLD, List.of("There is no richest leaderboard.",
+                        "It would reward hoarding and tell",
+                        "thieves who to target.")));
+                inv.setItem(13, item(Material.CLOCK, season > 0 ? "Season " + season
+                    : "No active season", NamedTextColor.LIGHT_PURPLE, List.of(
+                        "Seasons are monthly.",
+                        "Berries, stats and homes survive a reset.")));
+                if (champs > 0) {
+                    inv.setItem(14, item(Material.GOLDEN_HELMET, "Champion x" + champs,
+                        NamedTextColor.GOLD, List.of("Kept forever.",
+                            "Worth nothing in gameplay, deliberately -",
+                            "a Champion with an edge would make the",
+                            "next season unfair by construction.")));
+                }
+                inv.setItem(16, item(Material.PAPER, "Leaderboards", NamedTextColor.YELLOW,
+                    List.of("Rank, kills, streak and playtime.", "Runs /top.")));
+                inv.setItem(18, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(26, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
+
+    private void openAdmin(Player p) {        Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
             Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
 
         inv.setItem(10, item(Material.NAME_TAG, "Access audit", NamedTextColor.GREEN, List.of(
@@ -5497,6 +5769,15 @@ final class Menu implements Listener {
             return;
         }
 
+        if (holder.page.equals("stats")) {
+            switch (name) {
+                case "Back" -> openMain(p);
+                case "Leaderboards" -> { p.closeInventory(); run(p, "top rank"); }
+                default -> { }
+            }
+            return;
+        }
+
         if (holder.page.equals("homes")) {
             switch (clicked.getType()) {
                 case RED_BED -> { p.closeInventory(); run(p, "home " + name); }
@@ -5522,7 +5803,10 @@ final class Menu implements Listener {
 
         switch (name) {
             case "Homes"               -> openHomes(p);
+            case "Your rank", "Your stats" -> openStats(p);
             case "Shop"                -> openShop(p, null);
+            case "Friends"             -> { p.closeInventory(); run(p, "friend list"); }
+            case "Leaderboards"        -> { p.closeInventory(); run(p, "top rank"); }
             case "Berries"             -> run(p, "berries");
             case "Random Teleport"     -> { p.closeInventory(); run(p, "rtp"); }
             case "Teleport to a player" -> {
@@ -5530,7 +5814,6 @@ final class Menu implements Listener {
                 p.sendMessage(Component.text("Use /tpa <player>. They must accept.",
                     NamedTextColor.GRAY));
             }
-            case "Your rank"           -> run(p, "laughtail rating");
             case "Rules"               -> { p.closeInventory(); run(p, "rules"); }
             case "Staff and Owner tools" -> {
                 if (p.hasPermission("laughtail.status")) openAdmin(p);
@@ -7183,6 +7466,320 @@ final class CombatTag implements Listener {
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_CombatTag_java
+
+# ---- src/main/java/gg/laughtail/core/Social.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Social.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Social_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+
+import java.sql.SQLException;
+import java.util.List;
+import java.util.UUID;
+import java.util.logging.Level;
+
+/**
+ * Friends and leaderboards. Two of the features from D-0035's list.
+ *
+ * FRIENDSHIP IS SYMMETRIC AND STORED ONCE. The friends table keys on (uuid_low, uuid_high) - the two
+ * UUIDs sorted - rather than on (owner, friend). Storing it twice, once per direction, means the two
+ * rows can disagree: A thinks they are friends, B does not, and every query has to pick a side. One
+ * row cannot disagree with itself.
+ *
+ * IT REQUIRES CONSENT. A request sits in `pending` until the other player accepts. A one-sided friend
+ * list is a following list, and a following list is a harassment vector - somebody can attach
+ * themselves to a player who wants nothing to do with them and, if friends ever gate teleports or
+ * visibility, follow them around.
+ *
+ * FRIENDSHIP DELIBERATELY GRANTS NOTHING YET. No teleport bypass, no shared homes, no claim trust.
+ * Law 1 says every player is equal, and a friends list that unlocks capability is a quiet way to make
+ * a well-connected player stronger than a lone one. It is a convenience - see who is online - and any
+ * future power granted through it needs its own decision.
+ *
+ * LEADERBOARDS SHOW RATING, KILLS, KILLSTREAK AND PLAYTIME, and deliberately NOT Berries. A richest
+ * list turns the economy into a scoreboard and rewards hoarding over playing; worse, it tells every
+ * thief who to target. Rank is the competitive axis on this server, so rank is what is ranked.
+ */
+final class Social {
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+
+    Social(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+    }
+
+    boolean handle(CommandSender sender, String cmd, String[] args) {
+        switch (cmd) {
+            case "friend", "friends": return friends(sender, args);
+            case "baltop": return false;   // owned by Economy
+            case "top", "leaderboard": return leaderboard(sender, args);
+            default: return false;
+        }
+    }
+
+    // ---- friends -------------------------------------------------------------
+
+    private boolean friends(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("Friends are per-player; run this in game.");
+            return true;
+        }
+        String sub = args.length > 0 ? args[0].toLowerCase() : "list";
+        switch (sub) {
+            case "add" -> {
+                if (args.length < 2) {
+                    p.sendMessage(Component.text("Usage: /friend add <player>",
+                        NamedTextColor.GRAY));
+                    return true;
+                }
+                request(p, args[1]);
+            }
+            case "accept" -> {
+                if (args.length < 2) {
+                    p.sendMessage(Component.text("Usage: /friend accept <player>",
+                        NamedTextColor.GRAY));
+                    return true;
+                }
+                accept(p, args[1]);
+            }
+            case "remove", "deny" -> {
+                if (args.length < 2) {
+                    p.sendMessage(Component.text("Usage: /friend remove <player>",
+                        NamedTextColor.GRAY));
+                    return true;
+                }
+                remove(p, args[1]);
+            }
+            case "requests" -> listRequests(p);
+            default -> listFriends(p);
+        }
+        return true;
+    }
+
+    /** Resolves a name to a UUID without a blocking web lookup. */
+    private UUID resolve(String name) {
+        Player online = plugin.getServer().getPlayerExact(name);
+        if (online != null) return online.getUniqueId();
+        // Offline players are only resolvable if they have joined before, which is correct here:
+        // a friend request to somebody who has never played is a typo, and Mojang's API is a
+        // blocking network call that has no business inside a command.
+        OfflinePlayer off = plugin.getServer().getOfflinePlayerIfCached(name);
+        return off == null ? null : off.getUniqueId();
+    }
+
+    private void request(Player p, String name) {
+        UUID target = resolve(name);
+        if (target == null) {
+            p.sendMessage(Component.text("No player called " + name + " has played here.",
+                NamedTextColor.RED));
+            return;
+        }
+        if (target.equals(p.getUniqueId())) {
+            p.sendMessage(Component.text("You cannot befriend yourself.", NamedTextColor.GRAY));
+            return;
+        }
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                Database.FriendResult r = db.friendRequest(p.getUniqueId(), target);
+                reply(p, switch (r) {
+                    case ALREADY_FRIENDS -> Component.text("You are already friends with " + name
+                        + ".", NamedTextColor.GRAY);
+                    case ALREADY_PENDING -> Component.text("You have already asked " + name
+                        + ". They need to accept.", NamedTextColor.GRAY);
+                    case ACCEPTED_EXISTING -> Component.text("You and " + name
+                        + " are now friends - they had already asked you.", NamedTextColor.GREEN);
+                    case CREATED -> Component.text("Friend request sent to " + name + ".",
+                        NamedTextColor.GREEN);
+                });
+                Player t = plugin.getServer().getPlayer(target);
+                if (t != null && r == Database.FriendResult.CREATED) {
+                    final Player tt = t;
+                    plugin.getServer().getScheduler().runTask(plugin, () -> tt.sendMessage(
+                        Component.text(p.getName() + " wants to be your friend. ",
+                            NamedTextColor.AQUA)
+                        .append(Component.text("/friend accept " + p.getName(),
+                            NamedTextColor.WHITE))));
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "friend request failed: " + e.getMessage());
+                reply(p, Component.text("That did not work. Try again.", NamedTextColor.RED));
+            }
+        });
+    }
+
+    private void accept(Player p, String name) {
+        UUID target = resolve(name);
+        if (target == null) {
+            p.sendMessage(Component.text("No player called " + name + " has played here.",
+                NamedTextColor.RED));
+            return;
+        }
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                boolean ok = db.friendAccept(p.getUniqueId(), target);
+                reply(p, ok
+                    ? Component.text("You and " + name + " are now friends.",
+                        NamedTextColor.GREEN)
+                    : Component.text(name + " has not asked to be your friend. You cannot "
+                        + "accept a request that does not exist.", NamedTextColor.GRAY));
+                if (ok) {
+                    Player t = plugin.getServer().getPlayer(target);
+                    if (t != null) {
+                        final Player tt = t;
+                        plugin.getServer().getScheduler().runTask(plugin, () -> tt.sendMessage(
+                            Component.text(p.getName() + " accepted your friend request.",
+                                NamedTextColor.GREEN)));
+                    }
+                }
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "friend accept failed: " + e.getMessage());
+                reply(p, Component.text("That did not work. Try again.", NamedTextColor.RED));
+            }
+        });
+    }
+
+    private void remove(Player p, String name) {
+        UUID target = resolve(name);
+        if (target == null) {
+            p.sendMessage(Component.text("No player called " + name + " has played here.",
+                NamedTextColor.RED));
+            return;
+        }
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                boolean removed = db.friendRemove(p.getUniqueId(), target);
+                // Removing works on a pending request too, so a request can be withdrawn and an
+                // unwanted one refused with the same command. Two commands for one intent is worse.
+                reply(p, removed
+                    ? Component.text("Removed " + name + ".", NamedTextColor.GREEN)
+                    : Component.text("You have no friendship or request with " + name + ".",
+                        NamedTextColor.GRAY));
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "friend remove failed: " + e.getMessage());
+                reply(p, Component.text("That did not work. Try again.", NamedTextColor.RED));
+            }
+        });
+    }
+
+    private void listFriends(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                List<UUID> ids = db.friendList(p.getUniqueId(), "accepted");
+                int pending = db.friendList(p.getUniqueId(), "pending").size();
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    p.sendMessage(Component.text("Friends (" + ids.size() + ")",
+                        NamedTextColor.GOLD));
+                    if (ids.isEmpty()) {
+                        p.sendMessage(Component.text("  nobody yet - /friend add <player>",
+                            NamedTextColor.GRAY));
+                    }
+                    for (UUID id : ids) {
+                        Player online = plugin.getServer().getPlayer(id);
+                        String n = online != null ? online.getName()
+                            : plugin.getServer().getOfflinePlayer(id).getName();
+                        p.sendMessage(Component.text("  " + (n == null ? id.toString() : n),
+                            online != null ? NamedTextColor.GREEN : NamedTextColor.DARK_GRAY)
+                            .append(Component.text(online != null ? "  online" : "  offline",
+                                NamedTextColor.DARK_GRAY)));
+                    }
+                    if (pending > 0) {
+                        p.sendMessage(Component.text("  " + pending
+                            + " pending - /friend requests", NamedTextColor.AQUA));
+                    }
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "friend list failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void listRequests(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                List<UUID> ids = db.friendIncoming(p.getUniqueId());
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    p.sendMessage(Component.text("Friend requests waiting for you ("
+                        + ids.size() + ")", NamedTextColor.GOLD));
+                    if (ids.isEmpty()) {
+                        p.sendMessage(Component.text("  none", NamedTextColor.GRAY));
+                    }
+                    for (UUID id : ids) {
+                        String n = plugin.getServer().getOfflinePlayer(id).getName();
+                        p.sendMessage(Component.text("  " + (n == null ? id.toString() : n)
+                            + "  ", NamedTextColor.WHITE)
+                            .append(Component.text("/friend accept " + n, NamedTextColor.AQUA)));
+                    }
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "friend requests failed: " + e.getMessage());
+            }
+        });
+    }
+
+    // ---- leaderboards --------------------------------------------------------
+
+    private boolean leaderboard(CommandSender sender, String[] args) {
+        String kind = args.length > 0 ? args[0].toLowerCase() : "rank";
+        final String metric = switch (kind) {
+            case "kills" -> "kills";
+            case "streak" -> "killstreak_best";
+            case "playtime" -> "playtime_seconds";
+            default -> "rank";
+        };
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                List<String> rows = metric.equals("rank")
+                    ? db.topByRating(10)
+                    : db.topByStat(metric, 10);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    sender.sendMessage(Component.text("Top 10 - " + label(metric),
+                        NamedTextColor.GOLD));
+                    if (rows.isEmpty()) {
+                        sender.sendMessage(Component.text("  nothing recorded yet",
+                            NamedTextColor.GRAY));
+                    }
+                    int i = 1;
+                    for (String r : rows) {
+                        sender.sendMessage(Component.text(String.format("  %2d. ", i++)
+                            + r, NamedTextColor.WHITE));
+                    }
+                    sender.sendMessage(Component.text(
+                        "  /top rank | kills | streak | playtime", NamedTextColor.DARK_GRAY));
+                    // Stated on the leaderboard itself, not only in the documentation, because the
+                    // absence is a deliberate design choice and players will ask.
+                    sender.sendMessage(Component.text(
+                        "  There is no richest list - it would reward hoarding and tell thieves "
+                      + "who to target.", NamedTextColor.DARK_GRAY));
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "leaderboard failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private String label(String metric) {
+        return switch (metric) {
+            case "kills" -> "kills";
+            case "killstreak_best" -> "best killstreak";
+            case "playtime_seconds" -> "playtime";
+            default -> "rank (this season)";
+        };
+    }
+
+    private void reply(Player p, Component c) {
+        plugin.getServer().getScheduler().runTask(plugin, () -> {
+            if (p.isOnline()) p.sendMessage(c);
+        });
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Social_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do

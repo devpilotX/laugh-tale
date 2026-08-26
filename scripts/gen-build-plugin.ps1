@@ -40,7 +40,8 @@ $files = @(
   'src/main/java/gg/laughtail/core/Arbitrage.java',
   'src/main/java/gg/laughtail/core/ShopService.java',
   'src/main/java/gg/laughtail/core/SellBox.java',
-  'src/main/java/gg/laughtail/core/CombatTag.java'
+  'src/main/java/gg/laughtail/core/CombatTag.java',
+  'src/main/java/gg/laughtail/core/Social.java'
 )
 
 foreach ($f in $files) {
