@@ -188,16 +188,17 @@ $LT_VOLUME   = '<NEW-VOLUME-UUID>'
 command goes through `scripts/remote.ps1`, which reads this file — so this is the only place the address
 belongs, and it is why acceptance row 2 (no hardcoded values) passes.
 
-Then fix the few scripts that still name the volume literally:
+**No script hardcodes the volume any more**, so there is nothing else to change. This was true when this
+runbook was first drafted and has since been fixed at the source: scripts either receive the volume from
+`host.env.ps1` or discover it, and `reset-seasons.sh` refuses outright if more than one server volume
+exists without being told which to use — because picking one arbitrarily is how a script wipes the wrong
+server. Worth re-checking anyway, since it costs nothing:
 
 ```
 findstr /S /C:"4fd2f0a9" scripts\*.ps1 scripts\remote\*.sh
 ```
 
-At the time of writing that is **three** small diagnostic scripts plus `host.env.ps1` itself:
-`read-arbitrage.sh`, `read-row25.sh` and `reset-seasons.sh`. **Fix every hit.** A script still pointing
-at the old UUID does not error — it reads a directory that does not exist and reports nothing useful, or
-reports success having examined the wrong thing.
+The only expected hit is `host.env.ps1`, which is git-ignored and is where the address belongs.
 
 ### Step 7 â€” Restore the data (5 min)
 

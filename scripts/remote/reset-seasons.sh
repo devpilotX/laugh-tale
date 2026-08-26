@@ -25,7 +25,31 @@
 # LAYERED REFUSALS, because the only irreversible mistake here is doing it to the wrong server.
 set -euo pipefail
 
-DEV_VOLUME=4fd2f0a9-6ad6-4a4d-96c8-e11e763bdd22
+# THE VOLUME IS DISCOVERED, NOT HARDCODED.
+#
+# A hardcoded UUID makes this script silently useless the moment the server moves to another box - it
+# would look at a directory that does not exist, and the refusal below would then fire for the wrong
+# reason. docs/MIGRATION.md flagged this as something to fix by hand during a migration; fixing it here
+# instead means there is nothing to remember.
+#
+# It REFUSES when more than one volume exists and LT_VOLUME is not set. That matters because the plan
+# is eventually two servers - laughtail-dev and the real laughtail - and picking one arbitrarily is how
+# a script wipes the season history of the wrong server.
+VOLS=$(sudo -n ls -1 /var/lib/pelican/volumes 2>/dev/null || true)
+VOL_COUNT=$(printf '%s\n' "$VOLS" | grep -c . || true)
+if [ "${VOL_COUNT:-0}" -eq 0 ]; then
+  echo "REFUSED: no Pelican volumes found. This is not the machine this script is for."
+  exit 2
+elif [ -n "${LT_VOLUME:-}" ]; then
+  DEV_VOLUME="$LT_VOLUME"
+elif [ "$VOL_COUNT" -eq 1 ]; then
+  DEV_VOLUME=$(printf '%s\n' "$VOLS" | grep . )
+else
+  echo "REFUSED: $VOL_COUNT server volumes exist and LT_VOLUME is not set."
+  echo "Choosing one arbitrarily could wipe the season history of the wrong server."
+  exit 2
+fi
+echo "  operating on volume: $DEV_VOLUME"
 
 q() {
   sudo -n docker exec -u root laughtail-db sh -c "mariadb -u laughtail -p\"\$(cat /run/lt-secrets/app_password)\" -D laughtail -N -B -e \"$1\"" 2>&1 | sed '/password on the command line/d'
