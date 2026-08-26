@@ -135,22 +135,49 @@ function Assert-CommandAllowed {
        r = 'never-break rule 7'; why = 'vanilla /reload corrupts plugin state. Use /laughtail reload' }
     @{ p = 'drop\s+(database|schema)\b|drop\s+table\b|truncate\s+table\b'
        r = 'data safety'; why = 'destroys player data' }
-    @{ p = 'mkfs|dd\s+if=.*of=/dev/|>\s*/dev/(sd|nvme|xvd)'
-       r = 'data safety'; why = 'destroys the filesystem' }
     @{ p = 'docker\s+(volume\s+)?rm\b|docker\s+system\s+prune|docker\s+volume\s+prune'
        r = 'never-break rule 8'; why = 'deletes a Pelican server volume' }
     @{ p = 'ufw\s+(disable|--force\s+reset|reset)\b'
        r = 'security'; why = 'opens the host to the internet' }
     @{ p = 'iptables\s+-f\b|iptables\s+--flush'
        r = 'security'; why = 'flushes all firewall rules' }
-    @{ p = 'shutdown|reboot|halt|poweroff'
-       r = 'availability'; why = 'takes the host down; use the Panel to stop a server instead' }
+    @{ p = '(rm|mv|shred)\s[^;&|]*(/world|/world_nether|/world_the_end)(\s|/|$)'
+       r = 'never-break rule 3'; why = 'never reset or delete the main world. Only the resource world resets, monthly' }
   )
 
   foreach ($d in $deny) {
     if (-not (Test-GuardRule -Norm $norm -Pattern $d.p)) { continue }
     throw ("GUARD REFUSED ({0}): {1}`n  command: {2}`n  If this is genuinely required, write it to docs/owner-actions.md and get explicit confirmation." -f `
            $d.r, $d.why, $Command)
+  }
+
+  # ---- dangerous binaries, checked by COMMAND POSITION not substring ----------
+  # "echo waiting for a clean shutdown" must not be refused. Only an actual
+  # invocation of shutdown must be. So the first real token of each command
+  # segment is compared, after stripping sudo and env prefixes.
+  $denyBinaries = @{
+    'shutdown' = 'availability: takes the host down; stop the server via the Panel instead'
+    'reboot'   = 'availability: takes the host down'
+    'halt'     = 'availability: takes the host down'
+    'poweroff' = 'availability: takes the host down'
+    'mkfs'     = 'data safety: destroys the filesystem'
+    'mkfs.ext4'= 'data safety: destroys the filesystem'
+    'fdisk'    = 'data safety: repartitions the disk'
+    'init'     = 'availability: changes runlevel'
+  }
+  foreach ($seg in ($norm -split '[;&|]|\bthen\b|\bdo\b')) {
+    $t = @($seg.Trim() -split '\s+' | Where-Object { $_ -ne '' })
+    $i = 0
+    while ($i -lt $t.Count -and ($t[$i] -eq 'sudo' -or $t[$i] -eq 'env' -or $t[$i] -like '-*' -or $t[$i] -match '^\w+=')) { $i++ }
+    if ($i -ge $t.Count) { continue }
+    $bin = ($t[$i] -replace '^.*/', '')          # /sbin/shutdown -> shutdown
+    if ($denyBinaries.ContainsKey($bin)) {
+      throw ("GUARD REFUSED ({0}).`n  command: {1}`n  If this is genuinely required, write it to docs/owner-actions.md and get explicit confirmation." -f $denyBinaries[$bin], $Command)
+    }
+    # dd writing to a block device
+    if ($bin -eq 'dd' -and $seg -match 'of=/dev/') {
+      throw ("GUARD REFUSED (data safety): dd writing to a block device destroys the filesystem.`n  command: {0}" -f $Command)
+    }
   }
 
   # ---- production server protection (never-break rule 1) --------------------
@@ -166,6 +193,9 @@ function Assert-CommandAllowed {
     @{ p = 'apt(-get)?\s+install';                                   why = 'installs software on the game box' }
     @{ p = 'systemctl\s+(stop|disable|mask)\s';                      why = 'stops a host service' }
     @{ p = 'docker\s+(stop|kill|restart)\b';                         why = 'stops a running server' }
+    @{ p = 'p:server:bulk-power\s+(stop|restart|kill)';              why = 'stops or kills a Pelican server; players online would be disconnected' }
+    @{ p = 'artisan\s+migrate(\s|$)';                                why = 'runs Panel database migrations' }
+    @{ p = 'artisan\s+down\b';                                       why = 'puts the Panel into maintenance mode' }
     @{ p = 'growpart|resize2fs|parted|fdisk';                        why = 'modifies partitions' }
     @{ p = 'chown\s+-r|chmod\s+-r';                                  why = 'recursive ownership or permission change' }
     @{ p = 'ufw\s+(allow|deny|delete)';                              why = 'changes the firewall' }

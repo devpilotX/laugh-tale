@@ -75,15 +75,40 @@ Write-Output 'GROUP 8  security and availability'
 Should-Refuse 'ufw disable'                                     'disable firewall'
 Should-Refuse 'iptables --flush'                                'flush rules'
 Should-Refuse 'sudo reboot'                                     'reboot host'
+Should-Refuse 'shutdown -h now'                                 'shutdown host'
+Should-Refuse '/sbin/shutdown -r now'                           'shutdown by full path'
+Should-Refuse 'sudo -n mkfs.ext4 /dev/nvme0n1'                  'format disk'
+Should-Refuse 'dd if=/dev/zero of=/dev/nvme0n1'                 'overwrite disk'
+
+Write-Output 'GROUP 8b  the same words inside strings must NOT be refused'
+Should-Allow 'echo "=== waiting for a clean shutdown (up to 60s) ==="'
+Should-Allow 'echo reboot required'
+Should-Allow 'grep -c "left the game" latest.log'
+
+Write-Output 'GROUP 8c  SQL keywords stay broad ON PURPOSE'
+# Position-based checking is right for binaries, where "echo ... shutdown" is
+# obviously harmless. It is NOT right for SQL, because a DROP can arrive through
+# mysql -e, a heredoc, a .sql file, or a tinker one-liner, and enumerating those
+# is how a guard gets bypassed. The cost of this false positive is rewording a
+# log message. The cost of a false negative is the player database. Deliberate.
+Should-Refuse 'echo "this will drop table names into a list"'    'SQL kept broad by design'
 
 Write-Output 'GROUP 9  never-break rule 1 - production is untouchable'
 Should-Refuse 'docker start laughtail-prod'                     'production named'
+
+Write-Output 'GROUP 9b  never-break rule 3 - the main world'
+Should-Refuse 'rm -r /var/lib/pelican/volumes/abc/world'        'delete main world'
+Should-Refuse 'mv /var/lib/pelican/volumes/abc/world /tmp/old'  'move main world'
+Should-Refuse 'rm -r /var/lib/pelican/volumes/abc/world_nether' 'delete nether'
+Should-Allow  'rm -rf /var/lib/pelican/volumes/abc/world_resource'
 
 Write-Output 'GROUP 10  confirm-required refused without -Confirmed'
 Should-Refuse 'apt-get install openjdk-21-jdk'                  'install'
 Should-Refuse 'systemctl stop wings'                            'stop service'
 Should-Refuse 'ufw allow 24454/udp'                             'firewall change'
 Should-Refuse 'growpart /dev/nvme0n1 1'                         'partition change'
+Should-Refuse 'php artisan p:server:bulk-power stop --servers=1' 'panel stop'
+Should-Refuse 'php artisan migrate'                             'panel migrations'
 
 Write-Output 'GROUP 11  confirm-required allowed WITH -Confirmed'
 try {
