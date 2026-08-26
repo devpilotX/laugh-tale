@@ -423,3 +423,42 @@ The three things that will actually stall this build, in order:
 **What I will do on approval, in order.** Push to GitHub once OA-02 arrives, then - after OA-03, OA-04, OA-05 and OA-06 - Phase 0.1 host remediation, then 0.2 repository machinery. I will not touch the host before the snapshot exists.
 
 **Surprises worth remembering.** The build PC has no git but the VPS does. The host is ARM64 and burstable, neither of which the specification anticipated. One Pelican server exists and is running, and it is allocated 1.9 of the box's 2 cores. The specification's own `.gitignore` excludes `*.sql` while the same subsection mandates `db/migrations/`; the carve-out I applied is recorded as decision D-0001.
+
+---
+
+## Session 2, third block - Phase 0 foundation
+
+**Phase 0.5 done - the database exists.** Spec 5.2's `db` container: `mariadb:11.4.5` pinned by digest, 320 MiB cap, loopback only, 180 MiB actual use. `V1__init.sql` applied in 379 ms creating bookkeeping, `players`, `access_grants`, `seasons`, `champions`. **Acceptance row 36's schema half PASSES** - `PRIMARY KEY (season_number)` plus a failed-insert test returning `ERROR 1062`. The migration runner was made to apply, to be idempotent, and to *refuse* - all three observed rather than assumed. See **D-0023**, **D-0024**.
+
+**Phase 0.6 done, and this was the actual Section 20 gate for the phase.** `backup-run.sh` does save-off / save-all flush / tar / save-on with the flush restoration in a trap, plus `mariadb-dump --single-transaction`. `restore-drill.sh` **PASSED with 0 failures**: 5/5 tables, identical V1 checksum, 3/3 foreign keys, `level.dat` decompressing cleanly, 12/12 region files, and - the check most people skip - **the row 36 constraint survives the round trip**. A backup that restores rows but loses a constraint restores a silently broken server. Logged in `docs/restore-drills.md`. Backups are now on cron: hourly database at :17, six-hourly full at :23, with logrotate, a `bash -n` check, a cron.d mode check, and the scheduled command executed once as root to prove it runs.
+
+**Appendix C partly done - Paper config under repository control** as a managed subset of keys rather than whole files, because Paper renames keys between versions and rewrites these files at boot. Six managed keys, spark now enabled, and the autosave collision that 6.4 explicitly forbids found and fixed. Zero drift after boot. See **D-0025**.
+
+**The guard became narrower, not weaker.** `DROP DATABASE` was an absolute denial, which refused the restore drill itself - and refusing to *test* a backup in the name of data safety is a net loss of safety. It now judges the target name: `laughtail` and `players` are still refused, only `_drill` and `_scratch` names pass. **75 guard tests, 0 failures**, both directions proven.
+
+### One bug class kept recurring - worth internalising
+
+**`sudo` never applies to the shell's own redirection.** Three separate instances this session:
+
+* `sudo -n wc -l < file` - the redirect runs as `ubuntu`, which cannot read the volume, so the count came back empty and a test reported a **false pass**.
+* `sudo -n gzip -t < file` - same fault, rescued only by an `|| true` fallback that hid it.
+* A bare `[ -f ]` inside the volume returns **false** rather than erroring, so the installer took the wrong branch and reported saving a rollback jar it had never looked at.
+
+Related: `"$D/plugins"/*.jar` is expanded by the calling shell and fails the same way. And under `pipefail`, `cmd | head` returns 141 (SIGPIPE) and aborts the script under `set -e`.
+
+### State against the ten phases
+
+| Phase | State |
+| --- | --- |
+| Day Zero | Done apart from owner items - OA-02 GitHub, OA-03 snapshot, 2FA, plan approval |
+| **0 Foundation** | **Mostly done.** 0.2 tooling, 0.3 dev server, 0.4 pinned + arm64 proof, 0.5 database, 0.6 backups **and a passed restore drill**, 0.9 baseline. Remaining: 0.1 host remediation (OA-03/04/05/06), 0.7 alerting (OA-16), 0.8 UDP verification (OA-06 **and** a Panel allocation change), 0.10 cold-start proof |
+| 1-9 | Not started. No paywall, economy, rank, seasons, shop gating, load test, voice, cosmetics or website |
+
+**Acceptance: 3 of 81 rows carry evidence** - row 5 TCP half, row 36 schema half, plus the tooling-satisfied 29.x criteria. That is the honest number.
+
+### Next, in order
+
+1. **0.10 cold start** - prove the server comes up from a clean checkout with one command and time a rebuild (rows 1 and 3). Everything needed now exists.
+2. `paper-world-defaults.yml` and `bukkit.yml` into the managed registry, if Phase 6 justifies the entity-range changes currently deferred under Law 5.
+3. **Phase 1 is blocked on owner input** - OA-10 store, OA-12 price, OA-13 legal text, OA-16 Discord. But its schema is already in place, so LuckPerms permission work and the rules-gate table can start early.
+4. **Q-41 must be answered before Phase 6.** Host memory available is now **473 MB** and has fallen with each required component. Spec 22.3's ~2.5 GB heap for 24 players cannot coexist with never-break rule 4 on this box. That is arithmetic, not opinion.
