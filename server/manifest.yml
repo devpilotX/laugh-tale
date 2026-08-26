@@ -112,6 +112,19 @@ components:
     role: "Simulation anti-cheat (14.1)"
     version: "2.3.73"
     file: "grimac-bukkit-2.3.73.jar"
+    installed: false
+    not_installed_because: >
+      MEASURED UNPLAYABLE with a client newer than the server. The owner connected
+      with Minecraft 26.2 (confirmed by `viaversion list`) to this 1.21.11 server, so
+      ViaVersion translates every packet. GrimAC predicts movement from packets and
+      its own boot warning says this combination is unsupported. Result: Simulation
+      violations in the hundreds at offsets as small as 0.008 blocks, plus setbacks -
+      which to a player is simply "I cannot sprint". Only 5 of Grim's checks expose a
+      setbackvl knob; its movement checks correct the player BY DESIGN, so there is no
+      alert-only mode for them, and raising thresholds until false positives stop
+      would also raise them until real cheats pass. Still downloaded and
+      checksum-verified, just not installed. Acceptance row 50 is NOT claimable while
+      this is so, and has not been claimed. Blocked on OA-27.
     checksum_algo: "sha512"
     checksum: "bf9be1194eb45afe1dec6bd8e98d078dacf41539025c8aabe24d31337cbea86625774e30842568b47f34ca174472c724c7876cc30793945e7408b03609672655"
     url: "https://cdn.modrinth.com/data/LJNGWSvH/versions/1FIGlM6Q/grimac-bukkit-2.3.73.jar"

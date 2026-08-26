@@ -17,15 +17,18 @@ $src  = Join-Path $repo 'server\permissions.yml'
 $groups = @()
 $never  = @()
 $tests  = @()
+$reals  = @()
 $section = ''
 $curGroup = $null
 $curNever = $null
 $curTest = $null
+$curReal = $null
 
 foreach ($raw in Get-Content -LiteralPath $src) {
   if ($raw -match '^\s*#') { continue }
   if ($raw -match '^groups:\s*$')              { $section = 'groups'; continue }
   if ($raw -match '^never_grant_to_admin:\s*$'){ if ($curGroup) { $groups += [pscustomobject]$curGroup; $curGroup = $null }; $section = 'never'; continue }
+  if ($raw -match '^real_accounts:\s*$')       { if ($curGroup) { $groups += [pscustomobject]$curGroup; $curGroup = $null }; $section = 'real'; continue }
   if ($raw -match '^test_accounts:\s*$')       { if ($curNever) { $never += [pscustomobject]$curNever; $curNever = $null }; $section = 'tests'; continue }
   if ($raw -match '^\S' -and $raw -notmatch '^\s') { $section = ''; continue }
 
@@ -66,11 +69,23 @@ foreach ($raw in Get-Content -LiteralPath $src) {
       if ($raw -match '^\s+group:\s*(\S+)\s*$')     { $curTest.group = $Matches[1]; continue }
       if ($raw -match "^\s+purpose:\s*'(.*)'\s*$")  { $curTest.purpose = $Matches[1]; continue }
     }
+    'real' {
+      if ($raw -match "^\s*-\s+uuid:\s*'(.+?)'\s*$") {
+        if ($curReal) { $reals += [pscustomobject]$curReal }
+        $curReal = @{ uuid = $Matches[1]; name = ''; group = ''; note = '' }
+        continue
+      }
+      if ($null -eq $curReal) { continue }
+      if ($raw -match "^\s+name:\s*'(.+?)'\s*$")  { $curReal.name  = $Matches[1]; continue }
+      if ($raw -match '^\s+group:\s*(\S+)\s*$')   { $curReal.group = $Matches[1]; continue }
+      if ($raw -match "^\s+note:\s*'(.*)'\s*$")   { $curReal.note  = $Matches[1]; continue }
+    }
   }
 }
 if ($curGroup) { $groups += [pscustomobject]$curGroup }
 if ($curNever) { $never  += [pscustomobject]$curNever }
 if ($curTest)  { $tests  += [pscustomobject]$curTest }
+if ($curReal)  { $reals  += [pscustomobject]$curReal }
 
 if ($groups.Count -eq 0) { throw 'No groups parsed' }
 if ($never.Count -eq 0)  { throw 'No never-grant nodes parsed - refusing to generate a ladder with no denials' }
@@ -188,6 +203,12 @@ foreach ($g in $groups) {
 & $a '# even if someone later grants the node further up the chain.'
 foreach ($n in $never) {
   & $a ("lp group admin permission set {0} false" -f $n.node)
+}
+& $a '# --- real accounts: the mapping from a human to a group ---'
+& $a '# `parent set` rather than `parent add`: it replaces whatever the user had, so'
+& $a '# re-running cannot accumulate group memberships and a demotion actually demotes.'
+foreach ($r in $reals) {
+  & $a ("lp user {0} parent set {1}" -f $r.uuid, $r.group)
 }
 & $a '# --- test accounts for acceptance 17.5 ---'
 foreach ($t in $tests) {

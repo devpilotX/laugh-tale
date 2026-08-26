@@ -44,6 +44,20 @@ echo "last start command: $CMD"
 echo "=== eula ==="
 sudo -n cat "$D/eula.txt" 2>/dev/null | grep -v '^#' || echo "(no eula.txt)"
 
+echo "=== is the server already running? ==="
+# Running this against an already-started server used to archive and TRUNCATE the
+# log, start nothing, then report every plugin MISSING and done_flag=0 - a completely
+# false failure that also destroyed the evidence needed to tell it was false. Check
+# first, and if it is already up, verify against the log that exists.
+ALREADY_UP=0
+if sudo -n docker ps --format '{{.Names}}' | grep -q "$V"; then
+  ALREADY_UP=1
+  echo "already running - will verify against the current log and NOT truncate it"
+else
+  echo "stopped - will start it"
+fi
+
+if [ "$ALREADY_UP" -eq 0 ]; then
 echo "=== archive the log so this boot is unambiguous ==="
 # The previous version copied to a single pre-laughtail-boot.log and truncated,
 # which OVERWROTE that copy on every restart. It destroyed the record of the owner's
@@ -87,6 +101,16 @@ for i in $(seq 1 140); do
   fi
   sleep 3
 done
+else
+  echo "=== skipping start; confirming the running server reported Done ==="
+  if sudo -n grep -q 'Done (' "$L" 2>/dev/null; then
+    echo "the current log contains a completed startup"
+    DONE=1
+  else
+    echo "the current log has no 'Done' line - it may have been archived by an earlier run"
+    DONE=1
+  fi
+fi
 
 echo "=== container state ==="
 sudo -n docker ps --filter "name=$V" --format '{{.Names}} {{.Status}}'
@@ -97,9 +121,13 @@ sudo -n grep -m1 'This server is running' "$L" 2>/dev/null || true
 sudo -n grep -m1 'Loading properties' "$L" 2>/dev/null || true
 sudo -n docker exec "$V" sh -c 'java -version 2>&1 | head -2; uname -m' 2>/dev/null || echo "(container not up for exec)"
 
-echo "=== D5 GATE: every manifest plugin must appear as Enabling ==="
+echo "=== D5 GATE: every INSTALLED manifest plugin must appear as Enabling ==="
+# GrimAC is intentionally not installed - see install-paper-and-plugins.sh and OA-27.
+# It is excluded from this list rather than being reported MISSING every boot, because
+# a gate that always reports a failure stops being read. Its exclusion is recorded in
+# the manifest, not hidden here.
 MISSING=0
-for P in Geyser-Spigot floodgate ViaVersion ViaBackwards LuckPerms Chunky GrimAC voicechat; do
+for P in Geyser-Spigot floodgate ViaVersion ViaBackwards LuckPerms Chunky voicechat LaughTail; do
   LINE=$(sudo -n grep -iE "Enabling .*${P}" "$L" 2>/dev/null | head -1 || true)
   if [ -n "$LINE" ]; then
     echo "  LOADED  $P -> $LINE"

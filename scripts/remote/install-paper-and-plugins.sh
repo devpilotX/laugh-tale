@@ -34,9 +34,22 @@ for f in Geyser-ViaProxy.jar FastAsyncWorldEdit-Paper-2.15.4.jar Chunky-Bukkit-1
   fi
 done
 
-echo "=== install the eight manifest plugins ==="
+echo "=== install the manifest plugins ==="
+# GrimAC IS DELIBERATELY ABSENT FROM THIS LIST. It is pinned in the manifest and
+# still downloaded and checksum-verified, but it is not installed, because it makes
+# the server unplayable for a client newer than 1.21.11: it predicts movement from
+# packets ViaVersion has translated, mispredicts, and sets the player back. Measured
+# on the owner's own session - Simulation violations in the hundreds at offsets of
+# 0.008 blocks, and "I cannot even sprint".
+#
+# Without this exclusion, every deploy would reinstall it and undo the fix, which is
+# precisely the kind of silent regression a deploy script should never cause.
+#
+# Re-add it here the moment OA-27 is decided - either the server moves to the client's
+# version, or old clients are dropped so no translation happens. Acceptance row 50
+# cannot be claimed until then, and has not been.
 for f in Geyser-Spigot.jar floodgate-spigot.jar ViaVersion-5.11.0.jar ViaBackwards-5.11.0.jar \
-         LuckPerms-Bukkit-5.5.71.jar Chunky-Bukkit-1.4.40.jar grimac-bukkit-2.3.73.jar \
+         LuckPerms-Bukkit-5.5.71.jar Chunky-Bukkit-1.4.40.jar \
          voicechat-bukkit-2.6.21.jar; do
   sudo -n cp "$S/$f" "$D/plugins/$f"
   sudo -n chown $OWN "$D/plugins/$f"

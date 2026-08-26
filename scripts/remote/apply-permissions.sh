@@ -144,6 +144,7 @@ lp group owner permission set laughtail.secrets.read true
 lp group owner permission set laughtail.whitelist.add true
 lp group owner permission set laughtail.whitelist.remove true
 lp group owner permission set laughtail.plugins.manage true
+lp group owner permission set laughtail.rules.bypass true
 # --- the never-grant list, as EXPLICIT DENIALS on admin ---
 # An explicit false beats an inherited true in LuckPerms, so these keep working
 # even if someone later grants the node further up the chain.
@@ -178,6 +179,10 @@ lp group admin permission set laughtail.whitelist.add false
 lp group admin permission set laughtail.whitelist.remove false
 lp group admin permission set laughtail.audit.read false
 lp group admin permission set laughtail.secrets.read false
+# --- real accounts: the mapping from a human to a group ---
+# `parent set` rather than `parent add`: it replaces whatever the user had, so
+# re-running cannot accumulate group memberships and a demotion actually demotes.
+lp user 263645f0-7a1b-4d45-a0c9-16d9b0d345d0 parent set owner
 # --- test accounts for acceptance 17.5 ---
 lp user 00000000-0000-4000-8000-0000000000ad parent set admin
 lp user 00000000-0000-4000-8000-00000000000b parent set helper
