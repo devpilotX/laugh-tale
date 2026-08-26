@@ -681,3 +681,30 @@ What I will do when it arrives: update server/manifest.yml, re-run the aarch64
 What I am doing meanwhile: nothing removed. Both plugins remain installed and
      loading. Recorded as questions.md Q-42.
 ```
+
+```
+BLOCKED - OA-28 Approve or amend the proposed numbers in docs/proposals.md
+What I need: a yes, a no, or a different figure for each proposal. Nothing in that
+     file is implemented and nothing will be until you say so.
+Why: three of the four things blocking whole phases are missing NUMBERS rather than
+     missing work - questions.md Q-10 (the economy has no figures anywhere in the
+     specification), Q-11 to Q-13 (Appendix B and Section 9 contradict each other on
+     the ranking maths), and OA-12 (the access price). I can build the machinery
+     around all of them, and have, but the machinery is inert without values.
+     Rather than ask you to invent thirteen numbers, docs/proposals.md contains a
+     concrete figure for each, how it was derived, and WHAT BREAKS IF IT IS WRONG in
+     each direction - so you are approving or amending rather than starting blank.
+Steps for the owner:
+  1. Read docs/proposals.md. It is thirteen items and each is a few lines.
+  2. Reply "approve P1" / "P1 should be 149" / "reject P1" per item.
+  3. If thirteen is too many at once, approve ONLY P1 (the access price) and P2
+     (target berries per hour). Those two unblock more than the other eleven
+     combined, and P3 to P10 are all expressed relative to P2 so they are not
+     meaningful until it is fixed.
+What I will do when it arrives: build Phase 1's paywall against P1, and the economy
+     skeleton against P2. Record each approved value in decisions.md with your
+     approval as its authority, so nobody later mistakes a proposal for a decision.
+What I am doing meanwhile: the parts of Phase 4 that do not need the ranking maths -
+     the season lifecycle, the reset job and its idempotency, the archive, and the
+     Champion mechanism. All of it is testable without a single rating point.
+```
