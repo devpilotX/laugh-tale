@@ -645,3 +645,39 @@ What I am doing meanwhile: treating both as live and never reading them again. T
      Section 22.7 migration step rotates every secret anyway, so this is a question
      of timing rather than of whether.
 ```
+
+
+```
+BLOCKED - OA-27 Choose between older-client support and a reliable anti-cheat
+What I need: a decision on whether LaughTail supports older Minecraft clients, or
+     requires 1.21.11 and up.
+Why: GrimAC prints this on every boot, unprompted -
+       "GrimAC has detected that you have installed ViaBackwards on a 1.21.2+
+        server. This setup is currently unsupported and you will experience issues
+        with older clients using vehicles."
+     Both plugins are installed because the specification asks for both: 4.3 wants
+     older-client support (ViaBackwards), 14.1 wants a simulation anti-cheat
+     (GrimAC). They do not cooperate - GrimAC predicts movement, ViaBackwards
+     rewrites the packets it predicts from.
+Why it matters more than a compatibility note: acceptance row 50 needs the
+     anti-cheat to catch a test flight and a test reach cheat. If predictions are
+     unreliable for some clients, either those players get punished for lag - on a
+     server that sells fairness, to people who paid - or the checks are relaxed for
+     them and that becomes the preferred client for cheating, which is worse than
+     no anti-cheat because it is invisible.
+Steps for the owner - pick one:
+  1. "Require 1.21.11+" - I remove ViaBackwards and ViaVersion from the manifest.
+     The store page must then state the version requirement BEFORE purchase, or a
+     buyer on an old client is a guaranteed refund. This is my recommendation: it
+     keeps the fairness promise absolute, and Minecraft's launcher auto-updates so
+     the affected group is small.
+  2. "Keep old clients" - I research a different anti-cheat. Expect it to be weaker
+     or paid; 14.1 says do not buy anti-cheat you have not proven you need.
+  3. "Keep both and accept it" - I will do this if you instruct it, but I will
+     record that the vendor calls it unsupported and that row 50 cannot then be
+     honestly claimed.
+What I will do when it arrives: update server/manifest.yml, re-run the aarch64
+     load proof, and note the version requirement for the store page (OA-10).
+What I am doing meanwhile: nothing removed. Both plugins remain installed and
+     loading. Recorded as questions.md Q-42.
+```

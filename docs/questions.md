@@ -386,3 +386,42 @@ They are working notes, not deliverables, and they are noisier than this file. B
 **This sharpens R3 from a worry into a conclusion:** this box cannot host the spec's 24-player heap *and* run the Pelican Panel. The options are a bigger instance, or moving the Panel off the game box, or a lower cap. All three are owner decisions with cost attached, and all three are cheaper to make now than after the Phase 6 load test is run on a configuration that has to change anyway.
 
 **What I did meanwhile:** left the working configuration in place - heap 2,048 MiB, rule 4 passing at 27.3%, swap disabled, zero errors - and did not quietly re-size the box's allocation, because the choice between "lower heap" and "fewer players" is a product decision, not a tuning one. Related: **OA-05** (burstable instance) and **R3** in `docs/progress.md`. Phase 6 must not be run until this is settled, for the same reason OA-05 must be settled: a cap measured on a configuration that is about to change is not a measurement.
+
+
+### Q-42 | SERIOUS | Two pinned plugins conflict, and the specification requires both
+
+**What the server says on every boot**, unprompted:
+
+```
+[GrimAC] GrimAC has detected that you have installed ViaBackwards on a 1.21.2+ server.
+[GrimAC] This setup is currently unsupported and you will experience issues with
+         older clients using vehicles.
+```
+
+**Both plugins are in the manifest because the specification asks for both:**
+
+* **4.3** wants older Java client support, which is what ViaVersion and ViaBackwards provide.
+* **14.1** wants a simulation-based anti-cheat, which is GrimAC.
+
+GrimAC works by simulating player movement and comparing it to what the client reports. ViaBackwards rewrites packets for older protocol versions, so the movement GrimAC simulates and the movement the client actually sent are no longer the same thing. The vendor's own warning says the combination is **unsupported**, and names vehicles specifically - boats and minecarts, which is where movement prediction is hardest.
+
+**Why this is not a small compatibility note.** Acceptance row 50 requires anti-cheat to catch a test flight and a test reach cheat with logged evidence. If GrimAC's predictions are unreliable for a subset of clients, then either:
+
+* those clients get **false positives** - paying players punished for lag, on a server whose entire proposition is fairness; or
+* GrimAC's checks are relaxed for them and they become the **preferred client for cheating**, which is worse than having no anti-cheat because it is invisible.
+
+Either outcome undermines Law 1 and Section 3.2's no-advantage rule, and neither is detectable without deliberately testing with an old client.
+
+**Three ways out, with what each costs:**
+
+| Option | Cost |
+| --- | --- |
+| **Drop ViaBackwards**, require 1.21.11+ clients | Loses 4.3's older-client support. Cleanest technically. On a **paid** server, the price is that a buyer on an older client cannot play - which is a refund, so the store page must state the version requirement plainly before purchase |
+| **Drop GrimAC**, use a different anti-cheat | 14.1 explicitly recommends starting with a movement-focused free anti-cheat, and GrimAC is that recommendation. Alternatives are weaker or paid |
+| **Keep both**, accept degraded checks for old clients | Unsupported by the vendor. Not defensible on a server that sells fairness |
+
+**My recommendation is the first**, because it is the only one that keeps the fairness promise absolute, and because Minecraft's own auto-updating launcher means the affected population is small. But it is **player-facing and revenue-affecting**, so it is the owner's call and not mine - raised as an owner action rather than decided.
+
+**What I have not done:** nothing has been removed from the manifest. ViaVersion and ViaBackwards remain installed and loading. Recorded rather than acted on.
+
+**Verified:** the warning appears in `logs/latest.log` on every boot, observed across multiple restarts this session. Both plugin versions are pinned with checksums in `server/manifest.yml` - ViaBackwards 5.11.0, GrimAC 2.3.73.

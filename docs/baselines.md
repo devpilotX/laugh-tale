@@ -86,3 +86,52 @@ What still has to fit into what remains: Chunky pregeneration (Phase 2), backup 
 ### Query performance, for what it is worth
 
 `V1__init.sql` applied in **379 ms** for five tables with foreign keys - nothing to tune. Recorded only so that a future migration taking materially longer is visibly different rather than merely feeling slow.
+
+
+---
+
+## B3 - idle steady state with everything Phase 0 requires running
+
+Eight consecutive monitor samples, 2026-08-26 05:02-05:10 UTC. Game server up, database up, permission ladder applied, backups and monitoring scheduled. **Zero players.**
+
+| Measure | Range across 8 samples |
+| --- | --- |
+| TPS (1m) | 19.7 - **20.0** |
+| MSPT average (1m) | **0.1 - 0.2 ms** once settled |
+| MSPT maximum (1m) | 1.2 - 756.8 ms (see below) |
+| Host memory available | **277 - 370 MB** |
+| Host swap in use | 140 - 158 MB, flat |
+| Disk | 60% used, 7.5 GB available |
+
+### Tick performance is not the problem
+
+MSPT settled to **0.1-0.2 ms average**, matching B1 exactly. The earlier readings of ~6 ms were traced to the deploy's own work being measured seven minutes after boot - `investigate-tick-cost.sh` sampled six times at ten-second intervals and watched it return to 0.2 ms. **No regression.** The baseline did its job: it made a transient look suspicious enough to check, and the check settled it.
+
+### Memory is the problem, and it is now measured rather than predicted
+
+Available memory oscillates in a **277-370 MB** band and does not trend downward - swap use is flat, so this is steady state, not a leak. The server is healthy. But that band is the entire remaining headroom of the machine **with nobody playing**, before Chunky pregeneration, before backup compression running beside the tick loop, and before a single paying player connects.
+
+This is **Q-41** with evidence attached rather than arithmetic. Three components have consumed the slack in this session, each of them *required*:
+
+| Change | Available memory after |
+| --- | --- |
+| Start of session (heap `-Xmx2304M`, growing on demand) | 1,844 MB of page cache |
+| Heap fixed at 2,048 MiB to satisfy never-break rule 4 | ~650 MB |
+| Database container added, as spec 5.2 requires | ~519 MB |
+| Permission ladder, monitoring, backups scheduled | **277-370 MB** |
+
+None of these is optional and none can be given back. The conclusion has not changed, it has hardened: spec 22.3's ~2.5 GB heap for 24 players cannot coexist with never-break rule 4 on a 3,825 MB box that also runs the Pelican Panel.
+
+### The 756 ms tick, and what it exposed about thresholds
+
+One sample recorded a 756.8 ms maximum against a 1.6 ms average in the same minute. Judged on the average that is a perfectly healthy server; in reality it contained a **three-quarter-second freeze** that every player online would have felt.
+
+The monitor's original thresholds only examined the average, so it passed silently. A maximum-based alert was added at 250 ms - five vanilla ticks' work in one tick. It fired on the spike and cleared once the spike aged out of the window.
+
+This is exactly the gap `docs/questions.md` **Q-16** records: row 19 says "MSPT under 25 ms" and names **no statistic and no sample window**, so the same server passes or fails depending on which number you read. On this data an average-based reading passes at 0.2 ms while a maximum-based reading fails at 756 ms.
+
+### A calibration lesson worth keeping
+
+The memory alert was first set at "under 400 MB". Eight samples showed the idle floor is ~277 MB, so it fired **every single time**. An alert that always fires is noise, and it trains people to ignore the channel - the same failure as a drift detector that reports drift on every boot.
+
+Thresholds now sit **below** the measured floor (220 MB warn, 120 MB severe) so they catch a *departure* from steady state. The steady state itself is not a per-sample alert; it is an owner decision, and it belongs in Q-41 where it can be acted on once instead of shouted about every five minutes.
