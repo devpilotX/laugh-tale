@@ -26,10 +26,14 @@ bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 echo "=== 1. the catalogue is priced at boot, not lazily ==="
 ROWS=$(q "SELECT COUNT(*) FROM shop_prices;")
 echo "  priced rows: $ROWS"
-if [ "$ROWS" -eq 40 ]; then
-  ok "the table matches the catalogue exactly ($ROWS rows) - no orphans, nothing missing"
+# A COUNT, NOT AN EXACT NUMBER. The catalogue is now generated from rarity bands rather than a hand
+# written list, so its exact size changes whenever a Minecraft version adds or renames a material.
+# Asserting an exact figure would make this test fail on every upgrade for no reason; asserting a floor
+# still catches the thing that matters, which is seeding not having run at all.
+if [ "$ROWS" -ge 500 ]; then
+  ok "$ROWS items priced - the catalogue seeded"
 else
-  bad "$ROWS priced rows against a catalogue of 40 - the table and the code disagree"
+  bad "only $ROWS priced rows; expected 500 or more. Seeding did not run"
 fi
 
 echo "=== 2. buy > sell for every row (no money printer) ==="
@@ -40,20 +44,22 @@ else
   bad "$BADSPREAD row(s) have sell >= buy - buying and selling back would print Berries"
 fi
 
-echo "=== 3. the P3 minimum spread of 12% ==="
+echo "=== 3. the minimum spread of 50% ==="
 # No tolerance and no exemption for cheap rows. FLOOR is the correct comparison because that is
 # what the code must do; ROUND here would let an 11.7% spread pass as if it were 12%.
-THIN=$(q "SELECT COUNT(*) FROM shop_prices WHERE sell_price > FLOOR(current_price * 0.88);")
+# 0.50 spread: sell must be at most half of buy, floored. Was 0.88 when the spread was 12%.
+THIN=$(q "SELECT COUNT(*) FROM shop_prices WHERE sell_price > FLOOR(current_price * 0.50);")
 if [ "$THIN" = "0" ]; then
-  ok "no row is thinner than 12%, with no tolerance and no exemptions"
+  ok "no row is thinner than the 50% spread, with no tolerance and no exemptions"
 else
-  bad "$THIN row(s) have a spread under 12%: $(q "SELECT item, current_price, sell_price FROM shop_prices WHERE sell_price > FLOOR(current_price*0.88) LIMIT 3;" | tr "\n" " ")"
+  bad "$THIN row(s) have a spread under 50%: $(q "SELECT item, current_price, sell_price FROM shop_prices WHERE sell_price > FLOOR(current_price*0.50) LIMIT 3;" | tr "\n" " ")"
 fi
 
-echo "=== 4. the P4 band, and the database enforcing it ==="
-OUT=$(q "SELECT COUNT(*) FROM shop_prices WHERE current_price < ROUND(base_price*0.6) OR current_price > ROUND(base_price*1.4);")
+echo "=== 4. the +/-20% band, and the database enforcing it ==="
+# V7 narrowed the band from +/-40% to +/-20%, which is what makes a 50% spread safe for recipes.
+OUT=$(q "SELECT COUNT(*) FROM shop_prices WHERE current_price < GREATEST(1, ROUND(base_price*0.8)) OR current_price > ROUND(base_price*1.2);")
 if [ "$OUT" = "0" ]; then
-  ok "every current price is inside +/-40% of base"
+  ok "every current price is inside +/-20% of base"
 else
   bad "$OUT row(s) escaped the band"
 fi
@@ -103,16 +109,16 @@ q "SELECT item, category, base_price, current_price, sell_price FROM shop_prices
 
 echo "=== 7. row 27: the spread holds at BOTH EXTREMES of the dynamic band ==="
 # Checking today's prices is not enough. Row 27 asks whether buy still exceeds sell by the minimum
-# spread at the FLOOR (0.6x base) and the CEILING (1.4x base) - the two places the elasticity can
+# spread at the floor (0.8x base) and the CEILING (1.4x base) - the two places the elasticity can
 # push a price. If the spread inverted at either end, a player could drive the price to that end
 # and then print Berries, and no test of the current price would ever notice.
 #
 # FLOOR(x * 0.88) is the same arithmetic Shop.sellPrice performs, applied to the extremes rather
 # than to the stored value.
-LOWBAD=$(q "SELECT COUNT(*) FROM shop_prices WHERE FLOOR(GREATEST(1, ROUND(base_price*0.6)) * 0.88) >= GREATEST(1, ROUND(base_price*0.6));")
-HIGHBAD=$(q "SELECT COUNT(*) FROM shop_prices WHERE FLOOR(ROUND(base_price*1.4) * 0.88) >= ROUND(base_price*1.4);")
-echo "  at the floor (0.6x base):   $LOWBAD item(s) would invert"
-echo "  at the ceiling (1.4x base): $HIGHBAD item(s) would invert"
+LOWBAD=$(q "SELECT COUNT(*) FROM shop_prices WHERE FLOOR(GREATEST(1, ROUND(base_price*0.8)) * 0.50) >= GREATEST(1, ROUND(base_price*0.8));")
+HIGHBAD=$(q "SELECT COUNT(*) FROM shop_prices WHERE FLOOR(ROUND(base_price*1.2) * 0.50) >= ROUND(base_price*1.2);")
+echo "  at the floor (0.8x base):   $LOWBAD item(s) would invert"
+echo "  at the ceiling (1.2x base): $HIGHBAD item(s) would invert"
 if [ "$LOWBAD" = "0" ] && [ "$HIGHBAD" = "0" ]; then
   ok "buy exceeds sell at both extremes for every item - the band cannot be driven to a profit"
 else
@@ -126,6 +132,8 @@ echo "=== 8. the cheapest items, where rounding is most dangerous ==="
 # less than they cost.
 q "SELECT item, current_price, sell_price FROM shop_prices WHERE current_price <= 4 ORDER BY current_price, item;" \
   | awk 'NF{printf "  %-20s buy %-4s sell %-4s %s\n",$1,$2,$3,($3<$2?"ok":"INVERTED")}'
+# Cobblestone at 1 sells for 0, which is honest rather than exploitable - so the assertion is that
+# sell is strictly BELOW buy, not that it is positive.
 CHEAPBAD=$(q "SELECT COUNT(*) FROM shop_prices WHERE current_price <= 4 AND sell_price >= current_price;")
 if [ "$CHEAPBAD" = "0" ]; then
   ok "every cheap item sells for strictly less than it costs"
