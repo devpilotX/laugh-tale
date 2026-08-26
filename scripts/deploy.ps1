@@ -132,6 +132,7 @@ Invoke-Stage -Name 'regenerate db migrate' -Local -LocalScript 'gen-db-migrate.p
 Invoke-Stage -Name 'regenerate backup schedule' -Local -LocalScript 'gen-schedule-backups.ps1'
 Invoke-Stage -Name 'regenerate permissions' -Local -LocalScript 'gen-permissions.ps1'
 Invoke-Stage -Name 'regenerate monitor schedule' -Local -LocalScript 'gen-schedule-monitor.ps1'
+Invoke-Stage -Name 'regenerate plugin build' -Local -LocalScript 'gen-build-plugin.ps1'
 
 # ---- 3. artefacts onto the host, verified there -------------------------------
 if (-not $SkipFetch) {
@@ -144,6 +145,19 @@ Invoke-Stage -Name 'database container' -Script 'scripts/remote/db-up.sh' -Confi
   -Reason 'deploy: ensure the db container exists'
 Invoke-Stage -Name 'schema migrations' -Script 'scripts/remote/db-migrate.sh' `
   -Reason 'deploy: apply pending migrations'
+
+# The plugin is compiled BEFORE the server is stopped, so a compile error costs no
+# downtime - the build fails, the deploy aborts, and the server is still running.
+Invoke-Stage -Name 'build the core plugin' -Script 'scripts/remote/build-plugin.sh' -Confirmed `
+  -Reason 'deploy: compile LaughTail from source on the host'
+
+# Plugin config is deployed BEFORE the stop, deliberately. It proves the game
+# container can actually reach the database with /dev/tcp, and that test needs the
+# container running. Writing it live is safe: unlike server.properties and Paper's
+# YAML, a plugin config is only READ at enable and this plugin never writes it back,
+# so there is nothing to be discarded at shutdown.
+Invoke-Stage -Name 'deploy plugin config' -Script 'scripts/remote/deploy-plugin-config.sh' -Confirmed `
+  -Reason 'deploy: plugin config with the database secret injected host-side'
 
 # ---- 5. stop, deploy config, start -------------------------------------------
 # server.properties and the Paper YAML are read at boot and REWRITTEN at shutdown,
@@ -169,6 +183,8 @@ if (-not $NoRestart) {
     -Reason 'deploy: Section 17 staff ladder with the never-grant list as explicit denials'
   Invoke-Stage -Name 'verify permissions (17.5)' -Script 'scripts/remote/verify-permissions.sh' `
     -Reason 'deploy: prove every never-grant node is denied and inheritance is correct'
+  Invoke-Stage -Name 'verify the core plugin' -Script 'scripts/remote/verify-plugin.sh' `
+    -Reason 'deploy: prove the plugin loaded and reached the database'
 }
 
 # ---- 6. prove the result matches the repository ------------------------------
