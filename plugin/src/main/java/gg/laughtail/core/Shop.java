@@ -109,6 +109,29 @@ final class Shop {
         add(Material.DRAGON_EGG,      "special", 8, 1);
     }
 
+    /**
+     * Last known price per item, for rendering only.
+     *
+     * A GUI must be built on the main thread, but prices live in the database and row 25 forbids
+     * querying there. Without a cache every menu render would either block the server or show
+     * nothing. Database.currentPrice writes through to this on every read, and the shop is seeded
+     * at boot, so the cache is populated before any player can open a menu. It is deliberately
+     * NEVER the source of truth for a transaction - buy and sell re-read the price under the
+     * transaction lock, because a stale cache used for a charge would let a player pay yesterday's
+     * price for today's item.
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<Material, Long> PRICE_CACHE =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    static void cachePrice(Material m, long price) { PRICE_CACHE.put(m, price); }
+
+    /** Display price. Falls back to base, which is the right answer before the first read. */
+    static long displayPrice(Material m) {
+        Entry e = CATALOGUE.get(m);
+        if (e == null) return 0L;
+        return PRICE_CACHE.getOrDefault(m, e.basePrice());
+    }
+
     private Shop() { }
 
     static Entry entry(Material m) {

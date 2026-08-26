@@ -48,11 +48,31 @@ final class Menu implements Listener {
 
     /** Stashes the real material on a button, so a greyed placeholder stays identifiable. */
     private final org.bukkit.NamespacedKey shopItemKey;
+    /**
+     * Marks a button as not-yet-built.
+     *
+     * This used to be inferred from the MATERIAL - a list of types treated as inert. That was
+     * fragile and had already broken: the Shop button became a real feature while still being a
+     * CHEST, so it landed in the inert list and the working button reported itself unbuilt. A
+     * marker written into the item is the thing the comment always claimed it was.
+     */
+    private final org.bukkit.NamespacedKey notBuiltKey;
     private final LaughTailPlugin plugin;
+    /**
+     * Players who clicked Search and are expected to type next.
+     *
+     * A CHAT PROMPT rather than an anvil rename box. An anvil GUI is the usual trick for text
+     * input, but it needs a real anvil inventory whose behaviour differs between versions, it
+     * shows a nonsense repair cost, and it does not work reliably for Bedrock players through
+     * Geyser - which 4.4 puts in scope. A chat prompt works identically for everyone.
+     */
+    private final java.util.Set<java.util.UUID> pendingSearch =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     Menu(LaughTailPlugin plugin) {
         this.plugin = plugin;
         this.shopItemKey = new org.bukkit.NamespacedKey(plugin, "shop_item");
+        this.notBuiltKey = new org.bukkit.NamespacedKey(plugin, "not_built");
     }
 
     // ---- building ------------------------------------------------------------
@@ -72,11 +92,19 @@ final class Menu implements Listener {
     }
 
     private ItemStack notBuilt(Material m, String name, String whatItWillDo, String blockedBy) {
-        return item(m, name, NamedTextColor.DARK_GRAY, List.of(
-            whatItWillDo,
-            "",
-            "NOT BUILT YET",
-            blockedBy));
+        ItemStack it = item(m, name, NamedTextColor.DARK_GRAY, List.of(
+            whatItWillDo, "", "NOT BUILT YET", blockedBy));
+        ItemMeta meta = it.getItemMeta();
+        meta.getPersistentDataContainer().set(notBuiltKey,
+            org.bukkit.persistence.PersistentDataType.BYTE, (byte) 1);
+        it.setItemMeta(meta);
+        return it;
+    }
+
+    private boolean isNotBuilt(ItemStack it) {
+        ItemMeta m = it.getItemMeta();
+        return m != null && m.getPersistentDataContainer().has(notBuiltKey,
+            org.bukkit.persistence.PersistentDataType.BYTE);
     }
 
     void openMain(Player p) {
@@ -191,7 +219,16 @@ final class Menu implements Listener {
      * The lock here is cosmetic. Row 40 is enforced in ShopService against the database, so a
      * client that fabricates a click on a locked slot is still refused.
      */
-    void openShop(Player p, String category) {
+    void openShop(Player p, String category) { openShop(p, category, null); }
+
+    /**
+     * The shop page, optionally filtered.
+     *
+     * `query` matches anywhere in the material name, case-insensitively, so "diamond" finds
+     * DIAMOND and "gold" finds both GOLD_INGOT and RAW_GOLD. Substring rather than prefix because
+     * players think in nouns, not in Bukkit enum order.
+     */
+    void openShop(Player p, String category, String query) {
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             final int tier;
             final java.util.Map<Material, Long> prices = new java.util.LinkedHashMap<>();
@@ -199,7 +236,7 @@ final class Menu implements Listener {
                 int season = plugin.database().activeSeason();
                 tier = Shop.tierForRp(plugin.database().currentRp(p.getUniqueId(), season));
                 for (var en : Shop.catalogue().values()) {
-                    if (category == null || en.category().equals(category)) {
+                    if (matches(en, category, query)) {
                         prices.put(en.material(), plugin.database().currentPrice(en));
                     }
                 }
@@ -210,14 +247,15 @@ final class Menu implements Listener {
                 return;
             }
             plugin.getServer().getScheduler().runTask(plugin, () -> {
-                String heading = category == null ? "Shop" : "Shop - " + category;
+                String heading = query != null ? "Shop - search: " + query
+                    : category == null ? "Shop" : "Shop - " + category;
                 Inventory inv = Bukkit.createInventory(
-                    new MenuHolder(category == null ? "shop" : "shop:" + category), 54,
+                    new MenuHolder("shop"), 54,
                     Component.text(heading + "  (your tier " + tier + "/8)",
                         NamedTextColor.GOLD));
                 int slot = 0;
                 for (var e : Shop.catalogue().values()) {
-                    if (category != null && !e.category().equals(category)) continue;
+                    if (!matches(e, category, query)) continue;
                     if (slot >= 45) break;
                     long buy = prices.getOrDefault(e.material(), e.basePrice());
                     boolean allowed = Shop.canBuy(tier, e);
@@ -257,14 +295,24 @@ final class Menu implements Listener {
                 inv.setItem(48, item(Material.OAK_LOG, "Wood", NamedTextColor.GOLD, List.of()));
                 inv.setItem(49, item(Material.NETHER_STAR, "Special",
                     NamedTextColor.LIGHT_PURPLE, List.of()));
-                inv.setItem(51, item(Material.HOPPER, "Sell everything sellable",
-                    NamedTextColor.YELLOW, List.of("Runs /sell all.",
+                inv.setItem(50, item(Material.COMPASS, "Search", NamedTextColor.AQUA, List.of(
+                    "Type a name in chat, such as diamond.",
+                    "Matches any part of the name.")));
+                inv.setItem(51, item(Material.HOPPER, "Sell box",
+                    NamedTextColor.YELLOW, List.of("Put items in, see the value, click Sell.",
                         "Daily limit: 3600 Berries per category.")));
                 inv.setItem(52, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
                 inv.setItem(53, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
                 p.openInventory(inv);
             });
         });
+    }
+
+    private boolean matches(Shop.Entry e, String category, String query) {
+        if (query != null) {
+            return e.material().name().toLowerCase().contains(query.toLowerCase());
+        }
+        return category == null || e.category().equals(category);
     }
 
     private void openAdmin(Player p) {
@@ -308,17 +356,10 @@ final class Menu implements Listener {
 
         // Unbuilt entries are inert BY MARKER, not by name, so renaming a label cannot
         // accidentally make a dead button live.
-        if (clicked.getType() == Material.CHEST || clicked.getType() == Material.GOLD_BLOCK
-         || clicked.getType() == Material.PAPER && holder.page.equals("main")
-         || clicked.getType() == Material.PLAYER_HEAD
-         || clicked.getType() == Material.ARMOR_STAND
-         || clicked.getType() == Material.OAK_SIGN
-         || clicked.getType() == Material.NOTE_BLOCK) {
-            if (holder.page.equals("main")) {
-                p.sendMessage(Component.text(name + " is not built yet. "
-                    + "The menu says so rather than pretending.", NamedTextColor.DARK_GRAY));
-                return;
-            }
+        if (isNotBuilt(clicked)) {
+            p.sendMessage(Component.text(name + " is not built yet. "
+                + "The menu says so rather than pretending.", NamedTextColor.DARK_GRAY));
+            return;
         }
 
         if (holder.page.startsWith("shop")) {
@@ -329,7 +370,13 @@ final class Menu implements Listener {
                 case "Wood"    -> openShop(p, "wood");
                 case "Special" -> openShop(p, "special");
                 case "Back"    -> openMain(p);
-                case "Sell everything sellable" -> { p.closeInventory(); run(p, "sell all"); }
+                case "Sell box" -> { p.closeInventory(); plugin.sellBox().open(p); }
+                case "Search" -> {
+                    p.closeInventory();
+                    pendingSearch.add(p.getUniqueId());
+                    p.sendMessage(Component.text("Type what you are looking for, or cancel.",
+                        NamedTextColor.AQUA));
+                }
                 default -> {
                     // Read the stashed material rather than the clicked type, because a locked
                     // row is rendered as GRAY_DYE and its own type would be meaningless.
@@ -395,4 +442,33 @@ final class Menu implements Listener {
         // commands as console would be a permission bypass wearing a friendly face.
         plugin.getServer().dispatchCommand(p, command);
     }
-}
+
+    /**
+     * Catches the typed search term.
+     *
+     * Handled at MONITOR with ignoreCancelled so a search term is never broadcast to chat - a
+     * player typing "diamond" to search should not appear to be announcing it. Runs on the async
+     * chat thread, so the menu is opened back on the main thread.
+     */
+    @EventHandler(priority = org.bukkit.event.EventPriority.LOWEST)
+    public void onChat(io.papermc.paper.event.player.AsyncChatEvent e) {
+        Player p = e.getPlayer();
+        if (!pendingSearch.remove(p.getUniqueId())) return;
+        e.setCancelled(true);
+        String typed = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
+            .plainText().serialize(e.message()).trim();
+        if (typed.isEmpty() || typed.equalsIgnoreCase("cancel")) {
+            plugin.getServer().getScheduler().runTask(plugin, () -> openShop(p, null, null));
+            return;
+        }
+        // Bound the query. An unbounded string would be put into an inventory title, and a very
+        // long title is a client-side crash on some versions.
+        final String q = typed.length() > 32 ? typed.substring(0, 32) : typed;
+        plugin.getServer().getScheduler().runTask(plugin, () -> openShop(p, null, q));
+    }
+
+    @EventHandler
+    public void onSearchQuit(org.bukkit.event.player.PlayerQuitEvent e) {
+        // Otherwise a player who quits mid-prompt would have their next message eaten on rejoin.
+        pendingSearch.remove(e.getPlayer().getUniqueId());
+    }}

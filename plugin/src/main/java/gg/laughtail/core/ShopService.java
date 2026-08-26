@@ -74,7 +74,15 @@ final class ShopService {
     }
 
     private boolean sell(Player p, String[] args) {
-        final String mode = args.length > 0 ? args[0].toLowerCase() : "hand";
+        // Bare /sell opens the box, because that is what the owner asked for and it is the better
+        // default: you can see what you are selling and what it is worth before committing. The
+        // typed forms stay, because they are faster once you know what you want and because a
+        // GUI is unusable from a script or a macro.
+        if (args.length == 0) {
+            plugin.sellBox().open(p);
+            return true;
+        }
+        final String mode = args[0].toLowerCase();
         if (mode.equals("all")) return sellAll(p);
 
         ItemStack held = p.getInventory().getItemInMainHand();
@@ -250,4 +258,75 @@ final class ShopService {
             if (p.isOnline()) p.sendMessage(c);
         });
     }
-}
+
+    /**
+     * Sells a list of stacks taken out of the sell box, putting back whatever could not be sold.
+     *
+     * Each stack is sold on its own transaction rather than one big one. That is deliberate: a
+     * daily cap that bites halfway through should sell what it can and return the rest, not fail
+     * the whole box. The alternative - all or nothing - would mean a player near their cap could
+     * sell nothing at all, which reads as a broken shop rather than as a limit.
+     */
+    void sellStacks(Player p, java.util.List<ItemStack> stacks, org.bukkit.inventory.Inventory box,
+                    SellBox sellBox) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            long totalPaid = 0;
+            int totalUnits = 0;
+            long finalBalance = -1;
+            boolean capped = false;
+            java.util.List<ItemStack> back = new java.util.ArrayList<>();
+
+            for (ItemStack st : stacks) {
+                Shop.Entry e = Shop.entry(st.getType());
+                if (e == null) { back.add(st); continue; }
+                try {
+                    long unitBuy = db.currentPrice(e);
+                    long unitSell = Shop.sellPrice(unitBuy);
+                    if (unitSell <= 0) { back.add(st); continue; }
+                    Database.SellResult r = db.sell(p.getUniqueId(), e, st.getAmount(), unitSell);
+                    if (r.soldUnits() <= 0) {
+                        capped = true;
+                        back.add(st);
+                        continue;
+                    }
+                    totalPaid += r.paid();
+                    totalUnits += r.soldUnits();
+                    finalBalance = r.balance();
+                    if (r.soldUnits() < st.getAmount()) {
+                        // Partially sold: the cap stopped it. Return the remainder rather than
+                        // keeping items that were never paid for.
+                        capped = true;
+                        ItemStack rest = st.clone();
+                        rest.setAmount(st.getAmount() - r.soldUnits());
+                        back.add(rest);
+                    }
+                } catch (SQLException ex) {
+                    // Nothing was committed for this stack, so it goes back intact. Losing a
+                    // stack to a database hiccup is not acceptable.
+                    plugin.getLogger().log(Level.SEVERE, "sell box failed on "
+                        + st.getType() + ": " + ex.getMessage());
+                    back.add(st);
+                }
+            }
+
+            final long paid = totalPaid;
+            final int units = totalUnits;
+            final long bal = finalBalance;
+            final boolean wasCapped = capped;
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                for (ItemStack st : back) sellBox.putBack(p, box, st);
+                if (units > 0) {
+                    p.sendMessage(Component.text("Sold " + units + " item(s) for " + paid
+                        + " Berries. Balance " + bal + ".", NamedTextColor.GREEN));
+                } else {
+                    p.sendMessage(Component.text("Nothing was sold.", NamedTextColor.GRAY));
+                }
+                if (wasCapped) {
+                    p.sendMessage(Component.text(
+                        "Some items were left in the box - the 3600 daily limit for that "
+                      + "category is reached. It resets at midnight UTC.",
+                        NamedTextColor.YELLOW));
+                }
+            });
+        });
+    }}

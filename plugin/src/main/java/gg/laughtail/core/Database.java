@@ -1099,7 +1099,10 @@ public final class Database {
                     long current = rs.getLong(1);
                     long base = rs.getLong(2);
                     int hours = rs.getInt(3);
-                    if (hours <= 0 || current == base) return current;
+                    if (hours <= 0 || current == base) {
+                        Shop.cachePrice(e.material(), current);
+                        return current;
+                    }
                     // P5: 5% of the gap per hour, compounded over the elapsed hours.
                     double gap = current - base;
                     double recovered = gap * Math.pow(1.0 - 0.05, Math.min(hours, 240));
@@ -1114,6 +1117,7 @@ public final class Database {
                             up.executeUpdate();
                         }
                     }
+                    Shop.cachePrice(e.material(), next);
                     return next;
                 }
             }

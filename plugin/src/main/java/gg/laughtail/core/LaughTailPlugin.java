@@ -47,6 +47,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Menu menu;
     private Hud hud;
     private ShopService shopService;
+    private SellBox sellBox;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -90,6 +91,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.menu = new Menu(this);
         getServer().getPluginManager().registerEvents(menu, this);
         this.shopService = new ShopService(this, database);
+        this.sellBox = new SellBox(this, shopService);
+        getServer().getPluginManager().registerEvents(sellBox, this);
         // Seed the price table at boot rather than lazily on first trade. A price table that
         // only materialises when someone buys something means the arbitrage audit and the
         // invariant tests see an empty catalogue on a fresh database - they would pass by
@@ -153,7 +156,31 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         });
     }
 
+    /**
+     * Shutdown. Empties every open sell box back to its owner first.
+     *
+     * A GUI inventory lives only in memory. Items left in one when the server stops are simply
+     * gone - which is why servers that get this wrong generate a steady stream of "the shop ate my
+     * stuff" reports. Never-break rule 14 says do not leave the server in a broken state; a player
+     * down a stack of diamonds because of a restart qualifies.
+     */
+    @Override
+    public void onDisable() {
+        if (sellBox != null) {
+            try {
+                sellBox.returnAllOnShutdown();
+            } catch (RuntimeException e) {
+                getLogger().warning("Could not empty every sell box on shutdown: "
+                    + e.getMessage());
+            }
+        }
+        getLogger().info("LaughTail disabled cleanly.");
+    }
     Database database() { return database; }
+
+    SellBox sellBox() { return sellBox; }
+
+    Menu menu() { return menu; }
 
     String rulesVersion() { return rulesVersion; }
     List<String> rulesText() { return rulesText; }

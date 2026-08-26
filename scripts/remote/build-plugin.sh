@@ -403,6 +403,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Menu menu;
     private Hud hud;
     private ShopService shopService;
+    private SellBox sellBox;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -446,6 +447,8 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.menu = new Menu(this);
         getServer().getPluginManager().registerEvents(menu, this);
         this.shopService = new ShopService(this, database);
+        this.sellBox = new SellBox(this, shopService);
+        getServer().getPluginManager().registerEvents(sellBox, this);
         // Seed the price table at boot rather than lazily on first trade. A price table that
         // only materialises when someone buys something means the arbitrage audit and the
         // invariant tests see an empty catalogue on a fresh database - they would pass by
@@ -509,7 +512,31 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         });
     }
 
+    /**
+     * Shutdown. Empties every open sell box back to its owner first.
+     *
+     * A GUI inventory lives only in memory. Items left in one when the server stops are simply
+     * gone - which is why servers that get this wrong generate a steady stream of "the shop ate my
+     * stuff" reports. Never-break rule 14 says do not leave the server in a broken state; a player
+     * down a stack of diamonds because of a restart qualifies.
+     */
+    @Override
+    public void onDisable() {
+        if (sellBox != null) {
+            try {
+                sellBox.returnAllOnShutdown();
+            } catch (RuntimeException e) {
+                getLogger().warning("Could not empty every sell box on shutdown: "
+                    + e.getMessage());
+            }
+        }
+        getLogger().info("LaughTail disabled cleanly.");
+    }
     Database database() { return database; }
+
+    SellBox sellBox() { return sellBox; }
+
+    Menu menu() { return menu; }
 
     String rulesVersion() { return rulesVersion; }
     List<String> rulesText() { return rulesText; }
@@ -1988,7 +2015,10 @@ public final class Database {
                     long current = rs.getLong(1);
                     long base = rs.getLong(2);
                     int hours = rs.getInt(3);
-                    if (hours <= 0 || current == base) return current;
+                    if (hours <= 0 || current == base) {
+                        Shop.cachePrice(e.material(), current);
+                        return current;
+                    }
                     // P5: 5% of the gap per hour, compounded over the elapsed hours.
                     double gap = current - base;
                     double recovered = gap * Math.pow(1.0 - 0.05, Math.min(hours, 240));
@@ -2003,6 +2033,7 @@ public final class Database {
                             up.executeUpdate();
                         }
                     }
+                    Shop.cachePrice(e.material(), next);
                     return next;
                 }
             }
@@ -4924,11 +4955,31 @@ final class Menu implements Listener {
 
     /** Stashes the real material on a button, so a greyed placeholder stays identifiable. */
     private final org.bukkit.NamespacedKey shopItemKey;
+    /**
+     * Marks a button as not-yet-built.
+     *
+     * This used to be inferred from the MATERIAL - a list of types treated as inert. That was
+     * fragile and had already broken: the Shop button became a real feature while still being a
+     * CHEST, so it landed in the inert list and the working button reported itself unbuilt. A
+     * marker written into the item is the thing the comment always claimed it was.
+     */
+    private final org.bukkit.NamespacedKey notBuiltKey;
     private final LaughTailPlugin plugin;
+    /**
+     * Players who clicked Search and are expected to type next.
+     *
+     * A CHAT PROMPT rather than an anvil rename box. An anvil GUI is the usual trick for text
+     * input, but it needs a real anvil inventory whose behaviour differs between versions, it
+     * shows a nonsense repair cost, and it does not work reliably for Bedrock players through
+     * Geyser - which 4.4 puts in scope. A chat prompt works identically for everyone.
+     */
+    private final java.util.Set<java.util.UUID> pendingSearch =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     Menu(LaughTailPlugin plugin) {
         this.plugin = plugin;
         this.shopItemKey = new org.bukkit.NamespacedKey(plugin, "shop_item");
+        this.notBuiltKey = new org.bukkit.NamespacedKey(plugin, "not_built");
     }
 
     // ---- building ------------------------------------------------------------
@@ -4948,11 +4999,19 @@ final class Menu implements Listener {
     }
 
     private ItemStack notBuilt(Material m, String name, String whatItWillDo, String blockedBy) {
-        return item(m, name, NamedTextColor.DARK_GRAY, List.of(
-            whatItWillDo,
-            "",
-            "NOT BUILT YET",
-            blockedBy));
+        ItemStack it = item(m, name, NamedTextColor.DARK_GRAY, List.of(
+            whatItWillDo, "", "NOT BUILT YET", blockedBy));
+        ItemMeta meta = it.getItemMeta();
+        meta.getPersistentDataContainer().set(notBuiltKey,
+            org.bukkit.persistence.PersistentDataType.BYTE, (byte) 1);
+        it.setItemMeta(meta);
+        return it;
+    }
+
+    private boolean isNotBuilt(ItemStack it) {
+        ItemMeta m = it.getItemMeta();
+        return m != null && m.getPersistentDataContainer().has(notBuiltKey,
+            org.bukkit.persistence.PersistentDataType.BYTE);
     }
 
     void openMain(Player p) {
@@ -5067,7 +5126,16 @@ final class Menu implements Listener {
      * The lock here is cosmetic. Row 40 is enforced in ShopService against the database, so a
      * client that fabricates a click on a locked slot is still refused.
      */
-    void openShop(Player p, String category) {
+    void openShop(Player p, String category) { openShop(p, category, null); }
+
+    /**
+     * The shop page, optionally filtered.
+     *
+     * `query` matches anywhere in the material name, case-insensitively, so "diamond" finds
+     * DIAMOND and "gold" finds both GOLD_INGOT and RAW_GOLD. Substring rather than prefix because
+     * players think in nouns, not in Bukkit enum order.
+     */
+    void openShop(Player p, String category, String query) {
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             final int tier;
             final java.util.Map<Material, Long> prices = new java.util.LinkedHashMap<>();
@@ -5075,7 +5143,7 @@ final class Menu implements Listener {
                 int season = plugin.database().activeSeason();
                 tier = Shop.tierForRp(plugin.database().currentRp(p.getUniqueId(), season));
                 for (var en : Shop.catalogue().values()) {
-                    if (category == null || en.category().equals(category)) {
+                    if (matches(en, category, query)) {
                         prices.put(en.material(), plugin.database().currentPrice(en));
                     }
                 }
@@ -5086,14 +5154,15 @@ final class Menu implements Listener {
                 return;
             }
             plugin.getServer().getScheduler().runTask(plugin, () -> {
-                String heading = category == null ? "Shop" : "Shop - " + category;
+                String heading = query != null ? "Shop - search: " + query
+                    : category == null ? "Shop" : "Shop - " + category;
                 Inventory inv = Bukkit.createInventory(
-                    new MenuHolder(category == null ? "shop" : "shop:" + category), 54,
+                    new MenuHolder("shop"), 54,
                     Component.text(heading + "  (your tier " + tier + "/8)",
                         NamedTextColor.GOLD));
                 int slot = 0;
                 for (var e : Shop.catalogue().values()) {
-                    if (category != null && !e.category().equals(category)) continue;
+                    if (!matches(e, category, query)) continue;
                     if (slot >= 45) break;
                     long buy = prices.getOrDefault(e.material(), e.basePrice());
                     boolean allowed = Shop.canBuy(tier, e);
@@ -5133,14 +5202,24 @@ final class Menu implements Listener {
                 inv.setItem(48, item(Material.OAK_LOG, "Wood", NamedTextColor.GOLD, List.of()));
                 inv.setItem(49, item(Material.NETHER_STAR, "Special",
                     NamedTextColor.LIGHT_PURPLE, List.of()));
-                inv.setItem(51, item(Material.HOPPER, "Sell everything sellable",
-                    NamedTextColor.YELLOW, List.of("Runs /sell all.",
+                inv.setItem(50, item(Material.COMPASS, "Search", NamedTextColor.AQUA, List.of(
+                    "Type a name in chat, such as diamond.",
+                    "Matches any part of the name.")));
+                inv.setItem(51, item(Material.HOPPER, "Sell box",
+                    NamedTextColor.YELLOW, List.of("Put items in, see the value, click Sell.",
                         "Daily limit: 3600 Berries per category.")));
                 inv.setItem(52, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
                 inv.setItem(53, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
                 p.openInventory(inv);
             });
         });
+    }
+
+    private boolean matches(Shop.Entry e, String category, String query) {
+        if (query != null) {
+            return e.material().name().toLowerCase().contains(query.toLowerCase());
+        }
+        return category == null || e.category().equals(category);
     }
 
     private void openAdmin(Player p) {
@@ -5184,17 +5263,10 @@ final class Menu implements Listener {
 
         // Unbuilt entries are inert BY MARKER, not by name, so renaming a label cannot
         // accidentally make a dead button live.
-        if (clicked.getType() == Material.CHEST || clicked.getType() == Material.GOLD_BLOCK
-         || clicked.getType() == Material.PAPER && holder.page.equals("main")
-         || clicked.getType() == Material.PLAYER_HEAD
-         || clicked.getType() == Material.ARMOR_STAND
-         || clicked.getType() == Material.OAK_SIGN
-         || clicked.getType() == Material.NOTE_BLOCK) {
-            if (holder.page.equals("main")) {
-                p.sendMessage(Component.text(name + " is not built yet. "
-                    + "The menu says so rather than pretending.", NamedTextColor.DARK_GRAY));
-                return;
-            }
+        if (isNotBuilt(clicked)) {
+            p.sendMessage(Component.text(name + " is not built yet. "
+                + "The menu says so rather than pretending.", NamedTextColor.DARK_GRAY));
+            return;
         }
 
         if (holder.page.startsWith("shop")) {
@@ -5205,7 +5277,13 @@ final class Menu implements Listener {
                 case "Wood"    -> openShop(p, "wood");
                 case "Special" -> openShop(p, "special");
                 case "Back"    -> openMain(p);
-                case "Sell everything sellable" -> { p.closeInventory(); run(p, "sell all"); }
+                case "Sell box" -> { p.closeInventory(); plugin.sellBox().open(p); }
+                case "Search" -> {
+                    p.closeInventory();
+                    pendingSearch.add(p.getUniqueId());
+                    p.sendMessage(Component.text("Type what you are looking for, or cancel.",
+                        NamedTextColor.AQUA));
+                }
                 default -> {
                     // Read the stashed material rather than the clicked type, because a locked
                     // row is rendered as GRAY_DYE and its own type would be meaningless.
@@ -5271,7 +5349,36 @@ final class Menu implements Listener {
         // commands as console would be a permission bypass wearing a friendly face.
         plugin.getServer().dispatchCommand(p, command);
     }
-}
+
+    /**
+     * Catches the typed search term.
+     *
+     * Handled at MONITOR with ignoreCancelled so a search term is never broadcast to chat - a
+     * player typing "diamond" to search should not appear to be announcing it. Runs on the async
+     * chat thread, so the menu is opened back on the main thread.
+     */
+    @EventHandler(priority = org.bukkit.event.EventPriority.LOWEST)
+    public void onChat(io.papermc.paper.event.player.AsyncChatEvent e) {
+        Player p = e.getPlayer();
+        if (!pendingSearch.remove(p.getUniqueId())) return;
+        e.setCancelled(true);
+        String typed = net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
+            .plainText().serialize(e.message()).trim();
+        if (typed.isEmpty() || typed.equalsIgnoreCase("cancel")) {
+            plugin.getServer().getScheduler().runTask(plugin, () -> openShop(p, null, null));
+            return;
+        }
+        // Bound the query. An unbounded string would be put into an inventory title, and a very
+        // long title is a client-side crash on some versions.
+        final String q = typed.length() > 32 ? typed.substring(0, 32) : typed;
+        plugin.getServer().getScheduler().runTask(plugin, () -> openShop(p, null, q));
+    }
+
+    @EventHandler
+    public void onSearchQuit(org.bukkit.event.player.PlayerQuitEvent e) {
+        // Otherwise a player who quits mid-prompt would have their next message eaten on rejoin.
+        pendingSearch.remove(e.getPlayer().getUniqueId());
+    }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Menu_java
 
 # ---- src/main/java/gg/laughtail/core/Hud.java ----
@@ -5627,6 +5734,29 @@ final class Shop {
         add(Material.DRAGON_EGG,      "special", 8, 1);
     }
 
+    /**
+     * Last known price per item, for rendering only.
+     *
+     * A GUI must be built on the main thread, but prices live in the database and row 25 forbids
+     * querying there. Without a cache every menu render would either block the server or show
+     * nothing. Database.currentPrice writes through to this on every read, and the shop is seeded
+     * at boot, so the cache is populated before any player can open a menu. It is deliberately
+     * NEVER the source of truth for a transaction - buy and sell re-read the price under the
+     * transaction lock, because a stale cache used for a charge would let a player pay yesterday's
+     * price for today's item.
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<Material, Long> PRICE_CACHE =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    static void cachePrice(Material m, long price) { PRICE_CACHE.put(m, price); }
+
+    /** Display price. Falls back to base, which is the right answer before the first read. */
+    static long displayPrice(Material m) {
+        Entry e = CATALOGUE.get(m);
+        if (e == null) return 0L;
+        return PRICE_CACHE.getOrDefault(m, e.basePrice());
+    }
+
     private Shop() { }
 
     static Entry entry(Material m) {
@@ -5794,7 +5924,15 @@ final class ShopService {
     }
 
     private boolean sell(Player p, String[] args) {
-        final String mode = args.length > 0 ? args[0].toLowerCase() : "hand";
+        // Bare /sell opens the box, because that is what the owner asked for and it is the better
+        // default: you can see what you are selling and what it is worth before committing. The
+        // typed forms stay, because they are faster once you know what you want and because a
+        // GUI is unusable from a script or a macro.
+        if (args.length == 0) {
+            plugin.sellBox().open(p);
+            return true;
+        }
+        final String mode = args[0].toLowerCase();
         if (mode.equals("all")) return sellAll(p);
 
         ItemStack held = p.getInventory().getItemInMainHand();
@@ -5970,8 +6108,411 @@ final class ShopService {
             if (p.isOnline()) p.sendMessage(c);
         });
     }
-}
+
+    /**
+     * Sells a list of stacks taken out of the sell box, putting back whatever could not be sold.
+     *
+     * Each stack is sold on its own transaction rather than one big one. That is deliberate: a
+     * daily cap that bites halfway through should sell what it can and return the rest, not fail
+     * the whole box. The alternative - all or nothing - would mean a player near their cap could
+     * sell nothing at all, which reads as a broken shop rather than as a limit.
+     */
+    void sellStacks(Player p, java.util.List<ItemStack> stacks, org.bukkit.inventory.Inventory box,
+                    SellBox sellBox) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            long totalPaid = 0;
+            int totalUnits = 0;
+            long finalBalance = -1;
+            boolean capped = false;
+            java.util.List<ItemStack> back = new java.util.ArrayList<>();
+
+            for (ItemStack st : stacks) {
+                Shop.Entry e = Shop.entry(st.getType());
+                if (e == null) { back.add(st); continue; }
+                try {
+                    long unitBuy = db.currentPrice(e);
+                    long unitSell = Shop.sellPrice(unitBuy);
+                    if (unitSell <= 0) { back.add(st); continue; }
+                    Database.SellResult r = db.sell(p.getUniqueId(), e, st.getAmount(), unitSell);
+                    if (r.soldUnits() <= 0) {
+                        capped = true;
+                        back.add(st);
+                        continue;
+                    }
+                    totalPaid += r.paid();
+                    totalUnits += r.soldUnits();
+                    finalBalance = r.balance();
+                    if (r.soldUnits() < st.getAmount()) {
+                        // Partially sold: the cap stopped it. Return the remainder rather than
+                        // keeping items that were never paid for.
+                        capped = true;
+                        ItemStack rest = st.clone();
+                        rest.setAmount(st.getAmount() - r.soldUnits());
+                        back.add(rest);
+                    }
+                } catch (SQLException ex) {
+                    // Nothing was committed for this stack, so it goes back intact. Losing a
+                    // stack to a database hiccup is not acceptable.
+                    plugin.getLogger().log(Level.SEVERE, "sell box failed on "
+                        + st.getType() + ": " + ex.getMessage());
+                    back.add(st);
+                }
+            }
+
+            final long paid = totalPaid;
+            final int units = totalUnits;
+            final long bal = finalBalance;
+            final boolean wasCapped = capped;
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                for (ItemStack st : back) sellBox.putBack(p, box, st);
+                if (units > 0) {
+                    p.sendMessage(Component.text("Sold " + units + " item(s) for " + paid
+                        + " Berries. Balance " + bal + ".", NamedTextColor.GREEN));
+                } else {
+                    p.sendMessage(Component.text("Nothing was sold.", NamedTextColor.GRAY));
+                }
+                if (wasCapped) {
+                    p.sendMessage(Component.text(
+                        "Some items were left in the box - the 3600 daily limit for that "
+                      + "category is reached. It resets at midnight UTC.",
+                        NamedTextColor.YELLOW));
+                }
+            });
+        });
+    }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_ShopService_java
+
+# ---- src/main/java/gg/laughtail/core/SellBox.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/SellBox.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_SellBox_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextDecoration;
+import org.bukkit.Bukkit;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * The sell box. Drop items in, see what they are worth, click once to sell.
+ *
+ * THIS IS THE ONE MENU THAT IS A REAL CONTAINER. Every other page cancels every click, because a
+ * display that lets you take the buttons out is broken. Here the opposite is required: the deposit
+ * area must accept items, so clicks in slots 0-44 are deliberately NOT cancelled while clicks on
+ * the control row still are.
+ *
+ * WHICH CREATES THE ONLY WAY TO LOSE ITEMS IN THIS PLUGIN, so it is handled three times over:
+ *
+ *   1. On close, everything still in the box is returned to the player's inventory, and anything
+ *      that will not fit is dropped at their feet rather than deleted.
+ *   2. On quit - which does NOT always fire a close event first - the same return runs, and items
+ *      that cannot fit are dropped in the world where they can be picked back up.
+ *   3. On disable, every open sell box is emptied back to its owner, so a restart mid-session
+ *      cannot swallow a stack.
+ *
+ * A GUI inventory is not saved anywhere. Items left in one at shutdown are simply gone, which is
+ * why servers that get this wrong generate constant "the shop ate my stuff" reports. The box is
+ * treated as a loan, never as storage.
+ *
+ * SHIFT-CLICK IS INTERCEPTED rather than allowed. Bukkit's own shift-click moves a stack to the
+ * first free slot, which can be a control slot - so a shift-clicked stack could land on top of the
+ * Sell button. Placement is done by hand into the deposit area only.
+ */
+final class SellBox implements Listener {
+
+    /** Marks an inventory as a sell box. A client cannot fabricate a holder. */
+    static final class SellHolder implements InventoryHolder {
+        private final java.util.UUID owner;
+        private SellHolder(java.util.UUID owner) { this.owner = owner; }
+        @Override public Inventory getInventory() { return null; }
+    }
+
+    /** Slots 0-44 accept items. 45-53 are controls. */
+    private static final int DEPOSIT_END = 45;
+    private static final int SLOT_INFO = 49;
+    private static final int SLOT_SELL = 48;
+    private static final int SLOT_BACK = 45;
+    private static final int SLOT_CLOSE = 53;
+
+    private final LaughTailPlugin plugin;
+    private final ShopService shop;
+
+    SellBox(LaughTailPlugin plugin, ShopService shop) {
+        this.plugin = plugin;
+        this.shop = shop;
+    }
+
+    void open(Player p) {
+        Inventory inv = Bukkit.createInventory(new SellHolder(p.getUniqueId()), 54,
+            Component.text("Sell - put items in, then click Sell", NamedTextColor.GREEN));
+        decorate(inv, 0L, 0);
+        p.openInventory(inv);
+    }
+
+    /** Draws the control row and the running total. */
+    private void decorate(Inventory inv, long value, int count) {
+        inv.setItem(SLOT_BACK, button(Material.ARROW, "Back to menu", NamedTextColor.GRAY,
+            List.of("Your items come back with you.")));
+        inv.setItem(SLOT_SELL, button(Material.HOPPER,
+            count == 0 ? "Sell - the box is empty" : "Sell " + count + " item(s)",
+            count == 0 ? NamedTextColor.DARK_GRAY : NamedTextColor.GREEN,
+            count == 0
+                ? List.of("Drag items in from your inventory.",
+                          "Anything the shop does not buy stays put.")
+                : List.of("You receive " + value + " Berries.",
+                          "Daily limit is 3600 per category;",
+                          "anything over it is left in the box.")));
+        inv.setItem(SLOT_INFO, button(Material.PAPER, "Value: " + value + " Berries",
+            NamedTextColor.GOLD, List.of(
+                "Prices move with trade, so this is",
+                "what the shop pays right now.",
+                "Selling is never rank-gated.")));
+        inv.setItem(SLOT_CLOSE, button(Material.BARRIER, "Close", NamedTextColor.RED,
+            List.of("Your items come back with you.")));
+        // Fill the rest of the control row so the boundary is visible rather than implied.
+        for (int i = DEPOSIT_END; i < 54; i++) {
+            if (inv.getItem(i) == null) {
+                inv.setItem(i, button(Material.GRAY_STAINED_GLASS_PANE, " ",
+                    NamedTextColor.DARK_GRAY, List.of()));
+            }
+        }
+    }
+
+    private ItemStack button(Material m, String name, NamedTextColor c, List<String> lore) {
+        ItemStack it = new ItemStack(m);
+        ItemMeta meta = it.getItemMeta();
+        meta.displayName(Component.text(name, c).decoration(TextDecoration.ITALIC, false));
+        if (!lore.isEmpty()) {
+            meta.lore(lore.stream()
+                .map(s -> (Component) Component.text(s, NamedTextColor.GRAY)
+                    .decoration(TextDecoration.ITALIC, false))
+                .toList());
+        }
+        it.setItemMeta(meta);
+        return it;
+    }
+
+    /** What the deposit area is currently worth, and how many units it holds. */
+    private long[] valueOf(Inventory inv) {
+        long value = 0;
+        int count = 0;
+        for (int i = 0; i < DEPOSIT_END; i++) {
+            ItemStack it = inv.getItem(i);
+            if (it == null || it.getType() == Material.AIR) continue;
+            Shop.Entry e = Shop.entry(it.getType());
+            if (e == null) continue;
+            long unit = Shop.sellPrice(Shop.displayPrice(it.getType()));
+            value += unit * it.getAmount();
+            count += it.getAmount();
+        }
+        return new long[] { value, count };
+    }
+
+    private void refresh(Inventory inv) {
+        long[] v = valueOf(inv);
+        decorate(inv, v[0], (int) v[1]);
+    }
+
+    // ---- events --------------------------------------------------------------
+
+    @EventHandler
+    public void onClick(InventoryClickEvent e) {
+        if (!(e.getInventory().getHolder() instanceof SellHolder)) return;
+        if (!(e.getWhoClicked() instanceof Player p)) return;
+        Inventory box = e.getInventory();
+        int raw = e.getRawSlot();
+
+        // A click in the player's own inventory. Shift-click is intercepted because Bukkit would
+        // move the stack to the first free slot, which could be a control slot.
+        if (raw >= box.getSize()) {
+            if (e.isShiftClick()) {
+                e.setCancelled(true);
+                ItemStack moving = e.getCurrentItem();
+                if (moving == null || moving.getType() == Material.AIR) return;
+                if (Shop.entry(moving.getType()) == null) {
+                    p.sendMessage(Component.text("The shop does not buy "
+                        + moving.getType().name() + ".", NamedTextColor.GRAY));
+                    return;
+                }
+                int placed = placeInDeposit(box, moving.clone());
+                if (placed <= 0) {
+                    p.sendMessage(Component.text("The sell box is full.", NamedTextColor.YELLOW));
+                    return;
+                }
+                moving.setAmount(moving.getAmount() - placed);
+                if (moving.getAmount() <= 0) e.setCurrentItem(null);
+                refresh(box);
+            } else {
+                // A normal click in your own inventory is left alone, then the total is redrawn
+                // a tick later once Bukkit has finished moving the item.
+                plugin.getServer().getScheduler().runTask(plugin, () -> refresh(box));
+            }
+            return;
+        }
+
+        if (raw >= DEPOSIT_END) {
+            e.setCancelled(true);
+            ItemStack clicked = e.getCurrentItem();
+            if (clicked == null) return;
+            switch (clicked.getType()) {
+                case BARRIER -> p.closeInventory();
+                case ARROW -> {
+                    returnItems(p, box);
+                    plugin.getServer().getScheduler().runTask(plugin,
+                        () -> plugin.menu().openMain(p));
+                }
+                case HOPPER -> sellContents(p, box);
+                default -> { }
+            }
+            return;
+        }
+
+        // Slots 0-44: a real container. Not cancelled, so items can be put in and taken back out.
+        // Non-sellable items are refused at the point of placement, because discovering it only
+        // at checkout is worse feedback.
+        ItemStack placing = e.getCursor();
+        if (placing != null && placing.getType() != Material.AIR
+                && Shop.entry(placing.getType()) == null) {
+            e.setCancelled(true);
+            p.sendMessage(Component.text("The shop does not buy " + placing.getType().name()
+                + ". Nothing was taken.", NamedTextColor.GRAY));
+            return;
+        }
+        plugin.getServer().getScheduler().runTask(plugin, () -> refresh(box));
+    }
+
+    @EventHandler
+    public void onDrag(InventoryDragEvent e) {
+        if (!(e.getInventory().getHolder() instanceof SellHolder)) return;
+        // A drag that touches the control row is refused entirely rather than partially applied -
+        // a half-applied drag is how items end up on top of buttons.
+        for (int raw : e.getRawSlots()) {
+            if (raw < e.getInventory().getSize() && raw >= DEPOSIT_END) {
+                e.setCancelled(true);
+                return;
+            }
+        }
+        if (e.getOldCursor() != null && Shop.entry(e.getOldCursor().getType()) == null) {
+            e.setCancelled(true);
+            if (e.getWhoClicked() instanceof Player p) {
+                p.sendMessage(Component.text("The shop does not buy "
+                    + e.getOldCursor().getType().name() + ".", NamedTextColor.GRAY));
+            }
+            return;
+        }
+        Inventory box = e.getInventory();
+        plugin.getServer().getScheduler().runTask(plugin, () -> refresh(box));
+    }
+
+    @EventHandler
+    public void onClose(InventoryCloseEvent e) {
+        if (!(e.getInventory().getHolder() instanceof SellHolder)) return;
+        if (e.getPlayer() instanceof Player p) returnItems(p, e.getInventory());
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        // A quit does not reliably fire a close first. Without this, logging out with a full box
+        // would delete the contents.
+        Inventory top = e.getPlayer().getOpenInventory().getTopInventory();
+        if (top.getHolder() instanceof SellHolder) returnItems(e.getPlayer(), top);
+    }
+
+    /** Empties every open sell box back to its owner. Called from onDisable. */
+    void returnAllOnShutdown() {
+        for (Player p : plugin.getServer().getOnlinePlayers()) {
+            Inventory top = p.getOpenInventory().getTopInventory();
+            if (top.getHolder() instanceof SellHolder) {
+                returnItems(p, top);
+                p.closeInventory();
+            }
+        }
+    }
+
+    /** Puts everything in the deposit area back, dropping what will not fit. Never deletes. */
+    private void returnItems(Player p, Inventory box) {
+        for (int i = 0; i < DEPOSIT_END; i++) {
+            ItemStack it = box.getItem(i);
+            if (it == null || it.getType() == Material.AIR) continue;
+            box.setItem(i, null);
+            for (ItemStack leftover : p.getInventory().addItem(it).values()) {
+                // Dropped rather than discarded. A dropped item can be picked up; a deleted one
+                // is a support ticket.
+                p.getWorld().dropItemNaturally(p.getLocation(), leftover);
+            }
+        }
+    }
+
+    private int placeInDeposit(Inventory box, ItemStack stack) {
+        int remaining = stack.getAmount();
+        int max = stack.getMaxStackSize();
+        for (int i = 0; i < DEPOSIT_END && remaining > 0; i++) {
+            ItemStack slot = box.getItem(i);
+            if (slot == null || slot.getType() == Material.AIR) {
+                ItemStack put = stack.clone();
+                put.setAmount(Math.min(remaining, max));
+                box.setItem(i, put);
+                remaining -= put.getAmount();
+            } else if (slot.isSimilar(stack) && slot.getAmount() < max) {
+                int room = Math.min(max - slot.getAmount(), remaining);
+                slot.setAmount(slot.getAmount() + room);
+                remaining -= room;
+            }
+        }
+        return stack.getAmount() - remaining;
+    }
+
+    /**
+     * Sells the box.
+     *
+     * Items are taken out of the box FIRST and held, then sold; anything the sale could not take -
+     * a daily cap, a worthless item - is put back. Selling straight from the box would leave a
+     * window where a second click could sell the same stack twice.
+     */
+    private void sellContents(Player p, Inventory box) {
+        List<ItemStack> held = new ArrayList<>();
+        for (int i = 0; i < DEPOSIT_END; i++) {
+            ItemStack it = box.getItem(i);
+            if (it == null || it.getType() == Material.AIR) continue;
+            held.add(it.clone());
+            box.setItem(i, null);
+        }
+        if (held.isEmpty()) {
+            p.sendMessage(Component.text("The box is empty. Put items in first.",
+                NamedTextColor.GRAY));
+            return;
+        }
+        refresh(box);
+        shop.sellStacks(p, held, box, this);
+    }
+
+    /** Puts a stack back into the box, or into the player if the box is gone. */
+    void putBack(Player p, Inventory box, ItemStack stack) {
+        int placed = placeInDeposit(box, stack);
+        if (placed < stack.getAmount()) {
+            ItemStack rest = stack.clone();
+            rest.setAmount(stack.getAmount() - placed);
+            for (ItemStack leftover : p.getInventory().addItem(rest).values()) {
+                p.getWorld().dropItemNaturally(p.getLocation(), leftover);
+            }
+        }
+        refresh(box);
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_SellBox_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do
