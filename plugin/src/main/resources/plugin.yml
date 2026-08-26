@@ -9,6 +9,15 @@ description: The LaughTail core. Access, rules gate, player registry.
 # otherwise would let it load on a server it cannot run correctly on.
 
 commands:
+  shop:
+    description: Show your shop tier and how to buy and sell.
+    usage: /shop
+  sell:
+    description: Sell what you are holding, or everything sellable.
+    usage: /sell [hand|all]
+  buy:
+    description: Buy from the shop. Tier-gated by rank (row 40).
+    usage: /buy <item> [amount]
   laughtail:
     description: LaughTail administration. Never use vanilla /reload (never-break rule 7).
     usage: /laughtail <status|reload>

@@ -1039,6 +1039,240 @@ public final class Database {
         }
     }
 
+    // ---- shop ----------------------------------------------------------------
+
+    record SellResult(int soldUnits, long paid, long balance, long cappedAt) { }
+    record BuyResult(boolean ok, long balance) { }
+
+    /**
+     * The current buy price, creating the row from the derived base on first sight.
+     *
+     * Also applies P5's recovery: prices drift 5% of the gap back toward base per hour since the
+     * last trade. Doing it lazily on read rather than with a scheduled sweep means there is no
+     * background job walking every item, and a price nobody looks at costs nothing to keep correct.
+     */
+    long currentPrice(Shop.Entry e) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            try (PreparedStatement ps = c.prepareStatement(
+                    "INSERT INTO shop_prices (item, category, base_price, current_price, "
+                  + "sell_price, updated_at) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3)) "
+                  + "ON DUPLICATE KEY UPDATE updated_at = updated_at")) {
+                ps.setString(1, e.material().name());
+                ps.setString(2, e.category());
+                ps.setLong(3, e.basePrice());
+                ps.setLong(4, e.basePrice());
+                ps.setLong(5, Shop.sellPrice(e.basePrice()));
+                ps.executeUpdate();
+            }
+            // Self-heal a sell price that disagrees with Shop.sellPrice. Rows written before the
+            // spread was floored rather than rounded are a Berry high, and rather than a one-off
+            // migration this corrects on read - which also means ANY future drift between the
+            // stored value and the single source of truth repairs itself instead of quietly
+            // sitting in the table waiting for the invariant test to find it.
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT current_price, sell_price FROM shop_prices WHERE item = ?")) {
+                ps.setString(1, e.material().name());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        long cur = rs.getLong(1);
+                        long stored = rs.getLong(2);
+                        long correct = Shop.sellPrice(cur);
+                        if (stored != correct) {
+                            try (PreparedStatement fix = c.prepareStatement(
+                                    "UPDATE shop_prices SET sell_price = ? WHERE item = ?")) {
+                                fix.setLong(1, correct);
+                                fix.setString(2, e.material().name());
+                                fix.executeUpdate();
+                            }
+                        }
+                    }
+                }
+            }
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT current_price, base_price, "
+                  + "TIMESTAMPDIFF(HOUR, IFNULL(last_trade_at, updated_at), UTC_TIMESTAMP(3)) "
+                  + "FROM shop_prices WHERE item = ?")) {
+                ps.setString(1, e.material().name());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return e.basePrice();
+                    long current = rs.getLong(1);
+                    long base = rs.getLong(2);
+                    int hours = rs.getInt(3);
+                    if (hours <= 0 || current == base) return current;
+                    // P5: 5% of the gap per hour, compounded over the elapsed hours.
+                    double gap = current - base;
+                    double recovered = gap * Math.pow(1.0 - 0.05, Math.min(hours, 240));
+                    long next = Math.round(base + recovered);
+                    if (next != current) {
+                        try (PreparedStatement up = c.prepareStatement(
+                                "UPDATE shop_prices SET current_price = ?, sell_price = ?, "
+                              + "updated_at = UTC_TIMESTAMP(3) WHERE item = ?")) {
+                            up.setLong(1, next);
+                            up.setLong(2, Shop.sellPrice(next));
+                            up.setString(3, e.material().name());
+                            up.executeUpdate();
+                        }
+                    }
+                    return next;
+                }
+            }
+        }
+    }
+
+    /**
+     * Sells up to `amount`, respecting P6's daily category cap, and moves the price down by P4's
+     * elasticity.
+     *
+     * The cap is read, applied and the payment made in ONE transaction. Checking the cap and then
+     * paying separately would let two simultaneous sales both see the same remaining allowance -
+     * which is how a daily cap becomes a daily suggestion.
+     */
+    SellResult sell(UUID uuid, Shop.Entry e, int amount, long unitSell) throws SQLException {
+        assertOffMainThread();
+        final long DAILY_CAP = 3600L;   // P6
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, uuid);
+                lockBalance(c, uuid);
+
+                long already;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT berries FROM daily_sell_totals WHERE uuid = ? "
+                      + "AND sell_date = UTC_DATE() AND category = ? FOR UPDATE")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, e.category());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        already = rs.next() ? rs.getLong(1) : 0L;
+                    }
+                }
+                long headroom = DAILY_CAP - already;
+                if (headroom <= 0) {
+                    c.rollback();
+                    return new SellResult(0, 0, balanceIn(c, uuid), DAILY_CAP);
+                }
+                int units = (int) Math.min(amount, headroom / unitSell);
+                if (units <= 0) {
+                    c.rollback();
+                    return new SellResult(0, 0, balanceIn(c, uuid), DAILY_CAP);
+                }
+                long paid = units * unitSell;
+
+                long bal = readLocked(c, uuid) + paid;
+                writeBalance(c, uuid, bal, paid, 0);
+                ledger(c, uuid, paid, bal, "shop_sell", null, e.material().name(), units,
+                    "sold to shop at " + unitSell + " each");
+
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO daily_sell_totals (uuid, sell_date, category, berries, updated_at) "
+                      + "VALUES (?, UTC_DATE(), ?, ?, UTC_TIMESTAMP(3)) "
+                      + "ON DUPLICATE KEY UPDATE berries = berries + VALUES(berries), "
+                      + "updated_at = UTC_TIMESTAMP(3)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, e.category());
+                    ps.setLong(3, paid);
+                    ps.executeUpdate();
+                }
+
+                movePrice(c, e, -units);
+                c.commit();
+                long capped = (already + paid) >= DAILY_CAP ? DAILY_CAP : 0L;
+                return new SellResult(units, paid, bal, capped);
+            } catch (SQLException ex) {
+                c.rollback();
+                throw ex;
+            }
+        }
+    }
+
+    BuyResult buy(UUID uuid, Shop.Entry e, int amount, long unit) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, uuid);
+                lockBalance(c, uuid);
+                long bal = readLocked(c, uuid);
+                long total = unit * amount;
+                if (bal < total) {
+                    c.rollback();
+                    return new BuyResult(false, bal);
+                }
+                long after = bal - total;
+                writeBalance(c, uuid, after, 0, total);
+                ledger(c, uuid, -total, after, "shop_buy", null, e.material().name(), amount,
+                    "bought from shop at " + unit + " each");
+                movePrice(c, e, amount);
+                c.commit();
+                return new BuyResult(true, after);
+            } catch (SQLException ex) {
+                c.rollback();
+                throw ex;
+            }
+        }
+    }
+
+    private long balanceIn(Connection c, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT berries FROM balances WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0L;
+            }
+        }
+    }
+
+    /**
+     * P4's elasticity: 0.15 per 1,000 units, clamped to the +/-40% band.
+     *
+     * The band is clamped HERE as well as being a CHECK constraint, so the code fails politely
+     * rather than throwing on a constraint violation - but the constraint remains as the thing
+     * that makes the band true even if this arithmetic is ever wrong.
+     */
+    private void movePrice(Connection c, Shop.Entry e, int unitsDelta) throws SQLException {
+        long base = e.basePrice();
+        long floor = Math.max(1L, Math.round(base * 0.6));
+        long ceil = Math.round(base * 1.4);
+
+        // Read the current price under the transaction's lock, then compute in Java.
+        //
+        // The earlier version did the arithmetic in SQL, which meant the 12% spread existed in
+        // TWO places - Shop.sellPrice and an expression in this statement - and they had already
+        // drifted: one rounded and the other floored, so a diamond sold for 106 instead of 105
+        // and the spread came out at 11.7% against a stated minimum of 12%. Computing here and
+        // calling Shop.sellPrice makes that impossible by construction: there is one function
+        // that knows what the spread is, and both the display price and the stored price come
+        // from it.
+        long current;
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT current_price FROM shop_prices WHERE item = ? FOR UPDATE")) {
+            ps.setString(1, e.material().name());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return;
+                current = rs.getLong(1);
+            }
+        }
+
+        // P4: 0.15 per 1,000 units, clamped to the band. Buying pushes the price up, selling
+        // pushes it down - so the market punishes dumping and rewards scarcity, which is the
+        // whole point of a dynamic price.
+        double factor = 1.0 + (0.15 * unitsDelta / 1000.0);
+        long next = Math.max(floor, Math.min(ceil, Math.round(current * factor)));
+        long nextSell = Shop.sellPrice(next);
+
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE shop_prices SET current_price = ?, sell_price = ?, "
+              + "units_traded = units_traded + ?, last_trade_at = UTC_TIMESTAMP(3), "
+              + "updated_at = UTC_TIMESTAMP(3) WHERE item = ?")) {
+            ps.setLong(1, next);
+            ps.setLong(2, nextSell);
+            ps.setInt(3, Math.abs(unitsDelta));
+            ps.setString(4, e.material().name());
+            ps.executeUpdate();
+        }
+    }
+
     /** Kills and deaths, for the HUD. Returns {kills, deaths}, zeroes when unrecorded. */
     int[] killsAndDeaths(UUID uuid) throws SQLException {
         assertOffMainThread();

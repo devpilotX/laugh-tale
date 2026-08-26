@@ -35,7 +35,9 @@ $files = @(
   'src/main/java/gg/laughtail/core/Teleports.java',
   'src/main/java/gg/laughtail/core/ResourceWorldGuard.java',
   'src/main/java/gg/laughtail/core/Menu.java',
-  'src/main/java/gg/laughtail/core/Hud.java'
+  'src/main/java/gg/laughtail/core/Hud.java',
+  'src/main/java/gg/laughtail/core/Shop.java',
+  'src/main/java/gg/laughtail/core/ShopService.java'
 )
 
 foreach ($f in $files) {

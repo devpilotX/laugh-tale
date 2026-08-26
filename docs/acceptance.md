@@ -182,3 +182,39 @@ The never-grant list is applied as **explicit denials** on `admin`, not merely l
 For the same reason the **Owner group does not use a wildcard**. A wildcard is itself on 17.3's list because it silently grants everything added in future. The Owner's thirteen elevated nodes are listed one by one, which is more work and makes the Owner's power auditable. The wildcard audit confirms no group holds `*`.
 
 **Shell access to the host** is on 17.3's list and is not a Minecraft permission, so it cannot be denied in LuckPerms. It is controlled by SSH key distribution - key-only authentication with passwords disabled, verified session 1, and no staff member holds a key. Recorded so the list closes honestly rather than looking like an oversight.
+
+## Row 40 - shop tier gating (PARTIAL, database side proven)
+
+`scripts/remote/test-shop.sh`, 2026-08-26. Six assertions, all pass:
+
+* 44 catalogue rows priced at boot - asserted first, because an empty price table would pass
+  every other invariant by examining nothing.
+* No row has `sell_price >= current_price`. This is the structural reason buying and selling back
+  cannot yield a profit.
+* No row is thinner than P3's 12% spread, **with no tolerance and no exemption for cheap items**.
+* Every price inside P4's +/-40% band, and the database REFUSED a direct SQL update to 99x base:
+  `ERROR 4025 (23000) CONSTRAINT chk_price_band failed`. That is the price-table equivalent of a
+  modified client - going straight at the data, bypassing the plugin.
+* **No `tier` column exists.** Row 40's gate comes from the catalogue compiled into the jar,
+  checked against rank read from the database. There is deliberately nothing stored that a player,
+  or a careless admin, could edit to grant themselves Tier 8.
+* The daily sell cap is keyed `(uuid, sell_date, category)`, so rotating between similar items
+  cannot dodge P6.
+
+**What this does NOT yet prove:** a live player at Tier 1 being refused a Tier 8 purchase in game.
+The refusal path exists in `ShopService.buyItem` - it reads rank from the database, refuses, and
+writes a `buy.tier_refused` audit row - but it needs an in-game run to claim the row. The GUI greys
+locked items; that is cosmetic and is stated as such in the code, because the menu dispatches
+`/buy` as the player and so hits the same server-side check a typed command would.
+
+### A bug this test found, which is the point of writing it
+
+The first run reported DIAMOND at an **11.7% spread against a stated minimum of 12%**. Cause: the
+sell price was computed in two places - `Shop.sellPrice` in Java and an expression inside the
+`movePrice` SQL - and they disagreed, one rounding half-up where the other floored. Under a Berry
+per unit, invisible to any player, and compounding over every trade forever.
+
+Fixed by removing the duplication rather than by correcting both copies: `movePrice` now reads the
+price under its transaction lock and calls `Shop.sellPrice`, so one function knows what the spread
+is. `currentPrice` additionally repairs any stored sell price that disagrees, on read - so drift
+self-heals instead of waiting for a test to find it. Re-run: DIAMOND 12.5%, all 44 rows compliant.

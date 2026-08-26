@@ -46,6 +46,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private ResourceWorldGuard resourceGuard;
     private Menu menu;
     private Hud hud;
+    private ShopService shopService;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -88,6 +89,12 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         resourceGuard.start();
         this.menu = new Menu(this);
         getServer().getPluginManager().registerEvents(menu, this);
+        this.shopService = new ShopService(this, database);
+        // Seed the price table at boot rather than lazily on first trade. A price table that
+        // only materialises when someone buys something means the arbitrage audit and the
+        // invariant tests see an empty catalogue on a fresh database - they would pass by
+        // examining nothing. Idempotent: currentPrice inserts only when the row is absent.
+        seedShopCatalogue();
         this.hud = new Hud(this, database);
         getServer().getPluginManager().registerEvents(hud, this);
         hud.start();
@@ -129,6 +136,23 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     }
 
     /** Exposed so the menu can read homes without a second Database reference. */
+    private void seedShopCatalogue() {
+        getServer().getScheduler().runTaskAsynchronously(this, () -> {
+            int made = 0;
+            try {
+                for (Shop.Entry e : Shop.catalogue().values()) {
+                    database.currentPrice(e);
+                    made++;
+                }
+                getLogger().info("Shop catalogue priced from P2: " + made + " items, spread "
+                    + (int) (Shop.SPREAD * 100) + "%, target " + Shop.HOUR + " Berries/hour.");
+            } catch (java.sql.SQLException ex) {
+                getLogger().warning("Shop seeding stopped after " + made + " items: "
+                    + ex.getMessage() + ". The shop will still price lazily on first trade.");
+            }
+        });
+    }
+
     Database database() { return database; }
 
     String rulesVersion() { return rulesVersion; }
@@ -266,6 +290,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (economy.handle(sender, name, args)) return true;
         if (homes.handle(sender, name, args)) return true;
         if (teleports.handle(sender, name, args)) return true;
+        if (shopService.handle(sender, name, args)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }
@@ -429,6 +454,30 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
                 });
                 return true;
             }
+            if (args[0].equalsIgnoreCase("shopseed")) {
+                // Prices are created lazily on first read, which means a fresh database has an
+                // empty price table until someone trades. That is fine in play but useless for
+                // testing an invariant across the whole catalogue, so this walks every entry and
+                // forces the row into existence. It is idempotent - currentPrice inserts only if
+                // absent - so running it twice changes nothing.
+                getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                    int made = 0;
+                    try {
+                        for (Shop.Entry e : Shop.catalogue().values()) {
+                            database.currentPrice(e);
+                            made++;
+                        }
+                    } catch (java.sql.SQLException ex) {
+                        getLogger().warning("shopseed failed after " + made + ": " + ex.getMessage());
+                    }
+                    final int n = made;
+                    getServer().getScheduler().runTask(this, () -> sender.sendMessage(
+                        Component.text("Shop catalogue seeded: " + n + " of "
+                            + Shop.catalogue().size() + " priced from P2.", NamedTextColor.GREEN)));
+                });
+                return true;
+            }
+
             if (args[0].equalsIgnoreCase("rating")) {
                 if (!sender.hasPermission("laughtail.status")) {
                     sender.sendMessage(Component.text("No permission.", NamedTextColor.RED));

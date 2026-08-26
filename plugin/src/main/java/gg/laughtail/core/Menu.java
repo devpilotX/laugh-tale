@@ -46,10 +46,13 @@ final class Menu implements Listener {
         @Override public Inventory getInventory() { return null; }
     }
 
+    /** Stashes the real material on a button, so a greyed placeholder stays identifiable. */
+    private final org.bukkit.NamespacedKey shopItemKey;
     private final LaughTailPlugin plugin;
 
     Menu(LaughTailPlugin plugin) {
         this.plugin = plugin;
+        this.shopItemKey = new org.bukkit.NamespacedKey(plugin, "shop_item");
     }
 
     // ---- building ------------------------------------------------------------
@@ -105,8 +108,10 @@ final class Menu implements Listener {
             "The rules you accepted, and their version.")));
 
         // --- honestly unbuilt ---
-        inv.setItem(19, notBuilt(Material.CHEST, "Shop",
-            "Buy and sell at dynamic prices.", "Waiting on: the derived price table"));
+        inv.setItem(19, item(Material.CHEST, "Shop", NamedTextColor.GOLD, List.of(
+            "Buy and sell at prices that move with trade.",
+            "Selling is never tier-gated. Buying is.",
+            "Daily sell limit: 3600 Berries per category.")));
         inv.setItem(20, notBuilt(Material.GOLD_BLOCK, "Auction House",
             "List items for other players to buy.", "Waiting on: Phase 3"));
         inv.setItem(21, notBuilt(Material.PAPER, "Orders / Bazaar",
@@ -176,6 +181,92 @@ final class Menu implements Listener {
         });
     }
 
+    /**
+     * The shop page. Category buttons, then items with live prices.
+     *
+     * Locked items are SHOWN, greyed, with the tier they need - rather than hidden. Hiding them
+     * would make rank feel like nothing exists beyond your tier; showing them is the entire
+     * incentive to rank up, and it is honest about what the ladder is for.
+     *
+     * The lock here is cosmetic. Row 40 is enforced in ShopService against the database, so a
+     * client that fabricates a click on a locked slot is still refused.
+     */
+    void openShop(Player p, String category) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final int tier;
+            final java.util.Map<Material, Long> prices = new java.util.LinkedHashMap<>();
+            try {
+                int season = plugin.database().activeSeason();
+                tier = Shop.tierForRp(plugin.database().currentRp(p.getUniqueId(), season));
+                for (var en : Shop.catalogue().values()) {
+                    if (category == null || en.category().equals(category)) {
+                        prices.put(en.material(), plugin.database().currentPrice(en));
+                    }
+                }
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read shop prices.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                String heading = category == null ? "Shop" : "Shop - " + category;
+                Inventory inv = Bukkit.createInventory(
+                    new MenuHolder(category == null ? "shop" : "shop:" + category), 54,
+                    Component.text(heading + "  (your tier " + tier + "/8)",
+                        NamedTextColor.GOLD));
+                int slot = 0;
+                for (var e : Shop.catalogue().values()) {
+                    if (category != null && !e.category().equals(category)) continue;
+                    if (slot >= 45) break;
+                    long buy = prices.getOrDefault(e.material(), e.basePrice());
+                    boolean allowed = Shop.canBuy(tier, e);
+                    List<String> lore = new java.util.ArrayList<>();
+                    lore.add("Buy  " + buy + " Berries each");
+                    long sp = Shop.sellPrice(buy);
+                    lore.add(sp > 0 ? "Sell " + sp + " Berries each"
+                                    : "Sell - worth nothing, too common");
+                    lore.add("");
+                    if (allowed) {
+                        lore.add("Left click  buy 1");
+                        lore.add("Right click buy 16");
+                        lore.add("Selling is never tier-gated.");
+                    } else {
+                        lore.add("LOCKED - needs shop tier " + e.tier());
+                        lore.add("You are tier " + tier + ".");
+                        lore.add("Rank up by winning fights. There is");
+                        lore.add("no way to buy this unlock.");
+                    }
+                    ItemStack it = new ItemStack(allowed ? e.material() : Material.GRAY_DYE);
+                    var meta = it.getItemMeta();
+                    meta.displayName(Component.text(e.material().name(),
+                        allowed ? NamedTextColor.WHITE : NamedTextColor.DARK_GRAY)
+                        .decoration(net.kyori.adventure.text.format.TextDecoration.ITALIC, false));
+                    meta.lore(lore.stream().map(s -> Component.text(s, NamedTextColor.GRAY)
+                        .decoration(net.kyori.adventure.text.format.TextDecoration.ITALIC, false))
+                        .map(c -> (Component) c).toList());
+                    // The real material is stashed so a greyed GRAY_DYE still knows what it is.
+                    meta.getPersistentDataContainer().set(shopItemKey,
+                        org.bukkit.persistence.PersistentDataType.STRING, e.material().name());
+                    it.setItemMeta(meta);
+                    inv.setItem(slot++, it);
+                }
+                inv.setItem(45, item(Material.IRON_PICKAXE, "Ore", NamedTextColor.AQUA, List.of()));
+                inv.setItem(46, item(Material.WHEAT, "Farm", NamedTextColor.GREEN, List.of()));
+                inv.setItem(47, item(Material.BONE, "Drops", NamedTextColor.WHITE, List.of()));
+                inv.setItem(48, item(Material.OAK_LOG, "Wood", NamedTextColor.GOLD, List.of()));
+                inv.setItem(49, item(Material.NETHER_STAR, "Special",
+                    NamedTextColor.LIGHT_PURPLE, List.of()));
+                inv.setItem(51, item(Material.HOPPER, "Sell everything sellable",
+                    NamedTextColor.YELLOW, List.of("Runs /sell all.",
+                        "Daily limit: 3600 Berries per category.")));
+                inv.setItem(52, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(53, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
+
     private void openAdmin(Player p) {
         Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
             Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
@@ -230,6 +321,32 @@ final class Menu implements Listener {
             }
         }
 
+        if (holder.page.startsWith("shop")) {
+            switch (name) {
+                case "Ore"     -> openShop(p, "ore");
+                case "Farm"    -> openShop(p, "farm");
+                case "Drops"   -> openShop(p, "drops");
+                case "Wood"    -> openShop(p, "wood");
+                case "Special" -> openShop(p, "special");
+                case "Back"    -> openMain(p);
+                case "Sell everything sellable" -> { p.closeInventory(); run(p, "sell all"); }
+                default -> {
+                    // Read the stashed material rather than the clicked type, because a locked
+                    // row is rendered as GRAY_DYE and its own type would be meaningless.
+                    var buttonMeta = clicked.getItemMeta();
+                    if (buttonMeta == null) return;
+                    String mat = buttonMeta.getPersistentDataContainer().get(shopItemKey,
+                        org.bukkit.persistence.PersistentDataType.STRING);
+                    if (mat == null) return;
+                    int qty = e.isRightClick() ? 16 : 1;
+                    // Dispatched as the player, so ShopService applies the row 40 check exactly
+                    // as it would for a typed command. The greying is cosmetic; this is not.
+                    run(p, "buy " + mat + " " + qty);
+                }
+            }
+            return;
+        }
+
         if (holder.page.equals("homes")) {
             switch (clicked.getType()) {
                 case RED_BED -> { p.closeInventory(); run(p, "home " + name); }
@@ -255,6 +372,7 @@ final class Menu implements Listener {
 
         switch (name) {
             case "Homes"               -> openHomes(p);
+            case "Shop"                -> openShop(p, null);
             case "Berries"             -> run(p, "berries");
             case "Random Teleport"     -> { p.closeInventory(); run(p, "rtp"); }
             case "Teleport to a player" -> {

@@ -1,3 +1,35 @@
+# LaughTail progress
+
+## Session 3 - the shop, the HUD, and the GUI
+
+Done and verified this session:
+
+* **Chest GUI** (`/menu`, `/laughtale`, `/lt`) with a staff section gated on `laughtail.status`.
+  Unbuilt features are shown greyed and labelled NOT BUILT YET, naming what they wait on.
+* **Permanent Champion title** per 9.6, applied on join from the `champions` table rather than
+  granted once at crowning, so a LuckPerms reset cannot lose it. No gameplay benefit, per 9.6.
+* **Sidebar HUD**: rank, RP, K/D, Berries, homes, Champion titles, season. Score numbers removed
+  with `NumberFormat.blank()`; lines are team prefixes so values update in place. Animated title
+  only - 5 packets/sec/player, and the first thing to switch off under MSPT pressure.
+* **Resource world spam removed** - the 5-second action bar and the full-screen red banner both
+  gone. One subtitle and one chat line on actually entering, plus the container warning.
+* **Homes GUI page** - one bed per home, click to teleport, buy-slot button with the live price.
+* **Shop** - 44 items priced from P2, dynamic prices with P4 elasticity and P5 recovery, P3 spread,
+  P6 daily category cap applied inside the payment transaction, row 40 tier gate enforced
+  server-side. `/shop`, `/sell hand|all`, `/buy <item> [amount]`, and a GUI page with category
+  buttons and locked items shown honestly.
+
+Next, in order:
+
+1. **In-game row 40 run**: as Tier 1, `/buy DRAGON_EGG` must be refused and must write a
+   `buy.tier_refused` audit row. Then row 40 can be claimed outright.
+2. Arbitrage audit walking recipe chains, failing the build on any positive-yield cycle (rows
+   26/27). The per-item spread invariant is proven; the chain version is not.
+3. Auction house and order book with atomic matching (rows 28/29).
+4. Friends commands, RTP queue, stats GUI page, leaderboards.
+5. Combat tag - hook marked in `Homes.goHome`, duration still to decide under D-0031. Blocks
+   rows 33 and the second half of 47.
+
 # LaughTail SMP - Progress
 
 **Status: pinned Paper 1.21.11 and all eight manifest plugins are running and verified on the dev box (aarch64). Blocked on OA-25 for `laughtail-dev` to exist as its own Panel server. See "Session 2" below - it supersedes the session 1 statement that nothing on the server has been changed.**

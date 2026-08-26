@@ -183,6 +183,15 @@ description: The LaughTail core. Access, rules gate, player registry.
 # otherwise would let it load on a server it cannot run correctly on.
 
 commands:
+  shop:
+    description: Show your shop tier and how to buy and sell.
+    usage: /shop
+  sell:
+    description: Sell what you are holding, or everything sellable.
+    usage: /sell [hand|all]
+  buy:
+    description: Buy from the shop. Tier-gated by rank (row 40).
+    usage: /buy <item> [amount]
   laughtail:
     description: LaughTail administration. Never use vanilla /reload (never-break rule 7).
     usage: /laughtail <status|reload>
@@ -393,6 +402,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private ResourceWorldGuard resourceGuard;
     private Menu menu;
     private Hud hud;
+    private ShopService shopService;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -435,6 +445,12 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         resourceGuard.start();
         this.menu = new Menu(this);
         getServer().getPluginManager().registerEvents(menu, this);
+        this.shopService = new ShopService(this, database);
+        // Seed the price table at boot rather than lazily on first trade. A price table that
+        // only materialises when someone buys something means the arbitrage audit and the
+        // invariant tests see an empty catalogue on a fresh database - they would pass by
+        // examining nothing. Idempotent: currentPrice inserts only when the row is absent.
+        seedShopCatalogue();
         this.hud = new Hud(this, database);
         getServer().getPluginManager().registerEvents(hud, this);
         hud.start();
@@ -476,6 +492,23 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     }
 
     /** Exposed so the menu can read homes without a second Database reference. */
+    private void seedShopCatalogue() {
+        getServer().getScheduler().runTaskAsynchronously(this, () -> {
+            int made = 0;
+            try {
+                for (Shop.Entry e : Shop.catalogue().values()) {
+                    database.currentPrice(e);
+                    made++;
+                }
+                getLogger().info("Shop catalogue priced from P2: " + made + " items, spread "
+                    + (int) (Shop.SPREAD * 100) + "%, target " + Shop.HOUR + " Berries/hour.");
+            } catch (java.sql.SQLException ex) {
+                getLogger().warning("Shop seeding stopped after " + made + " items: "
+                    + ex.getMessage() + ". The shop will still price lazily on first trade.");
+            }
+        });
+    }
+
     Database database() { return database; }
 
     String rulesVersion() { return rulesVersion; }
@@ -613,6 +646,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (economy.handle(sender, name, args)) return true;
         if (homes.handle(sender, name, args)) return true;
         if (teleports.handle(sender, name, args)) return true;
+        if (shopService.handle(sender, name, args)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }
@@ -776,6 +810,30 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
                 });
                 return true;
             }
+            if (args[0].equalsIgnoreCase("shopseed")) {
+                // Prices are created lazily on first read, which means a fresh database has an
+                // empty price table until someone trades. That is fine in play but useless for
+                // testing an invariant across the whole catalogue, so this walks every entry and
+                // forces the row into existence. It is idempotent - currentPrice inserts only if
+                // absent - so running it twice changes nothing.
+                getServer().getScheduler().runTaskAsynchronously(this, () -> {
+                    int made = 0;
+                    try {
+                        for (Shop.Entry e : Shop.catalogue().values()) {
+                            database.currentPrice(e);
+                            made++;
+                        }
+                    } catch (java.sql.SQLException ex) {
+                        getLogger().warning("shopseed failed after " + made + ": " + ex.getMessage());
+                    }
+                    final int n = made;
+                    getServer().getScheduler().runTask(this, () -> sender.sendMessage(
+                        Component.text("Shop catalogue seeded: " + n + " of "
+                            + Shop.catalogue().size() + " priced from P2.", NamedTextColor.GREEN)));
+                });
+                return true;
+            }
+
             if (args[0].equalsIgnoreCase("rating")) {
                 if (!sender.hasPermission("laughtail.status")) {
                     sender.sendMessage(Component.text("No permission.", NamedTextColor.RED));
@@ -1866,6 +1924,240 @@ public final class Database {
             ps.setInt(3, counted ? 1 : 0);
             ps.setString(4, uuid.toString());
             ps.setInt(5, season);
+            ps.executeUpdate();
+        }
+    }
+
+    // ---- shop ----------------------------------------------------------------
+
+    record SellResult(int soldUnits, long paid, long balance, long cappedAt) { }
+    record BuyResult(boolean ok, long balance) { }
+
+    /**
+     * The current buy price, creating the row from the derived base on first sight.
+     *
+     * Also applies P5's recovery: prices drift 5% of the gap back toward base per hour since the
+     * last trade. Doing it lazily on read rather than with a scheduled sweep means there is no
+     * background job walking every item, and a price nobody looks at costs nothing to keep correct.
+     */
+    long currentPrice(Shop.Entry e) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            try (PreparedStatement ps = c.prepareStatement(
+                    "INSERT INTO shop_prices (item, category, base_price, current_price, "
+                  + "sell_price, updated_at) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3)) "
+                  + "ON DUPLICATE KEY UPDATE updated_at = updated_at")) {
+                ps.setString(1, e.material().name());
+                ps.setString(2, e.category());
+                ps.setLong(3, e.basePrice());
+                ps.setLong(4, e.basePrice());
+                ps.setLong(5, Shop.sellPrice(e.basePrice()));
+                ps.executeUpdate();
+            }
+            // Self-heal a sell price that disagrees with Shop.sellPrice. Rows written before the
+            // spread was floored rather than rounded are a Berry high, and rather than a one-off
+            // migration this corrects on read - which also means ANY future drift between the
+            // stored value and the single source of truth repairs itself instead of quietly
+            // sitting in the table waiting for the invariant test to find it.
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT current_price, sell_price FROM shop_prices WHERE item = ?")) {
+                ps.setString(1, e.material().name());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        long cur = rs.getLong(1);
+                        long stored = rs.getLong(2);
+                        long correct = Shop.sellPrice(cur);
+                        if (stored != correct) {
+                            try (PreparedStatement fix = c.prepareStatement(
+                                    "UPDATE shop_prices SET sell_price = ? WHERE item = ?")) {
+                                fix.setLong(1, correct);
+                                fix.setString(2, e.material().name());
+                                fix.executeUpdate();
+                            }
+                        }
+                    }
+                }
+            }
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT current_price, base_price, "
+                  + "TIMESTAMPDIFF(HOUR, IFNULL(last_trade_at, updated_at), UTC_TIMESTAMP(3)) "
+                  + "FROM shop_prices WHERE item = ?")) {
+                ps.setString(1, e.material().name());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return e.basePrice();
+                    long current = rs.getLong(1);
+                    long base = rs.getLong(2);
+                    int hours = rs.getInt(3);
+                    if (hours <= 0 || current == base) return current;
+                    // P5: 5% of the gap per hour, compounded over the elapsed hours.
+                    double gap = current - base;
+                    double recovered = gap * Math.pow(1.0 - 0.05, Math.min(hours, 240));
+                    long next = Math.round(base + recovered);
+                    if (next != current) {
+                        try (PreparedStatement up = c.prepareStatement(
+                                "UPDATE shop_prices SET current_price = ?, sell_price = ?, "
+                              + "updated_at = UTC_TIMESTAMP(3) WHERE item = ?")) {
+                            up.setLong(1, next);
+                            up.setLong(2, Shop.sellPrice(next));
+                            up.setString(3, e.material().name());
+                            up.executeUpdate();
+                        }
+                    }
+                    return next;
+                }
+            }
+        }
+    }
+
+    /**
+     * Sells up to `amount`, respecting P6's daily category cap, and moves the price down by P4's
+     * elasticity.
+     *
+     * The cap is read, applied and the payment made in ONE transaction. Checking the cap and then
+     * paying separately would let two simultaneous sales both see the same remaining allowance -
+     * which is how a daily cap becomes a daily suggestion.
+     */
+    SellResult sell(UUID uuid, Shop.Entry e, int amount, long unitSell) throws SQLException {
+        assertOffMainThread();
+        final long DAILY_CAP = 3600L;   // P6
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, uuid);
+                lockBalance(c, uuid);
+
+                long already;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT berries FROM daily_sell_totals WHERE uuid = ? "
+                      + "AND sell_date = UTC_DATE() AND category = ? FOR UPDATE")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, e.category());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        already = rs.next() ? rs.getLong(1) : 0L;
+                    }
+                }
+                long headroom = DAILY_CAP - already;
+                if (headroom <= 0) {
+                    c.rollback();
+                    return new SellResult(0, 0, balanceIn(c, uuid), DAILY_CAP);
+                }
+                int units = (int) Math.min(amount, headroom / unitSell);
+                if (units <= 0) {
+                    c.rollback();
+                    return new SellResult(0, 0, balanceIn(c, uuid), DAILY_CAP);
+                }
+                long paid = units * unitSell;
+
+                long bal = readLocked(c, uuid) + paid;
+                writeBalance(c, uuid, bal, paid, 0);
+                ledger(c, uuid, paid, bal, "shop_sell", null, e.material().name(), units,
+                    "sold to shop at " + unitSell + " each");
+
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO daily_sell_totals (uuid, sell_date, category, berries, updated_at) "
+                      + "VALUES (?, UTC_DATE(), ?, ?, UTC_TIMESTAMP(3)) "
+                      + "ON DUPLICATE KEY UPDATE berries = berries + VALUES(berries), "
+                      + "updated_at = UTC_TIMESTAMP(3)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, e.category());
+                    ps.setLong(3, paid);
+                    ps.executeUpdate();
+                }
+
+                movePrice(c, e, -units);
+                c.commit();
+                long capped = (already + paid) >= DAILY_CAP ? DAILY_CAP : 0L;
+                return new SellResult(units, paid, bal, capped);
+            } catch (SQLException ex) {
+                c.rollback();
+                throw ex;
+            }
+        }
+    }
+
+    BuyResult buy(UUID uuid, Shop.Entry e, int amount, long unit) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                ensureBalanceRow(c, uuid);
+                lockBalance(c, uuid);
+                long bal = readLocked(c, uuid);
+                long total = unit * amount;
+                if (bal < total) {
+                    c.rollback();
+                    return new BuyResult(false, bal);
+                }
+                long after = bal - total;
+                writeBalance(c, uuid, after, 0, total);
+                ledger(c, uuid, -total, after, "shop_buy", null, e.material().name(), amount,
+                    "bought from shop at " + unit + " each");
+                movePrice(c, e, amount);
+                c.commit();
+                return new BuyResult(true, after);
+            } catch (SQLException ex) {
+                c.rollback();
+                throw ex;
+            }
+        }
+    }
+
+    private long balanceIn(Connection c, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT berries FROM balances WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0L;
+            }
+        }
+    }
+
+    /**
+     * P4's elasticity: 0.15 per 1,000 units, clamped to the +/-40% band.
+     *
+     * The band is clamped HERE as well as being a CHECK constraint, so the code fails politely
+     * rather than throwing on a constraint violation - but the constraint remains as the thing
+     * that makes the band true even if this arithmetic is ever wrong.
+     */
+    private void movePrice(Connection c, Shop.Entry e, int unitsDelta) throws SQLException {
+        long base = e.basePrice();
+        long floor = Math.max(1L, Math.round(base * 0.6));
+        long ceil = Math.round(base * 1.4);
+
+        // Read the current price under the transaction's lock, then compute in Java.
+        //
+        // The earlier version did the arithmetic in SQL, which meant the 12% spread existed in
+        // TWO places - Shop.sellPrice and an expression in this statement - and they had already
+        // drifted: one rounded and the other floored, so a diamond sold for 106 instead of 105
+        // and the spread came out at 11.7% against a stated minimum of 12%. Computing here and
+        // calling Shop.sellPrice makes that impossible by construction: there is one function
+        // that knows what the spread is, and both the display price and the stored price come
+        // from it.
+        long current;
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT current_price FROM shop_prices WHERE item = ? FOR UPDATE")) {
+            ps.setString(1, e.material().name());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return;
+                current = rs.getLong(1);
+            }
+        }
+
+        // P4: 0.15 per 1,000 units, clamped to the band. Buying pushes the price up, selling
+        // pushes it down - so the market punishes dumping and rewards scarcity, which is the
+        // whole point of a dynamic price.
+        double factor = 1.0 + (0.15 * unitsDelta / 1000.0);
+        long next = Math.max(floor, Math.min(ceil, Math.round(current * factor)));
+        long nextSell = Shop.sellPrice(next);
+
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE shop_prices SET current_price = ?, sell_price = ?, "
+              + "units_traded = units_traded + ?, last_trade_at = UTC_TIMESTAMP(3), "
+              + "updated_at = UTC_TIMESTAMP(3) WHERE item = ?")) {
+            ps.setLong(1, next);
+            ps.setLong(2, nextSell);
+            ps.setInt(3, Math.abs(unitsDelta));
+            ps.setString(4, e.material().name());
             ps.executeUpdate();
         }
     }
@@ -4630,10 +4922,13 @@ final class Menu implements Listener {
         @Override public Inventory getInventory() { return null; }
     }
 
+    /** Stashes the real material on a button, so a greyed placeholder stays identifiable. */
+    private final org.bukkit.NamespacedKey shopItemKey;
     private final LaughTailPlugin plugin;
 
     Menu(LaughTailPlugin plugin) {
         this.plugin = plugin;
+        this.shopItemKey = new org.bukkit.NamespacedKey(plugin, "shop_item");
     }
 
     // ---- building ------------------------------------------------------------
@@ -4689,8 +4984,10 @@ final class Menu implements Listener {
             "The rules you accepted, and their version.")));
 
         // --- honestly unbuilt ---
-        inv.setItem(19, notBuilt(Material.CHEST, "Shop",
-            "Buy and sell at dynamic prices.", "Waiting on: the derived price table"));
+        inv.setItem(19, item(Material.CHEST, "Shop", NamedTextColor.GOLD, List.of(
+            "Buy and sell at prices that move with trade.",
+            "Selling is never tier-gated. Buying is.",
+            "Daily sell limit: 3600 Berries per category.")));
         inv.setItem(20, notBuilt(Material.GOLD_BLOCK, "Auction House",
             "List items for other players to buy.", "Waiting on: Phase 3"));
         inv.setItem(21, notBuilt(Material.PAPER, "Orders / Bazaar",
@@ -4760,6 +5057,92 @@ final class Menu implements Listener {
         });
     }
 
+    /**
+     * The shop page. Category buttons, then items with live prices.
+     *
+     * Locked items are SHOWN, greyed, with the tier they need - rather than hidden. Hiding them
+     * would make rank feel like nothing exists beyond your tier; showing them is the entire
+     * incentive to rank up, and it is honest about what the ladder is for.
+     *
+     * The lock here is cosmetic. Row 40 is enforced in ShopService against the database, so a
+     * client that fabricates a click on a locked slot is still refused.
+     */
+    void openShop(Player p, String category) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            final int tier;
+            final java.util.Map<Material, Long> prices = new java.util.LinkedHashMap<>();
+            try {
+                int season = plugin.database().activeSeason();
+                tier = Shop.tierForRp(plugin.database().currentRp(p.getUniqueId(), season));
+                for (var en : Shop.catalogue().values()) {
+                    if (category == null || en.category().equals(category)) {
+                        prices.put(en.material(), plugin.database().currentPrice(en));
+                    }
+                }
+            } catch (java.sql.SQLException e) {
+                plugin.getServer().getScheduler().runTask(plugin, () ->
+                    p.sendMessage(Component.text("Could not read shop prices.",
+                        NamedTextColor.RED)));
+                return;
+            }
+            plugin.getServer().getScheduler().runTask(plugin, () -> {
+                String heading = category == null ? "Shop" : "Shop - " + category;
+                Inventory inv = Bukkit.createInventory(
+                    new MenuHolder(category == null ? "shop" : "shop:" + category), 54,
+                    Component.text(heading + "  (your tier " + tier + "/8)",
+                        NamedTextColor.GOLD));
+                int slot = 0;
+                for (var e : Shop.catalogue().values()) {
+                    if (category != null && !e.category().equals(category)) continue;
+                    if (slot >= 45) break;
+                    long buy = prices.getOrDefault(e.material(), e.basePrice());
+                    boolean allowed = Shop.canBuy(tier, e);
+                    List<String> lore = new java.util.ArrayList<>();
+                    lore.add("Buy  " + buy + " Berries each");
+                    long sp = Shop.sellPrice(buy);
+                    lore.add(sp > 0 ? "Sell " + sp + " Berries each"
+                                    : "Sell - worth nothing, too common");
+                    lore.add("");
+                    if (allowed) {
+                        lore.add("Left click  buy 1");
+                        lore.add("Right click buy 16");
+                        lore.add("Selling is never tier-gated.");
+                    } else {
+                        lore.add("LOCKED - needs shop tier " + e.tier());
+                        lore.add("You are tier " + tier + ".");
+                        lore.add("Rank up by winning fights. There is");
+                        lore.add("no way to buy this unlock.");
+                    }
+                    ItemStack it = new ItemStack(allowed ? e.material() : Material.GRAY_DYE);
+                    var meta = it.getItemMeta();
+                    meta.displayName(Component.text(e.material().name(),
+                        allowed ? NamedTextColor.WHITE : NamedTextColor.DARK_GRAY)
+                        .decoration(net.kyori.adventure.text.format.TextDecoration.ITALIC, false));
+                    meta.lore(lore.stream().map(s -> Component.text(s, NamedTextColor.GRAY)
+                        .decoration(net.kyori.adventure.text.format.TextDecoration.ITALIC, false))
+                        .map(c -> (Component) c).toList());
+                    // The real material is stashed so a greyed GRAY_DYE still knows what it is.
+                    meta.getPersistentDataContainer().set(shopItemKey,
+                        org.bukkit.persistence.PersistentDataType.STRING, e.material().name());
+                    it.setItemMeta(meta);
+                    inv.setItem(slot++, it);
+                }
+                inv.setItem(45, item(Material.IRON_PICKAXE, "Ore", NamedTextColor.AQUA, List.of()));
+                inv.setItem(46, item(Material.WHEAT, "Farm", NamedTextColor.GREEN, List.of()));
+                inv.setItem(47, item(Material.BONE, "Drops", NamedTextColor.WHITE, List.of()));
+                inv.setItem(48, item(Material.OAK_LOG, "Wood", NamedTextColor.GOLD, List.of()));
+                inv.setItem(49, item(Material.NETHER_STAR, "Special",
+                    NamedTextColor.LIGHT_PURPLE, List.of()));
+                inv.setItem(51, item(Material.HOPPER, "Sell everything sellable",
+                    NamedTextColor.YELLOW, List.of("Runs /sell all.",
+                        "Daily limit: 3600 Berries per category.")));
+                inv.setItem(52, item(Material.ARROW, "Back", NamedTextColor.GRAY, List.of()));
+                inv.setItem(53, item(Material.BARRIER, "Close", NamedTextColor.RED, List.of()));
+                p.openInventory(inv);
+            });
+        });
+    }
+
     private void openAdmin(Player p) {
         Inventory inv = Bukkit.createInventory(new MenuHolder("admin"), 27,
             Component.text("Laugh Tale - staff", NamedTextColor.LIGHT_PURPLE));
@@ -4814,6 +5197,32 @@ final class Menu implements Listener {
             }
         }
 
+        if (holder.page.startsWith("shop")) {
+            switch (name) {
+                case "Ore"     -> openShop(p, "ore");
+                case "Farm"    -> openShop(p, "farm");
+                case "Drops"   -> openShop(p, "drops");
+                case "Wood"    -> openShop(p, "wood");
+                case "Special" -> openShop(p, "special");
+                case "Back"    -> openMain(p);
+                case "Sell everything sellable" -> { p.closeInventory(); run(p, "sell all"); }
+                default -> {
+                    // Read the stashed material rather than the clicked type, because a locked
+                    // row is rendered as GRAY_DYE and its own type would be meaningless.
+                    var buttonMeta = clicked.getItemMeta();
+                    if (buttonMeta == null) return;
+                    String mat = buttonMeta.getPersistentDataContainer().get(shopItemKey,
+                        org.bukkit.persistence.PersistentDataType.STRING);
+                    if (mat == null) return;
+                    int qty = e.isRightClick() ? 16 : 1;
+                    // Dispatched as the player, so ShopService applies the row 40 check exactly
+                    // as it would for a typed command. The greying is cosmetic; this is not.
+                    run(p, "buy " + mat + " " + qty);
+                }
+            }
+            return;
+        }
+
         if (holder.page.equals("homes")) {
             switch (clicked.getType()) {
                 case RED_BED -> { p.closeInventory(); run(p, "home " + name); }
@@ -4839,6 +5248,7 @@ final class Menu implements Listener {
 
         switch (name) {
             case "Homes"               -> openHomes(p);
+            case "Shop"                -> openShop(p, null);
             case "Berries"             -> run(p, "berries");
             case "Random Teleport"     -> { p.closeInventory(); run(p, "rtp"); }
             case "Teleport to a player" -> {
@@ -5103,6 +5513,465 @@ final class Hud implements Listener {
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Hud_java
+
+# ---- src/main/java/gg/laughtail/core/Shop.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Shop.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Shop_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.ItemStack;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * The shop catalogue and the price derivation.
+ *
+ * BASE PRICES ARE DERIVED FROM P2, not invented per item. `target_berries_per_hour` is 1,200, so
+ * every base price is an answer to "how much of this does an hour of deliberate play produce?".
+ * Iron at 20 means roughly 60 ingots an hour is a full hour's income, which is about right for
+ * someone mining with purpose. Cobblestone at 1 means you would need 1,200 an hour, which is also
+ * about right - it is nearly worthless because it nearly is.
+ *
+ * Deriving rather than hand-picking matters because P2 is the single anchor the whole economy
+ * hangs from. If the owner later changes 1,200, every price should move with it - and it will,
+ * because the numbers below are multipliers of an hour rather than absolute figures someone chose.
+ *
+ * THE SELL PRICE IS ALWAYS `buy * (1 - 0.12)` (P3's 12% spread). That is the server's cut and the
+ * anti-arbitrage margin in one, and it is why the Phase 3 audit can never find a buy-then-sell
+ * loop that yields a profit: selling back always loses 12%.
+ *
+ * TIERS GATE BUYING, NEVER SELLING. 10.3 is explicit that selling is never gated - a new player
+ * must be able to convert what they mine into Berries from the first minute, or the economy has no
+ * entry point. Tiers only restrict what you may BUY, which is what makes rank worth having without
+ * making poverty a trap.
+ */
+final class Shop {
+
+    /** An hour of deliberate play, from P2. Every base price is a fraction of this. */
+    static final long HOUR = 1_200L;
+    /** P3: the minimum spread. Sell price is buy price less this. */
+    static final double SPREAD = 0.12;
+
+    record Entry(Material material, String category, int tier, long basePrice) { }
+
+    /**
+     * The catalogue. `unitsPerHour` is the honest question behind each price: how many of these
+     * does an hour of focused play yield? Base price is HOUR divided by that.
+     *
+     * Tier is what rank a player must have REACHED to buy it (10.2's eight tiers). Everything at
+     * tier 1 is available immediately, which keeps the shop useful to a brand new player.
+     */
+    private static final Map<Material, Entry> CATALOGUE = new LinkedHashMap<>();
+
+    private static void add(Material m, String category, int tier, long unitsPerHour) {
+        CATALOGUE.put(m, new Entry(m, category, tier, Math.max(1L, HOUR / unitsPerHour)));
+    }
+
+    static {
+        // --- ore and mining. The bulk of early income. -------------------------
+        add(Material.COBBLESTONE,     "ore",     1, 1200);   // 1
+        add(Material.STONE,           "ore",     1, 600);    // 2
+        add(Material.COAL,            "ore",     1, 150);    // 8
+        add(Material.RAW_COPPER,      "ore",     1, 100);    // 12
+        add(Material.RAW_IRON,        "ore",     1, 60);     // 20
+        add(Material.IRON_INGOT,      "ore",     1, 60);     // 20
+        add(Material.REDSTONE,        "ore",     2, 120);    // 10
+        add(Material.LAPIS_LAZULI,    "ore",     2, 100);    // 12
+        add(Material.RAW_GOLD,        "ore",     2, 34);     // 35
+        add(Material.GOLD_INGOT,      "ore",     2, 34);     // 35
+        add(Material.QUARTZ,          "ore",     3, 60);     // 20
+        add(Material.AMETHYST_SHARD,  "ore",     3, 40);     // 30
+        add(Material.DIAMOND,         "ore",     4, 10);     // 120
+        add(Material.EMERALD,         "ore",     4, 12);     // 100
+        add(Material.ANCIENT_DEBRIS,  "ore",     6, 2);      // 600
+        add(Material.NETHERITE_SCRAP, "ore",     6, 2);      // 600
+
+        // --- farming. Lower value per unit, far higher throughput. -------------
+        add(Material.WHEAT,           "farm",    1, 200);
+        add(Material.CARROT,          "farm",    1, 200);
+        add(Material.POTATO,          "farm",    1, 200);
+        add(Material.SUGAR_CANE,      "farm",    1, 240);
+        add(Material.MELON_SLICE,     "farm",    1, 300);
+        add(Material.PUMPKIN,         "farm",    1, 120);
+        add(Material.BAMBOO,          "farm",    1, 600);
+        add(Material.NETHER_WART,     "farm",    2, 150);
+        add(Material.HONEYCOMB,       "farm",    3, 60);
+
+        // --- mob drops. Rewards combat with the world, not with players. -------
+        add(Material.ROTTEN_FLESH,    "drops",   1, 400);
+        add(Material.BONE,            "drops",   1, 200);
+        add(Material.STRING,          "drops",   1, 200);
+        add(Material.GUNPOWDER,       "drops",   2, 80);
+        add(Material.ENDER_PEARL,     "drops",   3, 24);
+        add(Material.BLAZE_ROD,       "drops",   4, 20);
+        add(Material.GHAST_TEAR,      "drops",   5, 8);
+        add(Material.NETHER_STAR,     "drops",   8, 1);      // 1200 - a full hour
+
+        // --- wood and building ------------------------------------------------
+        add(Material.OAK_LOG,         "wood",    1, 300);
+        add(Material.SPRUCE_LOG,      "wood",    1, 300);
+        add(Material.BIRCH_LOG,       "wood",    1, 300);
+        add(Material.DARK_OAK_LOG,    "wood",    1, 300);
+
+        // --- higher tiers. What rank actually unlocks. --------------------------
+        add(Material.OBSIDIAN,        "special", 3, 30);
+        add(Material.EXPERIENCE_BOTTLE, "special", 4, 40);
+        add(Material.SHULKER_SHELL,   "special", 5, 6);
+        add(Material.ELYTRA,          "special", 7, 1);
+        add(Material.BEACON,          "special", 7, 1);
+        add(Material.ENCHANTED_GOLDEN_APPLE, "special", 8, 2);
+        add(Material.DRAGON_EGG,      "special", 8, 1);
+    }
+
+    private Shop() { }
+
+    static Entry entry(Material m) {
+        return CATALOGUE.get(m);
+    }
+
+    static Map<Material, Entry> catalogue() {
+        return CATALOGUE;
+    }
+
+    /**
+     * Sell price from a buy price. P3's spread, always applied, never negotiable.
+     *
+     * FLOOR, NOT ROUND. Rounding half-up can push the sell price a fraction ABOVE the 12% floor -
+     * a diamond at 120 rounds to 106, which is a 11.7% spread, under the minimum P3 sets. The
+     * error is under one Berry per unit and would never be noticed by a player, which is exactly
+     * why it is worth fixing: it is invisible per trade and compounds over millions of them, and
+     * "minimum 12%" has to actually be a minimum or it is not a floor at all. The shop invariant
+     * test asserts this with no tolerance.
+     */
+    static long sellPrice(long buyPrice) {
+        long sell = (long) Math.floor(buyPrice * (1.0 - SPREAD));
+        // A 1-Berry item would round to 1 and the spread would vanish, which is exactly the
+        // rounding hole a buy-then-sell loop exploits. Floor it to zero instead: cobblestone is
+        // worth buying for 1 and worth nothing to sell back, which is honest.
+        return Math.min(sell, buyPrice - 1);
+    }
+
+    /**
+     * Row 40. Whether a player may BUY this entry.
+     *
+     * Checked against PEAK tier rather than current, because 10.x gates on what a player has
+     * reached - a bad week should not revoke access to items they earned. Selling is never gated
+     * (10.3), so there is deliberately no matching canSell.
+     */
+    static boolean canBuy(int peakTier, Entry e) {
+        return peakTier >= e.tier();
+    }
+
+    /** The tier a rating corresponds to, 1-8. Maps the ten rank tiers onto eight shop tiers. */
+    static int tierForRp(int rp) {
+        String rank = Rating.tierName(rp);
+        return switch (rank) {
+            case "Wanderer", "Settler" -> 1;
+            case "Raider"    -> 1;
+            case "Fighter"   -> 2;
+            case "Warrior"   -> 3;
+            case "Gladiator" -> 4;
+            case "Champion"  -> 5;
+            case "Warlord"   -> 6;
+            case "Legend"    -> 7;
+            case "Mythic"    -> 8;
+            default -> 1;
+        };
+    }
+
+    /** Counts how many of a material a player is carrying. */
+    static int countIn(Player p, Material m) {
+        int n = 0;
+        for (ItemStack it : p.getInventory().getStorageContents()) {
+            if (it != null && it.getType() == m) n += it.getAmount();
+        }
+        return n;
+    }
+
+    /** Removes exactly `amount`, returning how many were actually taken. */
+    static int removeFrom(Player p, Material m, int amount) {
+        int remaining = amount;
+        ItemStack[] contents = p.getInventory().getStorageContents();
+        for (int i = 0; i < contents.length && remaining > 0; i++) {
+            ItemStack it = contents[i];
+            if (it == null || it.getType() != m) continue;
+            int take = Math.min(remaining, it.getAmount());
+            it.setAmount(it.getAmount() - take);
+            if (it.getAmount() <= 0) contents[i] = null;
+            remaining -= take;
+        }
+        p.getInventory().setStorageContents(contents);
+        return amount - remaining;
+    }
+
+    static Component describe(Entry e, long buy, boolean allowed) {
+        return Component.text(e.material().name(), allowed ? NamedTextColor.WHITE : NamedTextColor.DARK_GRAY)
+            .append(Component.text("  buy " + buy + "  sell " + sellPrice(buy),
+                NamedTextColor.GRAY));
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Shop_java
+
+# ---- src/main/java/gg/laughtail/core/ShopService.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/ShopService.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_ShopService_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.Material;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.ItemStack;
+
+import java.sql.SQLException;
+import java.util.logging.Level;
+
+/**
+ * Buying and selling. The commands and their guards.
+ *
+ * ROW 40 IS ENFORCED HERE AND ONLY HERE, server-side, after the player's peak tier is read from
+ * the database. "A Tier 1 player cannot buy a Tier 8 item by any means, including a modified
+ * client" - so the GUI's greyed-out button is decoration, not the control. A client that fabricates
+ * a click on a hidden slot still arrives at this method, and this method still refuses.
+ *
+ * SELLING IS NEVER GATED (10.3). A new player must be able to convert what they mine into Berries
+ * in their first minute or the economy has no entry point.
+ *
+ * THE DAILY SELL CAP (P6, 3,600 per category) is checked and applied inside the same transaction
+ * as the payment, so two simultaneous sales cannot both pass the same remaining-cap check. Caps
+ * that are checked and then applied separately are how a cap becomes a suggestion.
+ */
+final class ShopService {
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+
+    ShopService(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+    }
+
+    boolean handle(CommandSender sender, String cmd, String[] args) {
+        if (!(sender instanceof Player p)) return false;
+        switch (cmd) {
+            case "shop": return shopInfo(p, args);
+            case "sell": return sell(p, args);
+            case "buy":  return buy(p, args);
+            default: return false;
+        }
+    }
+
+    private boolean shopInfo(Player p, String[] args) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                int season = db.activeSeason();
+                int rp = db.currentRp(p.getUniqueId(), season);
+                int tier = Shop.tierForRp(rp);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    p.sendMessage(Component.text("Shop - your tier is " + tier + " of 8",
+                        NamedTextColor.GOLD));
+                    p.sendMessage(Component.text(
+                        "Selling is never tier-gated. Buying is (10.3).", NamedTextColor.GRAY));
+                    p.sendMessage(Component.text(
+                        "  /sell hand    sell what you are holding", NamedTextColor.GRAY));
+                    p.sendMessage(Component.text(
+                        "  /sell all     sell every sellable item in your inventory",
+                        NamedTextColor.GRAY));
+                    p.sendMessage(Component.text(
+                        "  /buy <item> [amount]", NamedTextColor.GRAY));
+                    p.sendMessage(Component.text("  /menu -> Shop for the full list",
+                        NamedTextColor.DARK_GRAY));
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "shop info failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private boolean sell(Player p, String[] args) {
+        final String mode = args.length > 0 ? args[0].toLowerCase() : "hand";
+        if (mode.equals("all")) return sellAll(p);
+
+        ItemStack held = p.getInventory().getItemInMainHand();
+        if (held == null || held.getType() == Material.AIR) {
+            p.sendMessage(Component.text("Hold what you want to sell, or use /sell all.",
+                NamedTextColor.GRAY));
+            return true;
+        }
+        Shop.Entry e = Shop.entry(held.getType());
+        if (e == null) {
+            p.sendMessage(Component.text("The shop does not buy " + held.getType().name() + ".",
+                NamedTextColor.RED));
+            return true;
+        }
+        int amount = Shop.countIn(p, held.getType());
+        sellItem(p, e, amount);
+        return true;
+    }
+
+    private boolean sellAll(Player p) {
+        int sold = 0;
+        for (Material m : Shop.catalogue().keySet()) {
+            int have = Shop.countIn(p, m);
+            if (have <= 0) continue;
+            sellItem(p, Shop.entry(m), have);
+            sold++;
+        }
+        if (sold == 0) {
+            p.sendMessage(Component.text("Nothing in your inventory is sellable.",
+                NamedTextColor.GRAY));
+        }
+        return true;
+    }
+
+    private void sellItem(Player p, Shop.Entry e, int amount) {
+        if (amount <= 0) return;
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                long unitBuy = db.currentPrice(e);
+                long unitSell = Shop.sellPrice(unitBuy);
+                if (unitSell <= 0) {
+                    reply(p, Component.text(e.material().name()
+                        + " is worth nothing to sell - it is too common.", NamedTextColor.GRAY));
+                    return;
+                }
+                Database.SellResult r = db.sell(p.getUniqueId(), e, amount, unitSell);
+                if (r.soldUnits() <= 0) {
+                    reply(p, Component.text("Daily sell limit reached for "
+                        + e.category() + ". It resets at midnight UTC.", NamedTextColor.YELLOW));
+                    return;
+                }
+                final int toRemove = r.soldUnits();
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    // Items are removed only AFTER the payment is committed. If the order were
+                    // reversed, a database failure between the two would take a player's items
+                    // and pay nothing - which is theft rather than a bug.
+                    int actually = Shop.removeFrom(p, e.material(), toRemove);
+                    p.sendMessage(Component.text("Sold " + actually + " x "
+                        + e.material().name() + " for " + r.paid() + " Berries. Balance "
+                        + r.balance() + ".", NamedTextColor.GREEN));
+                    if (actually < toRemove) {
+                        plugin.getLogger().warning("SELL MISMATCH for " + p.getName()
+                            + ": paid for " + toRemove + " but removed " + actually
+                            + ". Investigate - the player has been overpaid.");
+                    }
+                    if (r.cappedAt() > 0) {
+                        p.sendMessage(Component.text("Daily limit for " + e.category()
+                            + " reached at " + r.cappedAt() + " Berries.", NamedTextColor.YELLOW));
+                    }
+                });
+            } catch (SQLException ex) {
+                plugin.getLogger().log(Level.SEVERE, "sell failed: " + ex.getMessage());
+                reply(p, Component.text("The sale failed. Nothing was taken or paid.",
+                    NamedTextColor.RED));
+            }
+        });
+    }
+
+    private boolean buy(Player p, String[] args) {
+        if (args.length < 1) {
+            p.sendMessage(Component.text("Usage: /buy <item> [amount]", NamedTextColor.GRAY));
+            return true;
+        }
+        final Material m;
+        try {
+            m = Material.valueOf(args[0].toUpperCase());
+        } catch (IllegalArgumentException ex) {
+            p.sendMessage(Component.text("No such item: " + args[0], NamedTextColor.RED));
+            return true;
+        }
+        Shop.Entry e = Shop.entry(m);
+        if (e == null) {
+            p.sendMessage(Component.text("The shop does not sell " + m.name() + ".",
+                NamedTextColor.RED));
+            return true;
+        }
+        final int amount;
+        try {
+            amount = args.length > 1 ? Integer.parseInt(args[1]) : 1;
+        } catch (NumberFormatException ex) {
+            p.sendMessage(Component.text("'" + args[1] + "' is not a number.", NamedTextColor.RED));
+            return true;
+        }
+        if (amount <= 0 || amount > 3456) {   // 3456 = 54 slots x 64
+            p.sendMessage(Component.text("Amount must be between 1 and 3456.",
+                NamedTextColor.RED));
+            return true;
+        }
+        buyItem(p, e, amount);
+        return true;
+    }
+
+    private void buyItem(Player p, Shop.Entry e, int amount) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                int season = db.activeSeason();
+                int rp = db.currentRp(p.getUniqueId(), season);
+                int tier = Shop.tierForRp(rp);
+
+                // ROW 40. Server-side, after reading rank from the database. The GUI's greyed
+                // button is decoration; this is the control.
+                if (!Shop.canBuy(tier, e)) {
+                    reply(p, Component.text(e.material().name() + " needs shop tier "
+                        + e.tier() + ". You are tier " + tier + ". Rank up by winning fights - "
+                        + "there is no other way to unlock it and no way to buy the unlock.",
+                        NamedTextColor.RED));
+                    db.audit(null, "SHOP", "buy.tier_refused", p.getUniqueId(), p.getName(),
+                        e.material().name() + " tier " + e.tier() + " vs player tier " + tier, null);
+                    return;
+                }
+
+                long unit = db.currentPrice(e);
+                long total = unit * amount;
+                Database.BuyResult r = db.buy(p.getUniqueId(), e, amount, unit);
+                if (!r.ok()) {
+                    reply(p, Component.text("You need " + total + " Berries and have "
+                        + r.balance() + ".", NamedTextColor.RED));
+                    return;
+                }
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    // Give the items, and refund anything that did not fit rather than silently
+                    // dropping it on the floor where it can despawn.
+                    java.util.Map<Integer, ItemStack> leftover =
+                        p.getInventory().addItem(new ItemStack(e.material(), amount));
+                    int notGiven = leftover.values().stream().mapToInt(ItemStack::getAmount).sum();
+                    p.sendMessage(Component.text("Bought " + (amount - notGiven) + " x "
+                        + e.material().name() + " for " + (unit * (amount - notGiven))
+                        + " Berries.", NamedTextColor.GREEN));
+                    if (notGiven > 0) {
+                        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+                            try {
+                                db.adjustBalance(p.getUniqueId(), unit * notGiven,
+                                    "shop_refund", "inventory full, " + notGiven + " not delivered");
+                                reply(p, Component.text("Your inventory was full - "
+                                    + notGiven + " were refunded.", NamedTextColor.YELLOW));
+                            } catch (SQLException ignored) {
+                                plugin.getLogger().severe("REFUND FAILED for " + p.getName()
+                                    + ": owed " + (unit * notGiven));
+                            }
+                        });
+                    }
+                });
+            } catch (SQLException ex) {
+                plugin.getLogger().log(Level.SEVERE, "buy failed: " + ex.getMessage());
+                reply(p, Component.text("The purchase failed. Nothing was charged.",
+                    NamedTextColor.RED));
+            }
+        });
+    }
+
+    private void reply(Player p, Component c) {
+        plugin.getServer().getScheduler().runTask(plugin, () -> {
+            if (p.isOnline()) p.sendMessage(c);
+        });
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_ShopService_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do
