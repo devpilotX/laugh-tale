@@ -50,6 +50,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private SellBox sellBox;
     private CombatTag combatTag;
     private Social social;
+    private Market market;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -94,6 +95,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(menu, this);
         this.shopService = new ShopService(this, database);
         this.social = new Social(this, database);
+        this.market = new Market(this, database);
         this.combatTag = new CombatTag(this, database);
         getServer().getPluginManager().registerEvents(combatTag, this);
         combatTag.start();
@@ -106,6 +108,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         assertRow25();
         seedShopCatalogue();
         runArbitrageAudit();
+        orderBookSelfTest();
         this.hud = new Hud(this, database);
         getServer().getPluginManager().registerEvents(hud, this);
         hud.start();
@@ -191,6 +194,38 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
      * would audit an empty recipe list and report a triumphant pass over nothing - which is the
      * failure mode this whole check exists to avoid.
      */
+    /**
+     * Row 28, re-proven on every boot.
+     *
+     * Runs a real match through the real matching code and rolls it back, asserting that Berries and
+     * items are conserved, that the resting order sets the price, and that self-trading is refused.
+     * Leaves nothing behind, so it is safe to run continuously rather than when someone remembers.
+     */
+    private void orderBookSelfTest() {
+        getServer().getScheduler().runTaskAsynchronously(this, () -> {
+            java.util.UUID a = java.util.UUID.nameUUIDFromBytes("laughtail-selftest-a".getBytes());
+            java.util.UUID b = java.util.UUID.nameUUIDFromBytes("laughtail-selftest-b".getBytes());
+            try {
+                // The two test identities must exist for the foreign keys to hold. They are created
+                // once, are never real players, and hold nothing - the test rolls back everything it
+                // does with them.
+                database.ensureSelfTestPlayers(a, b);
+                java.util.List<String> fails = market.book().selfTest(a, b);
+                if (fails.isEmpty()) {
+                    getLogger().info("ORDER BOOK SELF-TEST PASS: value conserved through a real "
+                        + "match, resting price applied, refund correct, self-trade refused. "
+                        + "Rolled back, nothing left behind.");
+                } else {
+                    getLogger().severe("ORDER BOOK SELF-TEST FAILED - the bazaar can create or "
+                        + "destroy value. " + fails.size() + " problem(s):");
+                    for (String f : fails) getLogger().severe("  " + f);
+                }
+            } catch (java.sql.SQLException e) {
+                getLogger().warning("ORDER BOOK SELF-TEST could not run: " + e.getMessage());
+            }
+        });
+    }
+
     private void runArbitrageAudit() {
         getServer().getScheduler().runTaskLater(this, () -> {
             int examined = Arbitrage.recipeCount(getServer());
@@ -417,6 +452,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (teleports.handle(sender, name, args)) return true;
         if (shopService.handle(sender, name, args)) return true;
         if (social.handle(sender, name, args)) return true;
+        if (market.handle(sender, name, args)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }

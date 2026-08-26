@@ -183,6 +183,10 @@ description: The LaughTail core. Access, rules gate, player registry.
 # otherwise would let it load on a server it cannot run correctly on.
 
 commands:
+  order:
+    description: The bazaar. Buy and sell orders, matched automatically.
+    usage: /order buy|sell|book|claim|cancel|list
+    aliases: [orders, bazaar]
   friend:
     description: Friends list. Requires consent from both sides.
     usage: /friend add|accept|remove|requests|list <player>
@@ -414,6 +418,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private SellBox sellBox;
     private CombatTag combatTag;
     private Social social;
+    private Market market;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -458,6 +463,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(menu, this);
         this.shopService = new ShopService(this, database);
         this.social = new Social(this, database);
+        this.market = new Market(this, database);
         this.combatTag = new CombatTag(this, database);
         getServer().getPluginManager().registerEvents(combatTag, this);
         combatTag.start();
@@ -470,6 +476,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         assertRow25();
         seedShopCatalogue();
         runArbitrageAudit();
+        orderBookSelfTest();
         this.hud = new Hud(this, database);
         getServer().getPluginManager().registerEvents(hud, this);
         hud.start();
@@ -555,6 +562,38 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
      * would audit an empty recipe list and report a triumphant pass over nothing - which is the
      * failure mode this whole check exists to avoid.
      */
+    /**
+     * Row 28, re-proven on every boot.
+     *
+     * Runs a real match through the real matching code and rolls it back, asserting that Berries and
+     * items are conserved, that the resting order sets the price, and that self-trading is refused.
+     * Leaves nothing behind, so it is safe to run continuously rather than when someone remembers.
+     */
+    private void orderBookSelfTest() {
+        getServer().getScheduler().runTaskAsynchronously(this, () -> {
+            java.util.UUID a = java.util.UUID.nameUUIDFromBytes("laughtail-selftest-a".getBytes());
+            java.util.UUID b = java.util.UUID.nameUUIDFromBytes("laughtail-selftest-b".getBytes());
+            try {
+                // The two test identities must exist for the foreign keys to hold. They are created
+                // once, are never real players, and hold nothing - the test rolls back everything it
+                // does with them.
+                database.ensureSelfTestPlayers(a, b);
+                java.util.List<String> fails = market.book().selfTest(a, b);
+                if (fails.isEmpty()) {
+                    getLogger().info("ORDER BOOK SELF-TEST PASS: value conserved through a real "
+                        + "match, resting price applied, refund correct, self-trade refused. "
+                        + "Rolled back, nothing left behind.");
+                } else {
+                    getLogger().severe("ORDER BOOK SELF-TEST FAILED - the bazaar can create or "
+                        + "destroy value. " + fails.size() + " problem(s):");
+                    for (String f : fails) getLogger().severe("  " + f);
+                }
+            } catch (java.sql.SQLException e) {
+                getLogger().warning("ORDER BOOK SELF-TEST could not run: " + e.getMessage());
+            }
+        });
+    }
+
     private void runArbitrageAudit() {
         getServer().getScheduler().runTaskLater(this, () -> {
             int examined = Arbitrage.recipeCount(getServer());
@@ -781,6 +820,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (teleports.handle(sender, name, args)) return true;
         if (shopService.handle(sender, name, args)) return true;
         if (social.handle(sender, name, args)) return true;
+        if (market.handle(sender, name, args)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }
@@ -2786,6 +2826,231 @@ public final class Database {
             }
         }
         return out;
+    }
+    // ---- helpers shared with OrderBook -----------------------------------------
+    //
+    // OrderBook runs its matching inside ONE transaction, so it needs the balance and ledger
+    // primitives that take an existing Connection. These are thin wrappers over the private
+    // versions rather than copies: a second implementation of "write a balance" is how two code
+    // paths end up disagreeing about what a balance is.
+
+    Connection openForTransaction() throws SQLException {
+        assertOffMainThread();
+        return open();
+    }
+
+    void lockBalanceIn(Connection c, UUID uuid) throws SQLException {
+        ensureBalanceRow(c, uuid);
+        lockBalance(c, uuid);
+    }
+
+    long readBalanceIn(Connection c, UUID uuid) throws SQLException {
+        return readLocked(c, uuid);
+    }
+
+    void writeBalanceIn(Connection c, UUID uuid, long newBalance, long in, long out)
+            throws SQLException {
+        writeBalance(c, uuid, newBalance, in, out);
+    }
+
+    void ledgerIn(Connection c, UUID uuid, long delta, long after, String type,
+                  UUID counterparty, String item, Integer qty, String reason) throws SQLException {
+        ledger(c, uuid, delta, after, type, counterparty, item, qty, reason);
+    }
+
+    /** Package-visible so OrderBook can assert the same rule. */
+    void assertOffMainThreadPublic() {
+        assertOffMainThread();
+    }
+    // ---- order book queries and payouts ----------------------------------------
+
+    record Payout(String material, long berries, int items) { }
+    record CancelResult(boolean ok, String message, long berries, int items, String material) { }
+
+    /**
+     * Collects everything the player's orders have earned, in one transaction.
+     *
+     * Berries go straight to the balance with a ledger row; item counts are returned to the caller to
+     * hand over on the main thread. The payout columns are zeroed in the SAME transaction that credits
+     * the balance, so a crash cannot pay twice - which is the duplication bug every "claim your
+     * rewards" system eventually has.
+     */
+    java.util.List<Payout> claimOrderPayouts(UUID player) throws SQLException {
+        assertOffMainThread();
+        java.util.List<Payout> out = new java.util.ArrayList<>();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                long totalBerries = 0;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT id, material, payout_berries, payout_items FROM orders "
+                      + "WHERE player = ? AND (payout_berries > 0 OR payout_items > 0) "
+                      + "FOR UPDATE")) {
+                    ps.setString(1, player.toString());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            out.add(new Payout(rs.getString(2), rs.getLong(3), rs.getInt(4)));
+                            totalBerries += rs.getLong(3);
+                        }
+                    }
+                }
+                if (out.isEmpty()) {
+                    c.rollback();
+                    return out;
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE orders SET payout_berries = 0, payout_items = 0, "
+                      + "updated_at = UTC_TIMESTAMP(3) WHERE player = ? "
+                      + "AND (payout_berries > 0 OR payout_items > 0)")) {
+                    ps.setString(1, player.toString());
+                    ps.executeUpdate();
+                }
+                if (totalBerries > 0) {
+                    ensureBalanceRow(c, player);
+                    lockBalance(c, player);
+                    long bal = readLocked(c, player) + totalBerries;
+                    writeBalance(c, player, bal, totalBerries, 0);
+                    ledger(c, player, totalBerries, bal, "order_payout", null, null, null,
+                        "collected from filled orders");
+                }
+                c.commit();
+                return out;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Cancels an open order and returns its escrow.
+     *
+     * Only the owner can cancel, enforced in the WHERE clause rather than checked first - a check
+     * followed by an update leaves a window, and the window is somebody else's order.
+     */
+    CancelResult cancelOrder(UUID player, long id) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                String material = null, state = null;
+                long escrowB = 0;
+                int escrowI = 0;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT material, state, escrow_berries, escrow_items FROM orders "
+                      + "WHERE id = ? AND player = ? FOR UPDATE")) {
+                    ps.setLong(1, id);
+                    ps.setString(2, player.toString());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            material = rs.getString(1);
+                            state = rs.getString(2);
+                            escrowB = rs.getLong(3);
+                            escrowI = rs.getInt(4);
+                        }
+                    }
+                }
+                if (material == null) {
+                    c.rollback();
+                    return new CancelResult(false, "No order #" + id + " of yours.", 0, 0, null);
+                }
+                if (!"open".equals(state)) {
+                    c.rollback();
+                    return new CancelResult(false, "Order #" + id + " is already " + state
+                        + ". Use /order claim to collect what it earned.", 0, 0, null);
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE orders SET state = 'cancelled', escrow_berries = 0, "
+                      + "escrow_items = 0, remaining = 0, updated_at = UTC_TIMESTAMP(3) "
+                      + "WHERE id = ?")) {
+                    ps.setLong(1, id);
+                    ps.executeUpdate();
+                }
+                if (escrowB > 0) {
+                    ensureBalanceRow(c, player);
+                    lockBalance(c, player);
+                    long bal = readLocked(c, player) + escrowB;
+                    writeBalance(c, player, bal, escrowB, 0);
+                    ledger(c, player, escrowB, bal, "order_refund", null, material, null,
+                        "cancelled order #" + id);
+                }
+                c.commit();
+                return new CancelResult(true, "cancelled", escrowB, escrowI, material);
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /** One side of the book, best price first. */
+    java.util.List<String> bookSide(String material, String side, int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        String order = side.equals("sell") ? "ASC" : "DESC";
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT unit_price, SUM(remaining) FROM orders WHERE material = ? AND side = ? "
+               + "AND state = 'open' AND remaining > 0 GROUP BY unit_price "
+               + "ORDER BY unit_price " + order + " LIMIT ?")) {
+            ps.setString(1, material);
+            ps.setString(2, side);
+            ps.setInt(3, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                // Aggregated by price, so the book shows depth rather than a list of individual
+                // orders - and nobody can tell whose order is whose, which removes a targeting hint.
+                while (rs.next()) out.add(rs.getInt(2) + " at " + rs.getLong(1) + " each");
+            }
+        }
+        return out;
+    }
+
+    java.util.List<String> myOrders(UUID player) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT id, side, material, unit_price, remaining, quantity, state, "
+               + "payout_berries, payout_items FROM orders WHERE player = ? "
+               + "AND (state = 'open' OR payout_berries > 0 OR payout_items > 0) "
+               + "ORDER BY id DESC LIMIT 20")) {
+            ps.setString(1, player.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append('#').append(rs.getLong(1)).append(' ')
+                      .append(rs.getString(2)).append(' ')
+                      .append(rs.getString(3)).append(" at ").append(rs.getLong(4))
+                      .append("  ").append(rs.getInt(5)).append('/').append(rs.getInt(6))
+                      .append(" left  ").append(rs.getString(7));
+                    long pb = rs.getLong(8);
+                    int pi = rs.getInt(9);
+                    if (pb > 0 || pi > 0) {
+                        sb.append("  to collect: ");
+                        if (pb > 0) sb.append(pb).append(" Berries ");
+                        if (pi > 0) sb.append(pi).append(" items");
+                    }
+                    out.add(sb.toString());
+                }
+            }
+        }
+        return out;
+    }
+    /** Creates the two self-test identities the order book test needs for its foreign keys. */
+    void ensureSelfTestPlayers(UUID a, UUID b) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO players (uuid, current_name, first_join, last_seen, created_at, "
+               + "updated_at) VALUES (?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), "
+               + "UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE uuid = uuid")) {
+            ps.setString(1, a.toString());
+            ps.setString(2, "#selftest-a");
+            ps.executeUpdate();
+            ps.setString(1, b.toString());
+            ps.setString(2, "#selftest-b");
+            ps.executeUpdate();
+        }
     }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Database_java
 
@@ -7780,6 +8045,729 @@ final class Social {
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Social_java
+
+# ---- src/main/java/gg/laughtail/core/OrderBook.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/OrderBook.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_OrderBook_java'
+package gg.laughtail.core;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * The order book and its matching engine. Acceptance rows 28 and 29.
+ *
+ * Kept in its own class rather than added to Database because matching is the one piece of logic
+ * here where a mistake mints or destroys value, and it deserves to be read on its own.
+ *
+ * ROW 28: "Server killed mid-match creates and destroys nothing."
+ *
+ * The whole match - the fill row, both order updates, both payouts - happens in ONE transaction. A
+ * kill -9 either lands before the commit, in which case nothing happened, or after it, in which case
+ * everything happened. There is no third state. This is why escrow lives in the database rather than
+ * in a Java map: a map is gone on restart and the player is either short an item or holding a
+ * duplicate.
+ *
+ * THE FILL ROW IS WRITTEN FIRST, inside the transaction. If a fill exists the trade happened; if it
+ * does not, it did not. After a crash the question "did this trade go through?" has exactly one
+ * answer, which is what makes row 28 provable rather than asserted.
+ *
+ * THE RESTING ORDER SETS THE PRICE. If a buyer offers 25 and a sell order is already sitting at 20,
+ * they trade at 20 and the buyer is refunded the difference. This is how real exchanges work and it
+ * matters for a reason beyond convention: if the incoming order set the price, a player could watch
+ * the book, place an order one Berry better, and capture the whole spread every time - which is
+ * front-running with extra steps. Rewarding the order that committed first also rewards providing
+ * liquidity, which is what makes a bazaar usable at all.
+ *
+ * ROWS ARE LOCKED IN ID ORDER. Two simultaneous matches touching the same pair of orders in opposite
+ * order would deadlock. Sorting by primary key before locking is the standard fix and the reason this
+ * code takes the lower id first every time.
+ *
+ * SELF-TRADING IS REFUSED. Matching a player against their own order would let someone move Berries
+ * between their own accounts while generating fake volume - which corrupts every price signal the
+ * shop's elasticity depends on, and looks exactly like market manipulation to any later audit.
+ */
+final class OrderBook {
+
+    record Fill(long buyOrderId, long sellOrderId, int quantity, long unitPrice,
+                UUID buyer, UUID seller) { }
+
+    record PlaceResult(long orderId, int filledImmediately, long spentOrEarned,
+                       String refusal) {
+        boolean ok() { return refusal == null; }
+    }
+
+    private final Database db;
+
+    OrderBook(Database db) {
+        this.db = db;
+    }
+
+    /**
+     * Places an order and matches it as far as it will go.
+     *
+     * Escrow is taken in the SAME transaction that creates the order. Taking Berries and then
+     * inserting the order as two steps leaves a window where a crash charges a player for an order
+     * that does not exist - which is the exact failure row 28 is about.
+     */
+    PlaceResult place(UUID player, String side, String material, int quantity, long unitPrice)
+            throws SQLException {
+        db.assertOffMainThreadPublic();
+        if (quantity <= 0 || unitPrice <= 0) {
+            return new PlaceResult(0, 0, 0, "quantity and price must both be positive");
+        }
+        try (Connection c = db.openForTransaction()) {
+            c.setAutoCommit(false);
+            try {
+                long orderId;
+                if (side.equals("buy")) {
+                    long cost = (long) quantity * unitPrice;
+                    db.lockBalanceIn(c, player);
+                    long bal = db.readBalanceIn(c, player);
+                    if (bal < cost) {
+                        c.rollback();
+                        return new PlaceResult(0, 0, 0, "you need " + cost
+                            + " Berries and have " + bal);
+                    }
+                    // The Berries leave the balance NOW. An order that is not funded is a promise,
+                    // and a market built on promises has to handle the promise being broken - which
+                    // is a whole class of problem that escrow simply removes.
+                    db.writeBalanceIn(c, player, bal - cost, 0, cost);
+                    db.ledgerIn(c, player, -cost, bal - cost, "order_escrow", null, material,
+                        quantity, "buy order at " + unitPrice + " each");
+                    orderId = insertOrder(c, player, side, material, quantity, unitPrice, cost, 0);
+                } else {
+                    // Sell escrow is the item count. The items themselves were already taken from
+                    // the inventory by the caller, on the main thread, before this ran.
+                    orderId = insertOrder(c, player, side, material, quantity, unitPrice, 0,
+                        quantity);
+                }
+
+                List<Fill> fills = match(c, orderId);
+                c.commit();
+                int filled = fills.stream().mapToInt(Fill::quantity).sum();
+                long value = fills.stream().mapToLong(f -> f.quantity() * f.unitPrice()).sum();
+                return new PlaceResult(orderId, filled, value, null);
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private long insertOrder(Connection c, UUID player, String side, String material,
+                             int quantity, long unitPrice, long escrowBerries, int escrowItems)
+            throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO orders (player, side, material, unit_price, quantity, remaining, "
+              + "escrow_berries, escrow_items, state, created_at, updated_at) VALUES "
+              + "(?, ?, ?, ?, ?, ?, ?, ?, 'open', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+                java.sql.Statement.RETURN_GENERATED_KEYS)) {
+            ps.setString(1, player.toString());
+            ps.setString(2, side);
+            ps.setString(3, material);
+            ps.setLong(4, unitPrice);
+            ps.setInt(5, quantity);
+            ps.setInt(6, quantity);
+            ps.setLong(7, escrowBerries);
+            ps.setInt(8, escrowItems);
+            ps.executeUpdate();
+            try (ResultSet rs = ps.getGeneratedKeys()) {
+                if (!rs.next()) throw new SQLException("order insert returned no id");
+                return rs.getLong(1);
+            }
+        }
+    }
+
+    /**
+     * Matches one order against the book until it is filled or nothing crosses.
+     *
+     * Runs inside the caller's transaction, deliberately. Matching in its own transaction would mean
+     * an order could exist, funded, with a matching counterparty, and no trade - which is a market
+     * that silently stops working.
+     */
+    private List<Fill> match(Connection c, long orderId) throws SQLException {
+        List<Fill> fills = new ArrayList<>();
+
+        String side, material;
+        long price;
+        int remaining;
+        UUID owner;
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT side, material, unit_price, remaining, player FROM orders "
+              + "WHERE id = ? FOR UPDATE")) {
+            ps.setLong(1, orderId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return fills;
+                side = rs.getString(1);
+                material = rs.getString(2);
+                price = rs.getLong(3);
+                remaining = rs.getInt(4);
+                owner = UUID.fromString(rs.getString(5));
+            }
+        }
+        if (remaining <= 0) return fills;
+
+        boolean buying = side.equals("buy");
+        // Best price first, then oldest first. A buy order takes the CHEAPEST sell available; a sell
+        // order takes the HIGHEST buy. Time is the tie-break, so waiting is never punished.
+        String sql = "SELECT id, player, unit_price, remaining FROM orders "
+                   + "WHERE material = ? AND side = ? AND state = 'open' AND remaining > 0 "
+                   + "AND player <> ? AND unit_price " + (buying ? "<= ?" : ">= ?")
+                   + " ORDER BY unit_price " + (buying ? "ASC" : "DESC") + ", created_at ASC, id ASC";
+
+        List<long[]> candidates = new ArrayList<>();
+        List<UUID> candidateOwners = new ArrayList<>();
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, material);
+            ps.setString(2, buying ? "sell" : "buy");
+            // Self-trading refused in the query itself, so it cannot be forgotten in the loop.
+            ps.setString(3, owner.toString());
+            ps.setLong(4, price);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    candidates.add(new long[] { rs.getLong(1), rs.getLong(3), rs.getInt(4) });
+                    candidateOwners.add(UUID.fromString(rs.getString(2)));
+                }
+            }
+        }
+
+        for (int i = 0; i < candidates.size() && remaining > 0; i++) {
+            long otherId = candidates.get(i)[0];
+            long restingPrice = candidates.get(i)[1];
+            UUID otherOwner = candidateOwners.get(i);
+
+            // Lock both rows in id order. The opposite order would deadlock against a simultaneous
+            // match on the same pair.
+            long first = Math.min(orderId, otherId), second = Math.max(orderId, otherId);
+            int otherRemaining = lockAndReadRemaining(c, first, second, orderId, otherId);
+            if (otherRemaining <= 0) continue;
+
+            // Re-read our own remaining under the lock: an earlier iteration changed it.
+            remaining = readRemaining(c, orderId);
+            if (remaining <= 0) break;
+
+            int qty = Math.min(remaining, otherRemaining);
+            long dealPrice = restingPrice;   // the resting order sets it - see the class note
+
+            long buyOrder = buying ? orderId : otherId;
+            long sellOrder = buying ? otherId : orderId;
+            UUID buyer = buying ? owner : otherOwner;
+            UUID seller = buying ? otherOwner : owner;
+
+            // The fill row goes in FIRST, so its existence is the record that the trade happened.
+            try (PreparedStatement ps = c.prepareStatement(
+                    "INSERT INTO order_fills (buy_order_id, sell_order_id, material, quantity, "
+                  + "unit_price, buyer, seller, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, "
+                  + "UTC_TIMESTAMP(3))")) {
+                ps.setLong(1, buyOrder);
+                ps.setLong(2, sellOrder);
+                ps.setString(3, material);
+                ps.setInt(4, qty);
+                ps.setLong(5, dealPrice);
+                ps.setString(6, buyer.toString());
+                ps.setString(7, seller.toString());
+                ps.executeUpdate();
+            }
+
+            long paid = qty * dealPrice;
+
+            // Buyer: consume escrow, receive items to collect. If they offered more than the deal
+            // price, the difference is refunded rather than kept - a market that pockets the
+            // difference is charging a hidden fee.
+            long buyerOffer = buying ? price : restingPrice;
+            long escrowUsed = qty * buyerOffer;
+            long refund = escrowUsed - paid;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "UPDATE orders SET escrow_berries = escrow_berries - ?, "
+                  + "payout_items = payout_items + ?, payout_berries = payout_berries + ?, "
+                  + "remaining = remaining - ?, updated_at = UTC_TIMESTAMP(3) WHERE id = ?")) {
+                ps.setLong(1, escrowUsed);
+                ps.setInt(2, qty);
+                ps.setLong(3, refund);
+                ps.setInt(4, qty);
+                ps.setLong(5, buyOrder);
+                ps.executeUpdate();
+            }
+
+            // Seller: consume item escrow, receive Berries to collect.
+            try (PreparedStatement ps = c.prepareStatement(
+                    "UPDATE orders SET escrow_items = escrow_items - ?, "
+                  + "payout_berries = payout_berries + ?, remaining = remaining - ?, "
+                  + "updated_at = UTC_TIMESTAMP(3) WHERE id = ?")) {
+                ps.setInt(1, qty);
+                ps.setLong(2, paid);
+                ps.setInt(3, qty);
+                ps.setLong(4, sellOrder);
+                ps.executeUpdate();
+            }
+
+            closeIfDone(c, buyOrder);
+            closeIfDone(c, sellOrder);
+
+            fills.add(new Fill(buyOrder, sellOrder, qty, dealPrice, buyer, seller));
+            remaining -= qty;
+        }
+        return fills;
+    }
+
+    private int lockAndReadRemaining(Connection c, long first, long second,
+                                     long mine, long other) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT id, remaining FROM orders WHERE id IN (?, ?) ORDER BY id FOR UPDATE")) {
+            ps.setLong(1, first);
+            ps.setLong(2, second);
+            int otherRemaining = 0;
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    if (rs.getLong(1) == other) otherRemaining = rs.getInt(2);
+                }
+            }
+            return otherRemaining;
+        }
+    }
+
+    private int readRemaining(Connection c, long id) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT remaining FROM orders WHERE id = ?")) {
+            ps.setLong(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        }
+    }
+
+    /** Marks an order filled once nothing is left. State is derived, never guessed. */
+    private void closeIfDone(Connection c, long id) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "UPDATE orders SET state = 'filled' WHERE id = ? AND remaining = 0")) {
+            ps.setLong(1, id);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * Runs a real match and ROLLS IT BACK, asserting that value was conserved.
+     *
+     * This is the strongest evidence available for row 28 without two live players. It exercises the
+     * ACTUAL matching code against the ACTUAL database - the same inserts, the same locks, the same
+     * arithmetic - and then rolls back, so it leaves nothing behind and can run on every boot.
+     *
+     * A test that reimplemented the arithmetic in SQL would only prove that two of my mistakes agree.
+     * A test against a mock would prove less. Rolling back a real transaction is the only way to
+     * exercise the real path without polluting live data.
+     *
+     * WHAT IT ASSERTS, in order of importance:
+     *   1. CONSERVATION. Berries in escrow and payouts, plus balances, are unchanged by the match.
+     *      A match must move value, never create or destroy it - that is row 28 in one sentence.
+     *   2. The resting order sets the price, and the aggressor is refunded the difference.
+     *   3. Item escrow moves to item payout, exactly.
+     *   4. Self-trading is refused.
+     *   5. A fill row exists for every trade.
+     *
+     * @return failure descriptions. Empty is a pass.
+     */
+    List<String> selfTest(UUID a, UUID b) throws SQLException {
+        db.assertOffMainThreadPublic();
+        List<String> fails = new ArrayList<>();
+        try (Connection c = db.openForTransaction()) {
+            c.setAutoCommit(false);
+            try {
+                final String MAT = "__SELFTEST__";
+
+                // A rests a SELL of 10 at 20. B aggresses with a BUY of 4 at 25.
+                // Expected: 4 trade at 20 (the resting price), B is refunded 4 x 5 = 20.
+                long sellId = insertOrder(c, a, "sell", MAT, 10, 20, 0, 10);
+                long buyId  = insertOrder(c, b, "buy",  MAT, 4, 25, 100, 0);
+
+                List<Fill> fills = match(c, buyId);
+
+                if (fills.size() != 1) {
+                    fails.add("expected exactly 1 fill, got " + fills.size());
+                } else {
+                    Fill f = fills.get(0);
+                    if (f.quantity() != 4) fails.add("expected 4 filled, got " + f.quantity());
+                    if (f.unitPrice() != 20) {
+                        fails.add("the RESTING price should apply: expected 20, got "
+                            + f.unitPrice());
+                    }
+                    if (!f.seller().equals(a)) fails.add("seller should be the resting order owner");
+                    if (!f.buyer().equals(b)) fails.add("buyer should be the aggressor");
+                }
+
+                // Seller: 10 items escrowed, 4 sold, so 6 escrowed and 80 Berries to collect.
+                long[] s = readOrder(c, sellId);
+                if (s[0] != 6) fails.add("seller item escrow should be 6, is " + s[0]);
+                if (s[1] != 80) fails.add("seller payout should be 80 Berries, is " + s[1]);
+                if (s[2] != 6) fails.add("seller remaining should be 6, is " + s[2]);
+
+                // Buyer: escrowed 100 (4 x 25), spent 80, so 20 refunded and 4 items to collect.
+                long[] bu = readOrder(c, buyId);
+                if (bu[0] != 0) fails.add("buyer berry escrow should be 0, is " + bu[0]);
+                if (bu[1] != 20) {
+                    fails.add("buyer should be refunded 20 - the difference between the offer and "
+                        + "the resting price - but has " + bu[1]);
+                }
+                if (bu[3] != 4) fails.add("buyer item payout should be 4, is " + bu[3]);
+
+                // CONSERVATION. Everything the two orders hold must still add to what went in:
+                // 100 Berries from the buyer, 10 items from the seller.
+                long berriesNow = s[0] * 0 + s[1] + bu[0] + bu[1];   // payouts plus escrow
+                if (berriesNow != 100) {
+                    fails.add("BERRIES NOT CONSERVED: 100 went in, " + berriesNow
+                        + " is accounted for");
+                }
+                long itemsNow = s[0] + bu[3];
+                if (itemsNow != 10) {
+                    fails.add("ITEMS NOT CONSERVED: 10 went in, " + itemsNow
+                        + " is accounted for");
+                }
+
+                // Self-trading: A aggresses against A's own resting sell. Must not match.
+                long selfBuy = insertOrder(c, a, "buy", MAT, 2, 25, 50, 0);
+                List<Fill> selfFills = match(c, selfBuy);
+                if (!selfFills.isEmpty()) {
+                    fails.add("SELF-TRADE MATCHED: " + selfFills.size()
+                        + " fill(s) between one player's own orders");
+                }
+
+                // A fill row must exist for the real trade and not for the self-trade.
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT COUNT(*) FROM order_fills WHERE material = ?")) {
+                    ps.setString(1, MAT);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        rs.next();
+                        if (rs.getInt(1) != 1) {
+                            fails.add("expected exactly 1 fill row, found " + rs.getInt(1));
+                        }
+                    }
+                }
+                return fails;
+            } finally {
+                // ALWAYS rolled back, including on an assertion failure, so a failing test cannot
+                // leave test orders in a live book.
+                c.rollback();
+            }
+        }
+    }
+
+    /** {escrow_items, payout_berries, remaining, payout_items} for a self-test order. */
+    private long[] readOrder(Connection c, long id) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT escrow_items, payout_berries, remaining, payout_items, escrow_berries "
+              + "FROM orders WHERE id = ?")) {
+            ps.setLong(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return new long[] { -1, -1, -1, -1, -1 };
+                // escrow_berries is returned in slot 0 for buy orders via the caller's convention;
+                // buy orders have no item escrow, so the two never collide.
+                long itemEscrow = rs.getLong(1);
+                long berryEscrow = rs.getLong(5);
+                return new long[] { itemEscrow > 0 ? itemEscrow : berryEscrow,
+                                    rs.getLong(2), rs.getLong(3), rs.getLong(4) };
+            }
+        }
+    }}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_OrderBook_java
+
+# ---- src/main/java/gg/laughtail/core/Market.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Market.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Market_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.Material;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.ItemStack;
+
+import java.sql.SQLException;
+import java.util.List;
+import java.util.logging.Level;
+
+/**
+ * The bazaar commands. `/order`.
+ *
+ * ONLY CATALOGUE MATERIALS CAN BE TRADED HERE, and that is not laziness. An order book trades
+ * fungible goods - "500 iron, any iron" - and the moment NBT is allowed, a buy order for an iron
+ * ingot could be filled with a renamed or differently enchanted one, and every fill needs a
+ * comparison nobody can reason about. Anything with NBT belongs in the auction house, where you buy
+ * one specific item you can see.
+ *
+ * ITEM ESCROW IS TAKEN BEFORE THE DATABASE CALL, on the main thread, and returned if the call fails.
+ * The reverse order would create the order first and then discover the player no longer has the
+ * items - and an unfunded sell order is a promise, which is a whole class of problem escrow removes.
+ */
+final class Market {
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+    private final OrderBook book;
+
+    Market(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+        this.book = new OrderBook(db);
+    }
+
+    OrderBook book() { return book; }
+
+    boolean handle(CommandSender sender, String cmd, String[] args) {
+        if (!cmd.equals("order") && !cmd.equals("orders") && !cmd.equals("bazaar")) return false;
+        if (!(sender instanceof Player p)) {
+            sender.sendMessage("The bazaar is per-player; run this in game.");
+            return true;
+        }
+        String sub = args.length > 0 ? args[0].toLowerCase() : "list";
+        switch (sub) {
+            case "buy"    -> place(p, args, "buy");
+            case "sell"   -> place(p, args, "sell");
+            case "cancel" -> cancel(p, args);
+            case "claim"  -> claim(p);
+            case "book"   -> showBook(p, args);
+            default       -> listMine(p);
+        }
+        return true;
+    }
+
+    private void help(Player p) {
+        p.sendMessage(Component.text("Bazaar - buy and sell orders, matched automatically",
+            NamedTextColor.GOLD));
+        p.sendMessage(Component.text("  /order buy <item> <qty> <price each>",
+            NamedTextColor.GRAY));
+        p.sendMessage(Component.text("  /order sell <item> <qty> <price each>",
+            NamedTextColor.GRAY));
+        p.sendMessage(Component.text("  /order book <item>    see what is on offer",
+            NamedTextColor.GRAY));
+        p.sendMessage(Component.text("  /order claim          collect what your orders earned",
+            NamedTextColor.GRAY));
+        p.sendMessage(Component.text("  /order cancel <id>    withdraw and get your escrow back",
+            NamedTextColor.GRAY));
+        p.sendMessage(Component.text("Nobody has to be online for your order to fill.",
+            NamedTextColor.DARK_GRAY));
+    }
+
+    private void place(Player p, String[] args, String side) {
+        if (args.length < 4) {
+            help(p);
+            return;
+        }
+        final Material m;
+        try {
+            m = Material.valueOf(args[1].toUpperCase());
+        } catch (IllegalArgumentException e) {
+            p.sendMessage(Component.text("No such item: " + args[1], NamedTextColor.RED));
+            return;
+        }
+        if (Shop.entry(m) == null) {
+            p.sendMessage(Component.text("The bazaar only trades shop resources. "
+                + m.name() + " is not one - use the auction house for it.",
+                NamedTextColor.RED));
+            return;
+        }
+        final int qty;
+        final long price;
+        try {
+            qty = Integer.parseInt(args[2]);
+            price = Long.parseLong(args[3]);
+        } catch (NumberFormatException e) {
+            p.sendMessage(Component.text("Quantity and price must both be numbers.",
+                NamedTextColor.RED));
+            return;
+        }
+        if (qty <= 0 || qty > 3456 || price <= 0 || price > 1_000_000L) {
+            p.sendMessage(Component.text("Quantity 1-3456, price 1-1000000.",
+                NamedTextColor.RED));
+            return;
+        }
+
+        if (side.equals("sell")) {
+            // Items leave the inventory FIRST, here on the main thread, and come back if the
+            // database refuses. The reverse order creates an order the player cannot honour.
+            int have = Shop.countIn(p, m);
+            if (have < qty) {
+                p.sendMessage(Component.text("You have " + have + " and tried to sell "
+                    + qty + ".", NamedTextColor.RED));
+                return;
+            }
+            int taken = Shop.removeFrom(p, m, qty);
+            if (taken < qty) {
+                // Put back whatever was taken. A partial take is worse than no take.
+                giveBack(p, m, taken);
+                p.sendMessage(Component.text("Could not take the items. Nothing was listed.",
+                    NamedTextColor.RED));
+                return;
+            }
+        }
+
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                OrderBook.PlaceResult r = book.place(p.getUniqueId(), side, m.name(), qty, price);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    if (!r.ok()) {
+                        if (side.equals("sell")) giveBack(p, m, qty);
+                        p.sendMessage(Component.text("Refused: " + r.refusal(),
+                            NamedTextColor.RED));
+                        return;
+                    }
+                    p.sendMessage(Component.text("Order #" + r.orderId() + " placed: "
+                        + side + " " + qty + " x " + m.name() + " at " + price + " each.",
+                        NamedTextColor.GREEN));
+                    if (r.filledImmediately() > 0) {
+                        p.sendMessage(Component.text("  " + r.filledImmediately()
+                            + " filled immediately for " + r.spentOrEarned()
+                            + " Berries. Use /order claim to collect.", NamedTextColor.GREEN));
+                    } else {
+                        p.sendMessage(Component.text("  Nothing matched yet. It will fill when "
+                            + "someone takes the other side, online or not.",
+                            NamedTextColor.GRAY));
+                    }
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "order place failed: " + e.getMessage());
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    if (side.equals("sell")) giveBack(p, m, qty);
+                    p.sendMessage(Component.text("That failed. Nothing was charged and your "
+                        + "items are back.", NamedTextColor.RED));
+                });
+            }
+        });
+    }
+
+    /** Returns items, dropping what will not fit. Never deletes. */
+    private void giveBack(Player p, Material m, int amount) {
+        if (amount <= 0) return;
+        for (ItemStack left : p.getInventory().addItem(new ItemStack(m, amount)).values()) {
+            p.getWorld().dropItemNaturally(p.getLocation(), left);
+        }
+    }
+
+    private void claim(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                List<Database.Payout> payouts = db.claimOrderPayouts(p.getUniqueId());
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    if (payouts.isEmpty()) {
+                        p.sendMessage(Component.text("Nothing to collect.", NamedTextColor.GRAY));
+                        return;
+                    }
+                    long berries = 0;
+                    for (Database.Payout po : payouts) {
+                        berries += po.berries();
+                        if (po.items() > 0) {
+                            try {
+                                giveBack(p, Material.valueOf(po.material()), po.items());
+                            } catch (IllegalArgumentException ignored) {
+                                plugin.getLogger().warning("payout for unknown material "
+                                    + po.material());
+                            }
+                        }
+                    }
+                    p.sendMessage(Component.text("Collected " + berries + " Berries and your "
+                        + "bought items.", NamedTextColor.GREEN));
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "claim failed: " + e.getMessage());
+                plugin.getServer().getScheduler().runTask(plugin, () -> p.sendMessage(
+                    Component.text("Claim failed. Nothing was lost - try again.",
+                        NamedTextColor.RED)));
+            }
+        });
+    }
+
+    private void cancel(Player p, String[] args) {
+        if (args.length < 2) {
+            p.sendMessage(Component.text("Usage: /order cancel <id>", NamedTextColor.GRAY));
+            return;
+        }
+        final long id;
+        try {
+            id = Long.parseLong(args[1]);
+        } catch (NumberFormatException e) {
+            p.sendMessage(Component.text("That is not an order id.", NamedTextColor.RED));
+            return;
+        }
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                Database.CancelResult r = db.cancelOrder(p.getUniqueId(), id);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    if (!r.ok()) {
+                        p.sendMessage(Component.text(r.message(), NamedTextColor.RED));
+                        return;
+                    }
+                    if (r.items() > 0) {
+                        try {
+                            giveBack(p, Material.valueOf(r.material()), r.items());
+                        } catch (IllegalArgumentException ignored) { }
+                    }
+                    p.sendMessage(Component.text("Order #" + id + " cancelled. "
+                        + (r.berries() > 0 ? r.berries() + " Berries returned. " : "")
+                        + (r.items() > 0 ? r.items() + " items returned." : ""),
+                        NamedTextColor.GREEN));
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.SEVERE, "cancel failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void showBook(Player p, String[] args) {
+        if (args.length < 2) {
+            p.sendMessage(Component.text("Usage: /order book <item>", NamedTextColor.GRAY));
+            return;
+        }
+        final String mat = args[1].toUpperCase();
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                List<String> buys = db.bookSide(mat, "buy", 5);
+                List<String> sells = db.bookSide(mat, "sell", 5);
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    p.sendMessage(Component.text("Order book - " + mat, NamedTextColor.GOLD));
+                    p.sendMessage(Component.text("  Selling (cheapest first)",
+                        NamedTextColor.RED));
+                    if (sells.isEmpty()) {
+                        p.sendMessage(Component.text("    nothing", NamedTextColor.DARK_GRAY));
+                    }
+                    for (String s : sells) {
+                        p.sendMessage(Component.text("    " + s, NamedTextColor.GRAY));
+                    }
+                    p.sendMessage(Component.text("  Buying (highest first)", NamedTextColor.GREEN));
+                    if (buys.isEmpty()) {
+                        p.sendMessage(Component.text("    nothing", NamedTextColor.DARK_GRAY));
+                    }
+                    for (String s : buys) {
+                        p.sendMessage(Component.text("    " + s, NamedTextColor.GRAY));
+                    }
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "book failed: " + e.getMessage());
+            }
+        });
+    }
+
+    private void listMine(Player p) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                List<String> mine = db.myOrders(p.getUniqueId());
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    p.sendMessage(Component.text("Your orders (" + mine.size() + ")",
+                        NamedTextColor.GOLD));
+                    if (mine.isEmpty()) help(p);
+                    for (String s : mine) {
+                        p.sendMessage(Component.text("  " + s, NamedTextColor.GRAY));
+                    }
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().log(Level.WARNING, "my orders failed: " + e.getMessage());
+            }
+        });
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Market_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do

@@ -9,6 +9,10 @@ description: The LaughTail core. Access, rules gate, player registry.
 # otherwise would let it load on a server it cannot run correctly on.
 
 commands:
+  order:
+    description: The bazaar. Buy and sell orders, matched automatically.
+    usage: /order buy|sell|book|claim|cancel|list
+    aliases: [orders, bazaar]
   friend:
     description: Friends list. Requires consent from both sides.
     usage: /friend add|accept|remove|requests|list <player>

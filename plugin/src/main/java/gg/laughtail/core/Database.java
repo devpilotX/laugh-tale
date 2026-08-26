@@ -1719,4 +1719,229 @@ public final class Database {
             }
         }
         return out;
+    }
+    // ---- helpers shared with OrderBook -----------------------------------------
+    //
+    // OrderBook runs its matching inside ONE transaction, so it needs the balance and ledger
+    // primitives that take an existing Connection. These are thin wrappers over the private
+    // versions rather than copies: a second implementation of "write a balance" is how two code
+    // paths end up disagreeing about what a balance is.
+
+    Connection openForTransaction() throws SQLException {
+        assertOffMainThread();
+        return open();
+    }
+
+    void lockBalanceIn(Connection c, UUID uuid) throws SQLException {
+        ensureBalanceRow(c, uuid);
+        lockBalance(c, uuid);
+    }
+
+    long readBalanceIn(Connection c, UUID uuid) throws SQLException {
+        return readLocked(c, uuid);
+    }
+
+    void writeBalanceIn(Connection c, UUID uuid, long newBalance, long in, long out)
+            throws SQLException {
+        writeBalance(c, uuid, newBalance, in, out);
+    }
+
+    void ledgerIn(Connection c, UUID uuid, long delta, long after, String type,
+                  UUID counterparty, String item, Integer qty, String reason) throws SQLException {
+        ledger(c, uuid, delta, after, type, counterparty, item, qty, reason);
+    }
+
+    /** Package-visible so OrderBook can assert the same rule. */
+    void assertOffMainThreadPublic() {
+        assertOffMainThread();
+    }
+    // ---- order book queries and payouts ----------------------------------------
+
+    record Payout(String material, long berries, int items) { }
+    record CancelResult(boolean ok, String message, long berries, int items, String material) { }
+
+    /**
+     * Collects everything the player's orders have earned, in one transaction.
+     *
+     * Berries go straight to the balance with a ledger row; item counts are returned to the caller to
+     * hand over on the main thread. The payout columns are zeroed in the SAME transaction that credits
+     * the balance, so a crash cannot pay twice - which is the duplication bug every "claim your
+     * rewards" system eventually has.
+     */
+    java.util.List<Payout> claimOrderPayouts(UUID player) throws SQLException {
+        assertOffMainThread();
+        java.util.List<Payout> out = new java.util.ArrayList<>();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                long totalBerries = 0;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT id, material, payout_berries, payout_items FROM orders "
+                      + "WHERE player = ? AND (payout_berries > 0 OR payout_items > 0) "
+                      + "FOR UPDATE")) {
+                    ps.setString(1, player.toString());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            out.add(new Payout(rs.getString(2), rs.getLong(3), rs.getInt(4)));
+                            totalBerries += rs.getLong(3);
+                        }
+                    }
+                }
+                if (out.isEmpty()) {
+                    c.rollback();
+                    return out;
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE orders SET payout_berries = 0, payout_items = 0, "
+                      + "updated_at = UTC_TIMESTAMP(3) WHERE player = ? "
+                      + "AND (payout_berries > 0 OR payout_items > 0)")) {
+                    ps.setString(1, player.toString());
+                    ps.executeUpdate();
+                }
+                if (totalBerries > 0) {
+                    ensureBalanceRow(c, player);
+                    lockBalance(c, player);
+                    long bal = readLocked(c, player) + totalBerries;
+                    writeBalance(c, player, bal, totalBerries, 0);
+                    ledger(c, player, totalBerries, bal, "order_payout", null, null, null,
+                        "collected from filled orders");
+                }
+                c.commit();
+                return out;
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Cancels an open order and returns its escrow.
+     *
+     * Only the owner can cancel, enforced in the WHERE clause rather than checked first - a check
+     * followed by an update leaves a window, and the window is somebody else's order.
+     */
+    CancelResult cancelOrder(UUID player, long id) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                String material = null, state = null;
+                long escrowB = 0;
+                int escrowI = 0;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT material, state, escrow_berries, escrow_items FROM orders "
+                      + "WHERE id = ? AND player = ? FOR UPDATE")) {
+                    ps.setLong(1, id);
+                    ps.setString(2, player.toString());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            material = rs.getString(1);
+                            state = rs.getString(2);
+                            escrowB = rs.getLong(3);
+                            escrowI = rs.getInt(4);
+                        }
+                    }
+                }
+                if (material == null) {
+                    c.rollback();
+                    return new CancelResult(false, "No order #" + id + " of yours.", 0, 0, null);
+                }
+                if (!"open".equals(state)) {
+                    c.rollback();
+                    return new CancelResult(false, "Order #" + id + " is already " + state
+                        + ". Use /order claim to collect what it earned.", 0, 0, null);
+                }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "UPDATE orders SET state = 'cancelled', escrow_berries = 0, "
+                      + "escrow_items = 0, remaining = 0, updated_at = UTC_TIMESTAMP(3) "
+                      + "WHERE id = ?")) {
+                    ps.setLong(1, id);
+                    ps.executeUpdate();
+                }
+                if (escrowB > 0) {
+                    ensureBalanceRow(c, player);
+                    lockBalance(c, player);
+                    long bal = readLocked(c, player) + escrowB;
+                    writeBalance(c, player, bal, escrowB, 0);
+                    ledger(c, player, escrowB, bal, "order_refund", null, material, null,
+                        "cancelled order #" + id);
+                }
+                c.commit();
+                return new CancelResult(true, "cancelled", escrowB, escrowI, material);
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    /** One side of the book, best price first. */
+    java.util.List<String> bookSide(String material, String side, int limit) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        String order = side.equals("sell") ? "ASC" : "DESC";
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT unit_price, SUM(remaining) FROM orders WHERE material = ? AND side = ? "
+               + "AND state = 'open' AND remaining > 0 GROUP BY unit_price "
+               + "ORDER BY unit_price " + order + " LIMIT ?")) {
+            ps.setString(1, material);
+            ps.setString(2, side);
+            ps.setInt(3, limit);
+            try (ResultSet rs = ps.executeQuery()) {
+                // Aggregated by price, so the book shows depth rather than a list of individual
+                // orders - and nobody can tell whose order is whose, which removes a targeting hint.
+                while (rs.next()) out.add(rs.getInt(2) + " at " + rs.getLong(1) + " each");
+            }
+        }
+        return out;
+    }
+
+    java.util.List<String> myOrders(UUID player) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT id, side, material, unit_price, remaining, quantity, state, "
+               + "payout_berries, payout_items FROM orders WHERE player = ? "
+               + "AND (state = 'open' OR payout_berries > 0 OR payout_items > 0) "
+               + "ORDER BY id DESC LIMIT 20")) {
+            ps.setString(1, player.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append('#').append(rs.getLong(1)).append(' ')
+                      .append(rs.getString(2)).append(' ')
+                      .append(rs.getString(3)).append(" at ").append(rs.getLong(4))
+                      .append("  ").append(rs.getInt(5)).append('/').append(rs.getInt(6))
+                      .append(" left  ").append(rs.getString(7));
+                    long pb = rs.getLong(8);
+                    int pi = rs.getInt(9);
+                    if (pb > 0 || pi > 0) {
+                        sb.append("  to collect: ");
+                        if (pb > 0) sb.append(pb).append(" Berries ");
+                        if (pi > 0) sb.append(pi).append(" items");
+                    }
+                    out.add(sb.toString());
+                }
+            }
+        }
+        return out;
+    }
+    /** Creates the two self-test identities the order book test needs for its foreign keys. */
+    void ensureSelfTestPlayers(UUID a, UUID b) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO players (uuid, current_name, first_join, last_seen, created_at, "
+               + "updated_at) VALUES (?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3), "
+               + "UTC_TIMESTAMP(3), UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE uuid = uuid")) {
+            ps.setString(1, a.toString());
+            ps.setString(2, "#selftest-a");
+            ps.executeUpdate();
+            ps.setString(1, b.toString());
+            ps.setString(2, "#selftest-b");
+            ps.executeUpdate();
+        }
     }}
