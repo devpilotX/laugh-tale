@@ -1,0 +1,246 @@
+-- V2__combat_stats_and_moderation.sql
+--
+-- Appendix D tables for the combat/rank layer (Section 9) and the moderation layer
+-- (Section 14, 17). Forward-only: once applied, never edited. Corrections arrive as V3.
+--
+-- WHAT THIS DOES NOT DECIDE. The Elo CONSTANTS are not here and cannot be, because
+-- Appendix B contradicts Section 9 in three places - questions.md Q-11 to Q-13 record
+-- them: MAX_GAIN = 40 is unreachable when raw = 24 * (1 - E); the death floor is "the
+-- bottom of the ladder" in 9.2 but max(tier_floor(...)) in Appendix B, which removes
+-- demotion entirely; and decay is "1% per week above the tier floor" in 9.2 but
+-- CR * (1 - DECAY_RATE) in Appendix B, a twentyfold difference at CR 2000.
+-- Schema can be built without resolving those; the rating LOGIC cannot. Storing a
+-- rating needs no opinion about how it is calculated.
+--
+-- Money is BIGINT, timestamps are DATETIME(3) UTC, UUIDs are CHAR(36) ascii_bin -
+-- same conventions as V1, and D-0024 records why each was chosen.
+
+SET NAMES utf8mb4;
+SET time_zone = '+00:00';
+
+-- ---------------------------------------------------------------------------
+-- combat_ratings - the ladder. PER SEASON, unlike stats.
+-- ---------------------------------------------------------------------------
+-- 9.x: rank resets each season, but the history is kept. So the primary key is
+-- (uuid, season_number) rather than uuid alone - a player has one rating per season
+-- and every past season's final rating stays queryable for the Hall of Fame and for
+-- "seasons played, best finish" in 9.8.
+--
+-- Retention: permanent.
+CREATE TABLE IF NOT EXISTS combat_ratings (
+  uuid            CHAR(36)      NOT NULL,
+  season_number   INT UNSIGNED  NOT NULL,
+  current_rp      INT           NOT NULL COMMENT 'rating points. INT not DECIMAL: Appendix B works in whole points',
+  peak_rp         INT           NOT NULL COMMENT 'highest reached THIS season - 9.8 shows peak, and a player who falls should not lose the record of having climbed',
+  games_counted   INT UNSIGNED  NOT NULL DEFAULT 0 COMMENT 'kills that actually affected rating, after anti-farm filtering. Distinct from stats.kills, which counts everything',
+  last_change_at  DATETIME(3)        NULL COMMENT 'UTC. Feeds the 9.2 inactivity decay',
+  created_at      DATETIME(3)   NOT NULL COMMENT 'UTC',
+  updated_at      DATETIME(3)   NOT NULL COMMENT 'UTC',
+  PRIMARY KEY (uuid, season_number),
+  KEY idx_cr_season_rank (season_number, current_rp DESC) COMMENT 'the leaderboard query: top N for a season',
+  KEY idx_cr_decay (season_number, last_change_at) COMMENT 'finds who is due decay without scanning',
+  CONSTRAINT fk_cr_player FOREIGN KEY (uuid) REFERENCES players (uuid) ON DELETE RESTRICT ON UPDATE CASCADE,
+  CONSTRAINT fk_cr_season FOREIGN KEY (season_number) REFERENCES seasons (season_number) ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- combat_events - every kill, and WHY it scored what it scored
+-- ---------------------------------------------------------------------------
+-- This table is the evidence base for four separate acceptance rows, which is why it
+-- records the reasoning and not just the outcome:
+--   row 30  two hours of mining moves RP by exactly zero  - provable only if every
+--           RP change has a row here and mining produces none
+--   row 31  diminishing returns on repeat kills           - needs the multiplier stored
+--   row 32  same-IP kills award zero RP and raise an alert - needs the IP comparison
+--           result stored, which is why same_ip is a column and not a log line
+--   row 14a wagering detection correlates a Berry payment with a death inside 60s -
+--           needs an exact timestamp on the death
+--
+-- Storing `rp_delta` AND `multiplier_applied` AND `suppressed_reason` means a player
+-- disputing their rating can be shown precisely what happened. A single delta column
+-- would make every dispute an argument.
+--
+-- Retention: this grows without bound, so it has a policy - 31.13 governs it. Kept at
+-- full detail for the season, then archived to season_archive and pruned.
+CREATE TABLE IF NOT EXISTS combat_events (
+  id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  season_number       INT UNSIGNED    NOT NULL,
+  killer_uuid         CHAR(36)             NULL COMMENT 'NULL when the death had no player killer - environmental, mob, or fall',
+  victim_uuid         CHAR(36)        NOT NULL,
+  killer_rp_before    INT                  NULL,
+  victim_rp_before    INT                  NULL,
+  rp_delta_killer     INT             NOT NULL DEFAULT 0 COMMENT 'what the killer actually gained, after every multiplier and suppression',
+  rp_delta_victim     INT             NOT NULL DEFAULT 0 COMMENT 'normally negative',
+  multiplier_applied  DECIMAL(5,4)    NOT NULL DEFAULT 1.0000 COMMENT 'the diminishing-returns factor from 9.x. DECIMAL not FLOAT - this number is shown to players and must not drift',
+  suppressed_reason   VARCHAR(40)          NULL COMMENT 'NULL means it counted. Otherwise why not: same_ip, repeat_kill, staff_excluded, combat_log, self_inflicted, new_player_grace',
+  same_ip             TINYINT(1)      NOT NULL DEFAULT 0 COMMENT 'row 32. Compared as hashes, never storing the address itself',
+  world               VARCHAR(48)          NULL,
+  x                   INT                  NULL,
+  y                   INT                  NULL,
+  z                   INT                  NULL,
+  occurred_at         DATETIME(3)     NOT NULL COMMENT 'UTC. Millisecond precision because row 14a correlates against a 60-second window',
+  PRIMARY KEY (id),
+  KEY idx_ce_killer (killer_uuid, occurred_at),
+  KEY idx_ce_victim (victim_uuid, occurred_at),
+  KEY idx_ce_pair (killer_uuid, victim_uuid, occurred_at) COMMENT 'the repeat-kill question: how often has A killed B recently',
+  KEY idx_ce_season (season_number, occurred_at),
+  KEY idx_ce_suppressed (suppressed_reason) COMMENT 'for the row 32 alerting query',
+  CONSTRAINT fk_ce_victim FOREIGN KEY (victim_uuid) REFERENCES players (uuid) ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- stats - 9.8's list. LIFETIME, not per season
+-- ---------------------------------------------------------------------------
+-- "All stats persist across seasons" (9.8), so this is keyed on uuid alone.
+--
+-- Fixed columns for the fixed stats, and two child tables for the two that are
+-- open-ended ("mob kills BY TYPE", "distance travelled BY METHOD"). The alternative -
+-- one key/value table for everything - was rejected: it would make every read a pivot
+-- and lose type safety on counters that are summed and compared constantly.
+--
+-- playtime is stored in SECONDS. 9.8's display rule - "hours until 24, then days and
+-- hours" - is a formatting decision and belongs in the plugin, not the schema. Storing
+-- a pre-formatted value is how you end up unable to sum it.
+CREATE TABLE IF NOT EXISTS stats (
+  uuid                CHAR(36)        NOT NULL,
+  kills               INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'every kill. Only kills feed rank, but not every kill feeds rank - see combat_events.suppressed_reason',
+  deaths              INT UNSIGNED    NOT NULL DEFAULT 0,
+  killstreak_current  INT UNSIGNED    NOT NULL DEFAULT 0,
+  killstreak_best     INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT '9.8: "current and best ever"',
+  blocks_mined        BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '9.8 marks this informational only. Row 30 depends on it having no effect on rank',
+  blocks_placed       BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  playtime_seconds    BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'ACTIVE playtime. 7.3 requires claim accrual to ignore AFK, so idle time must be excluded here too or the two disagree',
+  seasons_played      INT UNSIGNED    NOT NULL DEFAULT 0,
+  best_finish         INT UNSIGNED         NULL COMMENT 'best season placement, 1 = Champion. NULL = never finished a season',
+  champion_titles     INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT '9.8: "the stat everyone wants"',
+  created_at          DATETIME(3)     NOT NULL COMMENT 'UTC',
+  updated_at          DATETIME(3)     NOT NULL COMMENT 'UTC',
+  PRIMARY KEY (uuid),
+  KEY idx_stats_kills (kills DESC),
+  CONSTRAINT fk_stats_player FOREIGN KEY (uuid) REFERENCES players (uuid) ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS stats_mob_kills (
+  uuid       CHAR(36)        NOT NULL,
+  mob_type   VARCHAR(64)     NOT NULL COMMENT 'the Bukkit EntityType name, stored as text so a new mob in a future version needs no migration',
+  kills      BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  updated_at DATETIME(3)     NOT NULL COMMENT 'UTC',
+  PRIMARY KEY (uuid, mob_type),
+  CONSTRAINT fk_smk_player FOREIGN KEY (uuid) REFERENCES players (uuid) ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS stats_distance (
+  uuid       CHAR(36)        NOT NULL,
+  method     VARCHAR(32)     NOT NULL COMMENT 'walk, sprint, swim, boat, minecart, elytra, horse, fall - 9.8 says "by method"',
+  centimetres BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Minecraft measures movement in centimetres internally; storing its own unit avoids rounding on every update',
+  updated_at DATETIME(3)     NOT NULL COMMENT 'UTC',
+  PRIMARY KEY (uuid, method),
+  CONSTRAINT fk_sd_player FOREIGN KEY (uuid) REFERENCES players (uuid) ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- punishments - the published ladder (14.4), applied
+-- ---------------------------------------------------------------------------
+-- Retention: permanent. An expired ban is still evidence, and 17.4 requires that staff
+-- cannot delete the record of what staff did. Expiry is a timestamp, never a deletion.
+CREATE TABLE IF NOT EXISTS punishments (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  target_uuid    CHAR(36)        NOT NULL,
+  type           ENUM('warn','mute','kick','tempban','ban','voice_mute') NOT NULL,
+  reason         VARCHAR(500)    NOT NULL,
+  evidence_ref   VARCHAR(300)         NULL COMMENT 'link or id for the evidence. 14.x requires punishments be evidenced, not asserted',
+  rule_broken    VARCHAR(60)          NULL COMMENT 'which published rule, so the ladder in 14.4 can be audited for consistency',
+  issued_by      CHAR(36)             NULL COMMENT 'NULL means Console - an automated action, which must be distinguishable from a human one',
+  issued_at      DATETIME(3)     NOT NULL COMMENT 'UTC',
+  expires_at     DATETIME(3)          NULL COMMENT 'UTC. NULL = permanent',
+  revoked_at     DATETIME(3)          NULL COMMENT 'UTC. Set when overturned on appeal',
+  revoked_by     CHAR(36)             NULL,
+  revoked_reason VARCHAR(500)         NULL,
+  reviewed_by    CHAR(36)             NULL COMMENT '17.4 wants a two-person rule for permanent bans where possible: one issues, one reviews',
+  PRIMARY KEY (id),
+  KEY idx_pun_target (target_uuid, issued_at),
+  KEY idx_pun_active (target_uuid, type, revoked_at, expires_at) COMMENT 'the join-time question: is this player currently banned or muted',
+  KEY idx_pun_staff (issued_by, issued_at) COMMENT 'for reviewing a staff member''s pattern of punishments',
+  CONSTRAINT fk_pun_target FOREIGN KEY (target_uuid) REFERENCES players (uuid) ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- reports - player reports and their handling
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS reports (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  reporter_uuid CHAR(36)        NOT NULL,
+  target_uuid   CHAR(36)        NOT NULL,
+  reason        VARCHAR(500)    NOT NULL,
+  evidence_ref  VARCHAR(300)         NULL,
+  state         ENUM('open','claimed','resolved','rejected','duplicate') NOT NULL DEFAULT 'open',
+  handled_by    CHAR(36)             NULL,
+  handled_at    DATETIME(3)          NULL COMMENT 'UTC',
+  resolution    VARCHAR(500)         NULL,
+  created_at    DATETIME(3)     NOT NULL COMMENT 'UTC',
+  PRIMARY KEY (id),
+  KEY idx_rep_state (state, created_at) COMMENT 'the staff queue, oldest first',
+  KEY idx_rep_target (target_uuid, created_at) COMMENT 'is this player being repeatedly reported',
+  KEY idx_rep_reporter (reporter_uuid, created_at) COMMENT 'and is this reporter abusing the system',
+  CONSTRAINT fk_rep_reporter FOREIGN KEY (reporter_uuid) REFERENCES players (uuid) ON DELETE RESTRICT ON UPDATE CASCADE,
+  CONSTRAINT fk_rep_target   FOREIGN KEY (target_uuid)   REFERENCES players (uuid) ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- staff_audit - APPEND ONLY, and enforced as such
+-- ---------------------------------------------------------------------------
+-- Appendix D marks this append-only and 17.3 puts audit-log access on the
+-- never-grant-to-Admin list: "Staff must not be able to read or edit the record of what
+-- staff did."
+--
+-- The append-only property is enforced by TRIGGERS, not by convention. A comment saying
+-- "do not update this" is a request; a trigger that raises SQLSTATE 45000 on UPDATE or
+-- DELETE is a guarantee - the same reasoning as the champions PRIMARY KEY in V1 and the
+-- destructive-command guard. Note the app user cannot DROP the triggers either: the
+-- migration runner connects as `laughtail`, which has rights inside this schema, so the
+-- protection is against accident and against a compromised plugin, not against someone
+-- with root. That limit is real and is stated rather than glossed.
+CREATE TABLE IF NOT EXISTS staff_audit (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  staff_uuid   CHAR(36)             NULL COMMENT 'NULL = Console. 17.2: automation only, no human uses console as their identity',
+  staff_name   VARCHAR(32)          NULL COMMENT 'denormalised on purpose: the audit must still read correctly after a rename or an account deletion',
+  action       VARCHAR(64)     NOT NULL COMMENT 'the command or operation performed',
+  target_uuid  CHAR(36)             NULL,
+  target_name  VARCHAR(32)          NULL,
+  parameters   TEXT                 NULL COMMENT 'full arguments. Appendix D asks for who, what, when and to whom',
+  world        VARCHAR(48)          NULL,
+  occurred_at  DATETIME(3)     NOT NULL COMMENT 'UTC',
+  PRIMARY KEY (id),
+  KEY idx_audit_staff (staff_uuid, occurred_at),
+  KEY idx_audit_target (target_uuid, occurred_at),
+  KEY idx_audit_action (action, occurred_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- The append-only enforcement. Written as SINGLE-STATEMENT triggers on purpose: a
+-- BEGIN...END body would need a DELIMITER directive, which is a client-side feature and
+-- would make this file dependent on how it is piped in. One statement each, no
+-- delimiter games, works identically however it is applied.
+CREATE TRIGGER IF NOT EXISTS staff_audit_no_update
+  BEFORE UPDATE ON staff_audit FOR EACH ROW
+  SIGNAL SQLSTATE '45000'
+  SET MESSAGE_TEXT = 'staff_audit is append-only (Appendix D, spec 17.3): rows cannot be modified';
+
+CREATE TRIGGER IF NOT EXISTS staff_audit_no_delete
+  BEFORE DELETE ON staff_audit FOR EACH ROW
+  SIGNAL SQLSTATE '45000'
+  SET MESSAGE_TEXT = 'staff_audit is append-only (Appendix D, spec 17.3): rows cannot be deleted';
+
+-- ---------------------------------------------------------------------------
+-- preferences - the Section 16 settings menu
+-- ---------------------------------------------------------------------------
+-- Key/value here, unlike stats, and for the opposite reason: these are read once per
+-- session and never aggregated, the set will grow as the menu grows, and a new toggle
+-- should not need a migration.
+CREATE TABLE IF NOT EXISTS preferences (
+  uuid       CHAR(36)     NOT NULL,
+  pref_key   VARCHAR(48)  NOT NULL,
+  pref_value VARCHAR(200) NOT NULL,
+  updated_at DATETIME(3)  NOT NULL COMMENT 'UTC',
+  PRIMARY KEY (uuid, pref_key),
+  CONSTRAINT fk_pref_player FOREIGN KEY (uuid) REFERENCES players (uuid) ON DELETE RESTRICT ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
