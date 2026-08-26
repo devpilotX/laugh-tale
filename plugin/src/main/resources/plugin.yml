@@ -9,6 +9,17 @@ description: The LaughTail core. Access, rules gate, player registry.
 # otherwise would let it load on a server it cannot run correctly on.
 
 commands:
+  path:
+    description: Your six Paths and their progress. Titles only, never an advantage.
+    usage: /path [focus <name>]
+    aliases: [paths]
+  house:
+    description: Your House and the seasonal standing.
+    usage: /house [join <ember|tide|verdant|ashen>]
+  title:
+    description: Titles you have earned, and which one you wear.
+    usage: /title [wear <key>]
+    aliases: [titles]
   order:
     description: The bazaar. Buy and sell orders, matched automatically.
     usage: /order buy|sell|book|claim|cancel|list

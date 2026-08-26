@@ -1973,4 +1973,293 @@ public final class Database {
                 return rs.getInt(1) > 0;
             }
         }
+    }
+    // ---- roleplay: paths, houses, titles ----------------------------------------
+
+    record PathResult(long xp, int newLevel, boolean levelledUp) { }
+
+    /**
+     * Adds XP and recomputes the level, returning whether a level was crossed.
+     *
+     * The level is derived from XP and stored, in one statement, so the two can never disagree. Reading
+     * the XP, computing in Java and writing both back would leave a window where a second flush
+     * overwrites the first - which for a batched counter is not theoretical.
+     */
+    PathResult addPathXp(UUID uuid, Path path, long xp) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                long before;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT xp FROM paths WHERE uuid = ? AND path = ? FOR UPDATE")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, path.key());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        before = rs.next() ? rs.getLong(1) : -1;
+                    }
+                }
+                long after = (before < 0 ? 0 : before) + xp;
+                int oldLevel = Path.levelForXp(before < 0 ? 0 : before);
+                int newLevel = Path.levelForXp(after);
+                if (before < 0) {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "INSERT INTO paths (uuid, path, xp, level, created_at, updated_at) "
+                          + "VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))")) {
+                        ps.setString(1, uuid.toString());
+                        ps.setString(2, path.key());
+                        ps.setLong(3, after);
+                        ps.setInt(4, newLevel);
+                        ps.executeUpdate();
+                    }
+                } else {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "UPDATE paths SET xp = ?, level = ?, updated_at = UTC_TIMESTAMP(3) "
+                          + "WHERE uuid = ? AND path = ?")) {
+                        ps.setLong(1, after);
+                        ps.setInt(2, newLevel);
+                        ps.setString(3, uuid.toString());
+                        ps.setString(4, path.key());
+                        ps.executeUpdate();
+                    }
+                }
+                // House standing rises with member progress, so a House of farmers competes with a
+                // House of fighters. Points are XP-derived and grant nothing but standing.
+                addHouseStanding(c, uuid, xp);
+                c.commit();
+                return new PathResult(after, newLevel, newLevel > oldLevel);
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private void addHouseStanding(Connection c, UUID uuid, long points) throws SQLException {
+        int season = activeSeasonNoAssert(c);
+        if (season <= 0) return;
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO house_standing (season_number, house, points, updated_at) "
+              + "SELECT ?, house, ?, UTC_TIMESTAMP(3) FROM house_members WHERE uuid = ? "
+              + "ON DUPLICATE KEY UPDATE points = points + VALUES(points), "
+              + "updated_at = UTC_TIMESTAMP(3)")) {
+            ps.setInt(1, season);
+            ps.setLong(2, points);
+            ps.setString(3, uuid.toString());
+            ps.executeUpdate();
+        }
+    }
+
+    /** Season lookup inside an existing transaction, without re-asserting the thread. */
+    private int activeSeasonNoAssert(Connection c) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT season_number FROM seasons WHERE state IN ('active','finale') "
+              + "ORDER BY season_number DESC LIMIT 1")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : -1;
+            }
+        }
+    }
+
+    java.util.Map<Path, long[]> allPaths(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        java.util.Map<Path, long[]> out = new java.util.EnumMap<>(Path.class);
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT path, xp, level FROM paths WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    Path p = Path.fromKey(rs.getString(1));
+                    if (p != null) out.put(p, new long[] { rs.getLong(2), rs.getInt(3) });
+                }
+            }
+        }
+        return out;
+    }
+
+    void setActivePath(UUID uuid, Path path) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO player_identity (uuid, active_path, updated_at) "
+               + "VALUES (?, ?, UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE "
+               + "active_path = VALUES(active_path), updated_at = UTC_TIMESTAMP(3)")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, path.key());
+            ps.executeUpdate();
+        }
+    }
+
+    /** The Path shown on the HUD, and its xp/level. Null when none chosen. */
+    Object[] activePath(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT i.active_path, p.xp, p.level FROM player_identity i "
+               + "LEFT JOIN paths p ON p.uuid = i.uuid AND p.path = i.active_path "
+               + "WHERE i.uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next() || rs.getString(1) == null) return null;
+                Path p = Path.fromKey(rs.getString(1));
+                if (p == null) return null;
+                return new Object[] { p, rs.getLong(2), rs.getInt(3) };
+            }
+        }
+    }
+
+    void grantTitle(UUID uuid, String key, String display, String colour, String source)
+            throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO titles_owned (uuid, title_key, display, colour, source, "
+                      + "earned_at) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3)) "
+                      + "ON DUPLICATE KEY UPDATE display = VALUES(display)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, key);
+                    ps.setString(3, display);
+                    ps.setString(4, colour);
+                    ps.setString(5, source);
+                    ps.executeUpdate();
+                }
+                // Wearing it automatically is deliberate: a reward the player has to go and equip is a
+                // reward most players never see.
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO player_identity (uuid, active_title, updated_at) "
+                      + "VALUES (?, ?, UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE "
+                      + "active_title = VALUES(active_title), updated_at = UTC_TIMESTAMP(3)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, key);
+                    ps.executeUpdate();
+                }
+                c.commit();
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    java.util.List<String> ownedTitles(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT t.title_key, t.display, t.source, "
+               + "(SELECT active_title FROM player_identity i WHERE i.uuid = t.uuid) "
+               + "FROM titles_owned t WHERE t.uuid = ? ORDER BY t.earned_at")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    boolean worn = rs.getString(1).equals(rs.getString(4));
+                    out.add(rs.getString(2) + "  [" + rs.getString(1) + "]"
+                        + (worn ? "  (worn)" : ""));
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Only a title the player owns can be worn - enforced in the WHERE, not by a prior check. */
+    boolean wearTitle(UUID uuid, String key) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO player_identity (uuid, active_title, updated_at) "
+               + "SELECT ?, ?, UTC_TIMESTAMP(3) FROM titles_owned "
+               + "WHERE uuid = ? AND title_key = ? "
+               + "ON DUPLICATE KEY UPDATE active_title = VALUES(active_title), "
+               + "updated_at = UTC_TIMESTAMP(3)")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, key);
+            ps.setString(3, uuid.toString());
+            ps.setString(4, key);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    /** The worn title's display text and colour, for the HUD and chat. Null when none. */
+    String[] wornTitle(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT t.display, t.colour FROM player_identity i "
+               + "JOIN titles_owned t ON t.uuid = i.uuid AND t.title_key = i.active_title "
+               + "WHERE i.uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? new String[] { rs.getString(1), rs.getString(2) } : null;
+            }
+        }
+    }
+
+    /**
+     * Joins or switches House.
+     *
+     * Switching is allowed but counted. A House you can leave the moment it starts losing is not an
+     * identity, it is a bandwagon - and the counter makes a limit enforceable later without deleting
+     * the history needed to apply it.
+     */
+    String joinHouse(UUID uuid, String house) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            String current = null;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT house FROM house_members WHERE uuid = ?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) current = rs.getString(1);
+                }
+            }
+            if (house.equals(current)) return "You are already in that House.";
+            try (PreparedStatement ps = c.prepareStatement(
+                    "INSERT INTO house_members (uuid, house, joined_at, changes) "
+                  + "VALUES (?, ?, UTC_TIMESTAMP(3), 0) ON DUPLICATE KEY UPDATE "
+                  + "house = VALUES(house), joined_at = UTC_TIMESTAMP(3), changes = changes + 1")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, house);
+                ps.executeUpdate();
+            }
+            return current == null
+                ? "Welcome to House " + house + "."
+                : "You have left House " + current + " for House " + house + ".";
+        }
+    }
+
+    String myHouse(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT h.display, h.motto FROM house_members m "
+               + "JOIN houses h ON h.house = m.house WHERE m.uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) + " - " + rs.getString(2) : null;
+            }
+        }
+    }
+
+    java.util.List<String> houseStanding() throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        int season = activeSeason();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT h.display, IFNULL(s.points, 0), "
+               + "(SELECT COUNT(*) FROM house_members m WHERE m.house = h.house) "
+               + "FROM houses h LEFT JOIN house_standing s ON s.house = h.house "
+               + "AND s.season_number = ? ORDER BY IFNULL(s.points, 0) DESC, h.display")) {
+            ps.setInt(1, season);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(rs.getString(1) + "  " + rs.getLong(2) + " points  "
+                        + rs.getInt(3) + " member(s)");
+                }
+            }
+        }
+        return out;
     }}

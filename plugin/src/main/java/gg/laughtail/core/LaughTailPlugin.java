@@ -52,6 +52,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Social social;
     private Market market;
     private SeasonScheduler seasonScheduler;
+    private Roleplay roleplay;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -97,6 +98,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.shopService = new ShopService(this, database);
         this.social = new Social(this, database);
         this.market = new Market(this, database);
+        this.roleplay = new Roleplay(this, database);
+        getServer().getPluginManager().registerEvents(roleplay, this);
+        roleplay.start();
         this.seasonScheduler = new SeasonScheduler(this, database);
         seasonScheduler.start();
         this.combatTag = new CombatTag(this, database);
@@ -298,6 +302,10 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
      */
     @Override
     public void onDisable() {
+        // Flush pending Path XP before shutdown, or up to 30 seconds of everyone's progress is
+        // silently dropped on every restart - and a progression system that loses progress is worse
+        // than none.
+        if (roleplay != null) roleplay.flushNow();
         if (sellBox != null) {
             try {
                 sellBox.returnAllOnShutdown();
@@ -456,6 +464,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (shopService.handle(sender, name, args)) return true;
         if (social.handle(sender, name, args)) return true;
         if (market.handle(sender, name, args)) return true;
+        if (roleplay.handle(sender, name, args)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }

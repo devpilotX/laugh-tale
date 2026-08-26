@@ -183,6 +183,17 @@ description: The LaughTail core. Access, rules gate, player registry.
 # otherwise would let it load on a server it cannot run correctly on.
 
 commands:
+  path:
+    description: Your six Paths and their progress. Titles only, never an advantage.
+    usage: /path [focus <name>]
+    aliases: [paths]
+  house:
+    description: Your House and the seasonal standing.
+    usage: /house [join <ember|tide|verdant|ashen>]
+  title:
+    description: Titles you have earned, and which one you wear.
+    usage: /title [wear <key>]
+    aliases: [titles]
   order:
     description: The bazaar. Buy and sell orders, matched automatically.
     usage: /order buy|sell|book|claim|cancel|list
@@ -420,6 +431,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
     private Social social;
     private Market market;
     private SeasonScheduler seasonScheduler;
+    private Roleplay roleplay;
     private String rulesVersion;
     private List<String> rulesText;
 
@@ -465,6 +477,9 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         this.shopService = new ShopService(this, database);
         this.social = new Social(this, database);
         this.market = new Market(this, database);
+        this.roleplay = new Roleplay(this, database);
+        getServer().getPluginManager().registerEvents(roleplay, this);
+        roleplay.start();
         this.seasonScheduler = new SeasonScheduler(this, database);
         seasonScheduler.start();
         this.combatTag = new CombatTag(this, database);
@@ -666,6 +681,10 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
      */
     @Override
     public void onDisable() {
+        // Flush pending Path XP before shutdown, or up to 30 seconds of everyone's progress is
+        // silently dropped on every restart - and a progression system that loses progress is worse
+        // than none.
+        if (roleplay != null) roleplay.flushNow();
         if (sellBox != null) {
             try {
                 sellBox.returnAllOnShutdown();
@@ -824,6 +843,7 @@ public final class LaughTailPlugin extends JavaPlugin implements Listener {
         if (shopService.handle(sender, name, args)) return true;
         if (social.handle(sender, name, args)) return true;
         if (market.handle(sender, name, args)) return true;
+        if (roleplay.handle(sender, name, args)) return true;
         if (name.equals("menu")) {
             if (sender instanceof Player mp) { menu.openMain(mp); }
             else { sender.sendMessage(Component.text("A menu needs a screen.", NamedTextColor.GRAY)); }
@@ -3083,6 +3103,295 @@ public final class Database {
                 return rs.getInt(1) > 0;
             }
         }
+    }
+    // ---- roleplay: paths, houses, titles ----------------------------------------
+
+    record PathResult(long xp, int newLevel, boolean levelledUp) { }
+
+    /**
+     * Adds XP and recomputes the level, returning whether a level was crossed.
+     *
+     * The level is derived from XP and stored, in one statement, so the two can never disagree. Reading
+     * the XP, computing in Java and writing both back would leave a window where a second flush
+     * overwrites the first - which for a batched counter is not theoretical.
+     */
+    PathResult addPathXp(UUID uuid, Path path, long xp) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                long before;
+                try (PreparedStatement ps = c.prepareStatement(
+                        "SELECT xp FROM paths WHERE uuid = ? AND path = ? FOR UPDATE")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, path.key());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        before = rs.next() ? rs.getLong(1) : -1;
+                    }
+                }
+                long after = (before < 0 ? 0 : before) + xp;
+                int oldLevel = Path.levelForXp(before < 0 ? 0 : before);
+                int newLevel = Path.levelForXp(after);
+                if (before < 0) {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "INSERT INTO paths (uuid, path, xp, level, created_at, updated_at) "
+                          + "VALUES (?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))")) {
+                        ps.setString(1, uuid.toString());
+                        ps.setString(2, path.key());
+                        ps.setLong(3, after);
+                        ps.setInt(4, newLevel);
+                        ps.executeUpdate();
+                    }
+                } else {
+                    try (PreparedStatement ps = c.prepareStatement(
+                            "UPDATE paths SET xp = ?, level = ?, updated_at = UTC_TIMESTAMP(3) "
+                          + "WHERE uuid = ? AND path = ?")) {
+                        ps.setLong(1, after);
+                        ps.setInt(2, newLevel);
+                        ps.setString(3, uuid.toString());
+                        ps.setString(4, path.key());
+                        ps.executeUpdate();
+                    }
+                }
+                // House standing rises with member progress, so a House of farmers competes with a
+                // House of fighters. Points are XP-derived and grant nothing but standing.
+                addHouseStanding(c, uuid, xp);
+                c.commit();
+                return new PathResult(after, newLevel, newLevel > oldLevel);
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private void addHouseStanding(Connection c, UUID uuid, long points) throws SQLException {
+        int season = activeSeasonNoAssert(c);
+        if (season <= 0) return;
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO house_standing (season_number, house, points, updated_at) "
+              + "SELECT ?, house, ?, UTC_TIMESTAMP(3) FROM house_members WHERE uuid = ? "
+              + "ON DUPLICATE KEY UPDATE points = points + VALUES(points), "
+              + "updated_at = UTC_TIMESTAMP(3)")) {
+            ps.setInt(1, season);
+            ps.setLong(2, points);
+            ps.setString(3, uuid.toString());
+            ps.executeUpdate();
+        }
+    }
+
+    /** Season lookup inside an existing transaction, without re-asserting the thread. */
+    private int activeSeasonNoAssert(Connection c) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT season_number FROM seasons WHERE state IN ('active','finale') "
+              + "ORDER BY season_number DESC LIMIT 1")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : -1;
+            }
+        }
+    }
+
+    java.util.Map<Path, long[]> allPaths(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        java.util.Map<Path, long[]> out = new java.util.EnumMap<>(Path.class);
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT path, xp, level FROM paths WHERE uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    Path p = Path.fromKey(rs.getString(1));
+                    if (p != null) out.put(p, new long[] { rs.getLong(2), rs.getInt(3) });
+                }
+            }
+        }
+        return out;
+    }
+
+    void setActivePath(UUID uuid, Path path) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO player_identity (uuid, active_path, updated_at) "
+               + "VALUES (?, ?, UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE "
+               + "active_path = VALUES(active_path), updated_at = UTC_TIMESTAMP(3)")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, path.key());
+            ps.executeUpdate();
+        }
+    }
+
+    /** The Path shown on the HUD, and its xp/level. Null when none chosen. */
+    Object[] activePath(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT i.active_path, p.xp, p.level FROM player_identity i "
+               + "LEFT JOIN paths p ON p.uuid = i.uuid AND p.path = i.active_path "
+               + "WHERE i.uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next() || rs.getString(1) == null) return null;
+                Path p = Path.fromKey(rs.getString(1));
+                if (p == null) return null;
+                return new Object[] { p, rs.getLong(2), rs.getInt(3) };
+            }
+        }
+    }
+
+    void grantTitle(UUID uuid, String key, String display, String colour, String source)
+            throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO titles_owned (uuid, title_key, display, colour, source, "
+                      + "earned_at) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3)) "
+                      + "ON DUPLICATE KEY UPDATE display = VALUES(display)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, key);
+                    ps.setString(3, display);
+                    ps.setString(4, colour);
+                    ps.setString(5, source);
+                    ps.executeUpdate();
+                }
+                // Wearing it automatically is deliberate: a reward the player has to go and equip is a
+                // reward most players never see.
+                try (PreparedStatement ps = c.prepareStatement(
+                        "INSERT INTO player_identity (uuid, active_title, updated_at) "
+                      + "VALUES (?, ?, UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE "
+                      + "active_title = VALUES(active_title), updated_at = UTC_TIMESTAMP(3)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, key);
+                    ps.executeUpdate();
+                }
+                c.commit();
+            } catch (SQLException e) {
+                c.rollback();
+                throw e;
+            }
+        }
+    }
+
+    java.util.List<String> ownedTitles(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT t.title_key, t.display, t.source, "
+               + "(SELECT active_title FROM player_identity i WHERE i.uuid = t.uuid) "
+               + "FROM titles_owned t WHERE t.uuid = ? ORDER BY t.earned_at")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    boolean worn = rs.getString(1).equals(rs.getString(4));
+                    out.add(rs.getString(2) + "  [" + rs.getString(1) + "]"
+                        + (worn ? "  (worn)" : ""));
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Only a title the player owns can be worn - enforced in the WHERE, not by a prior check. */
+    boolean wearTitle(UUID uuid, String key) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "INSERT INTO player_identity (uuid, active_title, updated_at) "
+               + "SELECT ?, ?, UTC_TIMESTAMP(3) FROM titles_owned "
+               + "WHERE uuid = ? AND title_key = ? "
+               + "ON DUPLICATE KEY UPDATE active_title = VALUES(active_title), "
+               + "updated_at = UTC_TIMESTAMP(3)")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, key);
+            ps.setString(3, uuid.toString());
+            ps.setString(4, key);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    /** The worn title's display text and colour, for the HUD and chat. Null when none. */
+    String[] wornTitle(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT t.display, t.colour FROM player_identity i "
+               + "JOIN titles_owned t ON t.uuid = i.uuid AND t.title_key = i.active_title "
+               + "WHERE i.uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? new String[] { rs.getString(1), rs.getString(2) } : null;
+            }
+        }
+    }
+
+    /**
+     * Joins or switches House.
+     *
+     * Switching is allowed but counted. A House you can leave the moment it starts losing is not an
+     * identity, it is a bandwagon - and the counter makes a limit enforceable later without deleting
+     * the history needed to apply it.
+     */
+    String joinHouse(UUID uuid, String house) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open()) {
+            String current = null;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT house FROM house_members WHERE uuid = ?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) current = rs.getString(1);
+                }
+            }
+            if (house.equals(current)) return "You are already in that House.";
+            try (PreparedStatement ps = c.prepareStatement(
+                    "INSERT INTO house_members (uuid, house, joined_at, changes) "
+                  + "VALUES (?, ?, UTC_TIMESTAMP(3), 0) ON DUPLICATE KEY UPDATE "
+                  + "house = VALUES(house), joined_at = UTC_TIMESTAMP(3), changes = changes + 1")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, house);
+                ps.executeUpdate();
+            }
+            return current == null
+                ? "Welcome to House " + house + "."
+                : "You have left House " + current + " for House " + house + ".";
+        }
+    }
+
+    String myHouse(UUID uuid) throws SQLException {
+        assertOffMainThread();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT h.display, h.motto FROM house_members m "
+               + "JOIN houses h ON h.house = m.house WHERE m.uuid = ?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) + " - " + rs.getString(2) : null;
+            }
+        }
+    }
+
+    java.util.List<String> houseStanding() throws SQLException {
+        assertOffMainThread();
+        java.util.List<String> out = new java.util.ArrayList<>();
+        int season = activeSeason();
+        try (Connection c = open();
+             PreparedStatement ps = c.prepareStatement(
+                 "SELECT h.display, IFNULL(s.points, 0), "
+               + "(SELECT COUNT(*) FROM house_members m WHERE m.house = h.house) "
+               + "FROM houses h LEFT JOIN house_standing s ON s.house = h.house "
+               + "AND s.season_number = ? ORDER BY IFNULL(s.points, 0) DESC, h.display")) {
+            ps.setInt(1, season);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(rs.getString(1) + "  " + rs.getLong(2) + " points  "
+                        + rs.getInt(3) + " member(s)");
+                }
+            }
+        }
+        return out;
     }}
 LT_SRC_EOF_src_main_java_gg_laughtail_core_Database_java
 
@@ -6288,7 +6597,8 @@ import java.util.concurrent.ConcurrentHashMap;
 final class Hud implements Listener {
 
     private record Snapshot(long berries, int rp, String tier, int season, int homes,
-                            int homeMax, int champTitles, int kills, int deaths) { }
+                            int homeMax, int champTitles, int kills, int deaths,
+                            String pathName, long pathXp, int pathLevel, String title) { }
 
     /** The shimmer palette - gold moving through pale yellow and back. */
     private static final List<TextColor> SHIMMER = List.of(
@@ -6343,11 +6653,17 @@ final class Hud implements Listener {
             int season = db.activeSeason();
             int rp = db.currentRp(id, season);
             int[] kd = db.killsAndDeaths(id);
+            Object[] ap = db.activePath(id);
+            String[] worn = db.wornTitle(id);
             cache.put(id, new Snapshot(
                 db.balance(id), rp, Rating.tierName(rp), season,
                 db.homeNames(id).size(),
                 Math.min(Homes.MAX_HOMES, Homes.FREE_SLOTS + db.purchasedSlots(id)),
-                db.championSeasons(id).size(), kd[0], kd[1]));
+                db.championSeasons(id).size(), kd[0], kd[1],
+                ap == null ? null : ((Path) ap[0]).display(),
+                ap == null ? 0L : (Long) ap[1],
+                ap == null ? 0 : (Integer) ap[2],
+                worn == null ? null : worn[0]));
         } catch (SQLException e) {
             // Keep the previous snapshot. Stale beats a sidebar that flickers empty.
             plugin.getLogger().fine("HUD refresh failed: " + e.getMessage());
@@ -6446,6 +6762,16 @@ final class Hud implements Listener {
             line(board, o, i++, Component.text("\u265B ", NamedTextColor.GOLD)
                 .append(Component.text("Champion ", NamedTextColor.GRAY))
                 .append(Component.text("x" + s.champTitles(), NamedTextColor.GOLD)));
+        }
+
+        // The Path bar is the second ladder: something that always moves, for players who are not
+        // winning fights. It is deliberately shown next to rank rather than hidden in a menu.
+        if (s.pathName() != null) {
+            line(board, o, i++, Component.text("\u2692 ", NamedTextColor.YELLOW)
+                .append(Component.text(s.pathName() + " ", NamedTextColor.GRAY))
+                .append(Component.text(String.valueOf(s.pathLevel()), NamedTextColor.WHITE)));
+            line(board, o, i++, Component.text("  " + Path.bar(s.pathXp()),
+                NamedTextColor.DARK_GRAY));
         }
 
         line(board, o, i++, Component.empty());
@@ -9099,6 +9425,496 @@ final class SeasonScheduler {
     }
 }
 LT_SRC_EOF_src_main_java_gg_laughtail_core_SeasonScheduler_java
+
+# ---- src/main/java/gg/laughtail/core/Path.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Path.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Path_java'
+package gg.laughtail.core;
+
+/**
+ * The six Paths and their level curve. See docs/roleplay-design.md.
+ *
+ * THE ONE RULE: a Path level grants STATUS, never POWER. There is no method on this class that returns
+ * a damage multiplier, a health bonus, a speed modifier, a drop rate or a discount, and that is the
+ * design rather than an oversight. Such a method would break Law 1's total equality and violate
+ * acceptance row 30, which requires two hours of mining to change combat rating by EXACTLY ZERO.
+ *
+ * WHY THIS SYSTEM EXISTS AT ALL. Row 30 guarantees that non-combat play cannot move rank - correctly,
+ * because that is what makes the ladder honest. But it leaves a hole: a player who loses fights has
+ * nothing to climb. They mine, build and trade and no visible number moves. Most players are not
+ * top-decile fighters, so a server where they have no progress loses them. Paths are the second
+ * ladder, built so it can never leak into the first.
+ *
+ * THE CURVE IS QUADRATIC, not exponential. Exponential curves are the standard choice and they are
+ * wrong for a server this size: level 30 becomes unreachable, so the ladder stops moving and stops
+ * working. Quadratic keeps early levels quick and late levels meaningful without ever becoming
+ * hopeless. Level 1 costs 100, level 10 costs 10,000, level 50 costs 250,000 - reachable by a
+ * dedicated player in a season, which is the horizon that matters here.
+ */
+enum Path {
+
+    DELVER("delver", "Delver", "Mining, depth, and what is buried"),
+    CULTIVATOR("cultivator", "Cultivator", "Farming, breeding, and growing things"),
+    HUNTER("hunter", "Hunter", "Mobs, danger, and bosses"),
+    WAYFINDER("wayfinder", "Wayfinder", "Distance, biomes, and discovery"),
+    ARTIFICER("artificer", "Artificer", "Crafting, enchanting, and building"),
+    BROKER("broker", "Broker", "Trades, orders, and market volume");
+
+    /** Highest level. Beyond this the Path is mastered and stops accruing titles. */
+    static final int MAX_LEVEL = 50;
+
+    private final String key;
+    private final String display;
+    private final String blurb;
+
+    Path(String key, String display, String blurb) {
+        this.key = key;
+        this.display = display;
+        this.blurb = blurb;
+    }
+
+    String key() { return key; }
+    String display() { return display; }
+    String blurb() { return blurb; }
+
+    static Path fromKey(String k) {
+        for (Path p : values()) {
+            if (p.key.equalsIgnoreCase(k)) return p;
+        }
+        return null;
+    }
+
+    /**
+     * Total XP required to have reached a level.
+     *
+     * Quadratic: 100 * level^2. See the class note on why not exponential.
+     */
+    static long xpForLevel(int level) {
+        if (level <= 0) return 0;
+        return 100L * level * level;
+    }
+
+    /** The level a given lifetime XP total corresponds to. */
+    static int levelForXp(long xp) {
+        if (xp < 100) return 0;
+        // Inverting 100*L^2 <= xp gives L = floor(sqrt(xp/100)). Computed rather than looped, so the
+        // cost does not grow with the level.
+        int level = (int) Math.floor(Math.sqrt(xp / 100.0));
+        return Math.min(level, MAX_LEVEL);
+    }
+
+    /** Progress through the current level, 0.0 to 1.0, for the HUD bar. */
+    static double progress(long xp) {
+        int level = levelForXp(xp);
+        if (level >= MAX_LEVEL) return 1.0;
+        long floor = xpForLevel(level);
+        long ceil = xpForLevel(level + 1);
+        if (ceil <= floor) return 1.0;
+        return Math.max(0.0, Math.min(1.0, (double) (xp - floor) / (ceil - floor)));
+    }
+
+    /**
+     * The title awarded at a level, or null if that level awards none.
+     *
+     * Titles land at 5, 10, 20, 30, 40 and 50 rather than every level. A reward at every level becomes
+     * wallpaper - nobody remembers their 14th title. Six milestones across a Path stay memorable, and
+     * the gaps are what make the next one worth reaching.
+     */
+    String titleAt(int level) {
+        return switch (level) {
+            case 5  -> "Apprentice " + display;
+            case 10 -> "Journeyman " + display;
+            case 20 -> "Adept " + display;
+            case 30 -> "Master " + display;
+            case 40 -> "Grandmaster " + display;
+            case 50 -> display + " Eternal";
+            default -> null;
+        };
+    }
+
+    /** Colour for a level's title. Recognition is the entire reward, so it should look earned. */
+    static String colourAt(int level) {
+        if (level >= 50) return "#FFD447";
+        if (level >= 40) return "#C77DFF";
+        if (level >= 30) return "#4CC9F0";
+        if (level >= 20) return "#52B788";
+        if (level >= 10) return "#F4A261";
+        return "#ADB5BD";
+    }
+
+    /**
+     * A short bar for the HUD. Ten segments, because a sidebar line is narrow and a 20-segment bar
+     * wraps on smaller GUI scales.
+     */
+    static String bar(long xp) {
+        int filled = (int) Math.round(progress(xp) * 10);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 10; i++) {
+            sb.append(i < filled ? '\u25AC' : '\u00B7');
+        }
+        return sb.toString();
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Path_java
+
+# ---- src/main/java/gg/laughtail/core/Roleplay.java ----
+cat > "$SRC/src/main/java/gg/laughtail/core/Roleplay.java" <<'LT_SRC_EOF_src_main_java_gg_laughtail_core_Roleplay_java'
+package gg.laughtail.core;
+
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.format.TextColor;
+import net.kyori.adventure.text.format.TextDecoration;
+import org.bukkit.Material;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import net.kyori.adventure.title.Title;
+
+import java.sql.SQLException;
+import java.time.Duration;
+import java.util.EnumMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Level;
+
+/**
+ * Roleplay: Paths, Houses, titles. See docs/roleplay-design.md.
+ *
+ * XP IS BATCHED, NOT WRITTEN PER EVENT. A block break fires many times a second per player, and a
+ * database write per break would be the single heaviest thing this plugin does. Deltas accumulate in
+ * memory and flush every 30 seconds on an async task - the same mechanism the stats tracker already
+ * uses, for the same reason. The cost of a crash is up to 30 seconds of XP, which nobody notices; the
+ * cost of not batching is a server that stutters whenever anyone mines.
+ *
+ * MOVEMENT IS SAMPLED, NOT COUNTED. PlayerMoveEvent fires on every head turn - dozens per second per
+ * player - and doing arithmetic in it is how plugins destroy TPS. Wayfinder XP is instead sampled on a
+ * timer from the player's position, which costs nothing and cannot be told apart by a player.
+ *
+ * AND THE RULE, ONCE MORE, BECAUSE IT IS THE WHOLE DESIGN: nothing awarded here changes a number that
+ * matters in a fight. Titles, colours, House standing, recognition. Never damage, health, speed, drops,
+ * discounts or permissions. A Path that made a player stronger would break Law 1 and would make rank
+ * measure grinding rather than fighting.
+ */
+final class Roleplay implements Listener {
+
+    private static final long FLUSH_TICKS = 20L * 30;
+
+    private final LaughTailPlugin plugin;
+    private final Database db;
+
+    /** Pending XP per player per Path, awaiting a flush. */
+    private final Map<UUID, Map<Path, Long>> pending = new ConcurrentHashMap<>();
+    /** Last sampled position, for Wayfinder distance. */
+    private final Map<UUID, org.bukkit.Location> lastSample = new ConcurrentHashMap<>();
+
+    Roleplay(LaughTailPlugin plugin, Database db) {
+        this.plugin = plugin;
+        this.db = db;
+    }
+
+    void start() {
+        plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, this::flush,
+            FLUSH_TICKS, FLUSH_TICKS);
+        // Sample movement every 5 seconds instead of handling PlayerMoveEvent. See the class note.
+        plugin.getServer().getScheduler().runTaskTimer(plugin, this::sampleMovement, 100L, 100L);
+    }
+
+    // ---- earning -------------------------------------------------------------
+
+    private void award(UUID id, Path path, long xp) {
+        if (xp <= 0) return;
+        pending.computeIfAbsent(id, k -> new EnumMap<>(Path.class))
+            .merge(path, xp, Long::sum);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onBreak(BlockBreakEvent e) {
+        Material m = e.getBlock().getType();
+        // Ore is worth more than stone, because a Path that levels equally from cobblestone would be
+        // a ladder anyone climbs by facing a wall. The multiplier is XP only - it changes nothing else.
+        long xp = switch (m) {
+            case ANCIENT_DEBRIS -> 60;
+            case DIAMOND_ORE, DEEPSLATE_DIAMOND_ORE, EMERALD_ORE, DEEPSLATE_EMERALD_ORE -> 25;
+            case GOLD_ORE, DEEPSLATE_GOLD_ORE, LAPIS_ORE, DEEPSLATE_LAPIS_ORE,
+                 REDSTONE_ORE, DEEPSLATE_REDSTONE_ORE -> 8;
+            case IRON_ORE, DEEPSLATE_IRON_ORE, COPPER_ORE, DEEPSLATE_COPPER_ORE,
+                 COAL_ORE, DEEPSLATE_COAL_ORE, NETHER_QUARTZ_ORE, NETHER_GOLD_ORE -> 4;
+            default -> 1;
+        };
+        if (isCrop(m)) {
+            award(e.getPlayer().getUniqueId(), Path.CULTIVATOR, 3);
+        } else {
+            award(e.getPlayer().getUniqueId(), Path.DELVER, xp);
+        }
+    }
+
+    private boolean isCrop(Material m) {
+        return switch (m) {
+            case WHEAT, CARROTS, POTATOES, BEETROOTS, NETHER_WART, SUGAR_CANE, MELON, PUMPKIN,
+                 COCOA, SWEET_BERRY_BUSH, BAMBOO -> true;
+            default -> false;
+        };
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlace(BlockPlaceEvent e) {
+        award(e.getPlayer().getUniqueId(), Path.ARTIFICER, 1);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onMobDeath(EntityDeathEvent e) {
+        if (e.getEntity() instanceof Player) return;   // player kills are the PvP ladder, not this one
+        Player killer = e.getEntity().getKiller();
+        if (killer == null) return;
+        long xp = switch (e.getEntityType()) {
+            case ENDER_DRAGON -> 2000;
+            case WITHER -> 1000;
+            case WARDEN -> 800;
+            case ELDER_GUARDIAN -> 200;
+            case RAVAGER, EVOKER -> 60;
+            case BLAZE, WITHER_SKELETON, GUARDIAN, PIGLIN_BRUTE -> 15;
+            case ZOMBIE, SKELETON, SPIDER, CREEPER -> 4;
+            default -> 2;
+        };
+        award(killer.getUniqueId(), Path.HUNTER, xp);
+    }
+
+    /** Called by ShopService and Market so market activity has a ladder too. */
+    void awardBroker(UUID id, long berriesMoved) {
+        // Scaled down hard: a 1,000-Berry trade is 1 XP, so Broker rewards sustained trading rather
+        // than one large transaction, and cannot be farmed by moving Berries back and forth - the
+        // shop's 12% spread makes that lose money faster than it earns XP.
+        award(id, Path.BROKER, Math.max(1, berriesMoved / 1000));
+    }
+
+    private void sampleMovement() {
+        for (Player p : plugin.getServer().getOnlinePlayers()) {
+            org.bukkit.Location now = p.getLocation();
+            org.bukkit.Location before = lastSample.put(p.getUniqueId(), now.clone());
+            if (before == null || !before.getWorld().equals(now.getWorld())) continue;
+            double d = before.distance(now);
+            // Ignore teleports: a 500-block jump in 5 seconds was not travelled. Without this, /rtp
+            // would be the fastest Wayfinder XP on the server.
+            if (d < 2 || d > 200) continue;
+            award(p.getUniqueId(), Path.WAYFINDER, (long) Math.max(1, d / 10));
+        }
+    }
+
+    // ---- flushing and levelling ----------------------------------------------
+
+    private void flush() {
+        if (pending.isEmpty()) return;
+        Map<UUID, Map<Path, Long>> batch = new ConcurrentHashMap<>(pending);
+        pending.clear();
+        for (Map.Entry<UUID, Map<Path, Long>> e : batch.entrySet()) {
+            for (Map.Entry<Path, Long> pe : e.getValue().entrySet()) {
+                try {
+                    Database.PathResult r = db.addPathXp(e.getKey(), pe.getKey(), pe.getValue());
+                    if (r.levelledUp()) {
+                        celebrate(e.getKey(), pe.getKey(), r.newLevel());
+                    }
+                } catch (SQLException ex) {
+                    plugin.getLogger().log(Level.WARNING, "path xp flush failed: "
+                        + ex.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * Announces a level and grants any title it earns.
+     *
+     * A level-up is the payoff for everything above it, so it is deliberately loud - a title, a sound,
+     * and a server announcement at the milestone levels. A progression system whose rewards arrive
+     * silently is a progression system nobody notices they are on.
+     */
+    private void celebrate(UUID id, Path path, int level) {
+        String title = path.titleAt(level);
+        if (title != null) {
+            try {
+                db.grantTitle(id, "path." + path.key() + "." + level, title,
+                    Path.colourAt(level), "path");
+            } catch (SQLException e) {
+                plugin.getLogger().warning("could not grant title: " + e.getMessage());
+            }
+        }
+        plugin.getServer().getScheduler().runTask(plugin, () -> {
+            Player p = plugin.getServer().getPlayer(id);
+            if (p == null) return;
+            p.showTitle(Title.title(
+                Component.text(path.display() + " " + level,
+                    TextColor.fromHexString(Path.colourAt(level))),
+                Component.text(title != null ? "New title: " + title : "Path level up",
+                    NamedTextColor.GRAY),
+                Title.Times.times(Duration.ofMillis(300), Duration.ofSeconds(2),
+                    Duration.ofMillis(600))));
+            p.playSound(p.getLocation(), org.bukkit.Sound.UI_TOAST_CHALLENGE_COMPLETE, 0.7f, 1.0f);
+            if (title != null) {
+                plugin.getServer().broadcast(Component.text(p.getName() + " is now ",
+                        NamedTextColor.GRAY)
+                    .append(Component.text(title, TextColor.fromHexString(Path.colourAt(level)))
+                        .decoration(TextDecoration.BOLD, true))
+                    .append(Component.text(".", NamedTextColor.GRAY)));
+            }
+        });
+    }
+
+    /** Flushes everything immediately. Called on disable so a restart does not drop pending XP. */
+    void flushNow() {
+        flush();
+    }
+
+    // ---- commands ------------------------------------------------------------
+
+    boolean handle(CommandSender sender, String cmd, String[] args) {
+        if (!(sender instanceof Player p)) return false;
+        switch (cmd) {
+            case "path", "paths": return paths(p, args);
+            case "house": return house(p, args);
+            case "title", "titles": return titles(p, args);
+            default: return false;
+        }
+    }
+
+    private boolean paths(Player p, String[] args) {
+        if (args.length >= 2 && args[0].equalsIgnoreCase("focus")) {
+            Path chosen = Path.fromKey(args[1]);
+            if (chosen == null) {
+                p.sendMessage(Component.text("No such Path. One of: delver, cultivator, hunter, "
+                    + "wayfinder, artificer, broker.", NamedTextColor.RED));
+                return true;
+            }
+            plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+                try {
+                    db.setActivePath(p.getUniqueId(), chosen);
+                    plugin.getServer().getScheduler().runTask(plugin, () -> p.sendMessage(
+                        Component.text("Your HUD now shows the " + chosen.display() + " Path.",
+                            NamedTextColor.GREEN)));
+                } catch (SQLException e) {
+                    plugin.getLogger().warning("set path failed: " + e.getMessage());
+                }
+            });
+            return true;
+        }
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                Map<Path, long[]> all = db.allPaths(p.getUniqueId());
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    p.sendMessage(Component.text("Your Paths", NamedTextColor.GOLD));
+                    for (Path path : Path.values()) {
+                        long[] v = all.getOrDefault(path, new long[] { 0, 0 });
+                        long xp = v[0];
+                        int level = (int) v[1];
+                        p.sendMessage(Component.text("  " + path.display(),
+                                TextColor.fromHexString(Path.colourAt(level)))
+                            .append(Component.text("  " + level + "  " + Path.bar(xp)
+                                + "  " + xp + " xp", NamedTextColor.GRAY)));
+                    }
+                    p.sendMessage(Component.text("  /path focus <name> to show one on your HUD",
+                        NamedTextColor.DARK_GRAY));
+                    p.sendMessage(Component.text("  Paths grant titles and recognition only - "
+                        + "never an advantage in a fight.", NamedTextColor.DARK_GRAY));
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().warning("paths failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private boolean house(Player p, String[] args) {
+        if (args.length >= 2 && args[0].equalsIgnoreCase("join")) {
+            final String h = args[1].toLowerCase();
+            if (!h.equals("ember") && !h.equals("tide") && !h.equals("verdant")
+                    && !h.equals("ashen")) {
+                p.sendMessage(Component.text("Houses: ember, tide, verdant, ashen.",
+                    NamedTextColor.RED));
+                return true;
+            }
+            plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+                try {
+                    String result = db.joinHouse(p.getUniqueId(), h);
+                    plugin.getServer().getScheduler().runTask(plugin, () -> {
+                        p.sendMessage(Component.text(result, NamedTextColor.GREEN));
+                        plugin.getServer().broadcast(Component.text(p.getName()
+                            + " has joined House " + h.substring(0, 1).toUpperCase()
+                            + h.substring(1) + ".", NamedTextColor.GRAY));
+                    });
+                } catch (SQLException e) {
+                    plugin.getLogger().warning("join house failed: " + e.getMessage());
+                }
+            });
+            return true;
+        }
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                java.util.List<String> standing = db.houseStanding();
+                String mine = db.myHouse(p.getUniqueId());
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    p.sendMessage(Component.text("Houses", NamedTextColor.GOLD));
+                    p.sendMessage(Component.text("  Yours: "
+                        + (mine == null ? "none - /house join <name>" : mine),
+                        NamedTextColor.WHITE));
+                    for (String s : standing) {
+                        p.sendMessage(Component.text("  " + s, NamedTextColor.GRAY));
+                    }
+                    p.sendMessage(Component.text("  Standing comes from everything members do, "
+                        + "not only fighting - a House of farmers can win.",
+                        NamedTextColor.DARK_GRAY));
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().warning("house failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+
+    private boolean titles(Player p, String[] args) {
+        if (args.length >= 2 && args[0].equalsIgnoreCase("wear")) {
+            final String key = args[1];
+            plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+                try {
+                    boolean ok = db.wearTitle(p.getUniqueId(), key);
+                    plugin.getServer().getScheduler().runTask(plugin, () -> p.sendMessage(ok
+                        ? Component.text("Title changed.", NamedTextColor.GREEN)
+                        : Component.text("You have not earned that title.",
+                            NamedTextColor.RED)));
+                } catch (SQLException e) {
+                    plugin.getLogger().warning("wear title failed: " + e.getMessage());
+                }
+            });
+            return true;
+        }
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                java.util.List<String> owned = db.ownedTitles(p.getUniqueId());
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    p.sendMessage(Component.text("Your titles (" + owned.size() + ")",
+                        NamedTextColor.GOLD));
+                    if (owned.isEmpty()) {
+                        p.sendMessage(Component.text("  none yet - level a Path to earn one",
+                            NamedTextColor.GRAY));
+                    }
+                    for (String s : owned) {
+                        p.sendMessage(Component.text("  " + s, NamedTextColor.GRAY));
+                    }
+                    p.sendMessage(Component.text("  /title wear <key>", NamedTextColor.DARK_GRAY));
+                });
+            } catch (SQLException e) {
+                plugin.getLogger().warning("titles failed: " + e.getMessage());
+            }
+        });
+        return true;
+    }
+}
+LT_SRC_EOF_src_main_java_gg_laughtail_core_Roleplay_java
 
 echo "=== source staged ==="
 find "$SRC/src" "$SRC/pom.xml" -type f | sort | while read -r f; do

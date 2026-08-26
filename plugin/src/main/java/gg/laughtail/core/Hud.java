@@ -51,7 +51,8 @@ import java.util.concurrent.ConcurrentHashMap;
 final class Hud implements Listener {
 
     private record Snapshot(long berries, int rp, String tier, int season, int homes,
-                            int homeMax, int champTitles, int kills, int deaths) { }
+                            int homeMax, int champTitles, int kills, int deaths,
+                            String pathName, long pathXp, int pathLevel, String title) { }
 
     /** The shimmer palette - gold moving through pale yellow and back. */
     private static final List<TextColor> SHIMMER = List.of(
@@ -106,11 +107,17 @@ final class Hud implements Listener {
             int season = db.activeSeason();
             int rp = db.currentRp(id, season);
             int[] kd = db.killsAndDeaths(id);
+            Object[] ap = db.activePath(id);
+            String[] worn = db.wornTitle(id);
             cache.put(id, new Snapshot(
                 db.balance(id), rp, Rating.tierName(rp), season,
                 db.homeNames(id).size(),
                 Math.min(Homes.MAX_HOMES, Homes.FREE_SLOTS + db.purchasedSlots(id)),
-                db.championSeasons(id).size(), kd[0], kd[1]));
+                db.championSeasons(id).size(), kd[0], kd[1],
+                ap == null ? null : ((Path) ap[0]).display(),
+                ap == null ? 0L : (Long) ap[1],
+                ap == null ? 0 : (Integer) ap[2],
+                worn == null ? null : worn[0]));
         } catch (SQLException e) {
             // Keep the previous snapshot. Stale beats a sidebar that flickers empty.
             plugin.getLogger().fine("HUD refresh failed: " + e.getMessage());
@@ -209,6 +216,16 @@ final class Hud implements Listener {
             line(board, o, i++, Component.text("\u265B ", NamedTextColor.GOLD)
                 .append(Component.text("Champion ", NamedTextColor.GRAY))
                 .append(Component.text("x" + s.champTitles(), NamedTextColor.GOLD)));
+        }
+
+        // The Path bar is the second ladder: something that always moves, for players who are not
+        // winning fights. It is deliberately shown next to rank rather than hidden in a menu.
+        if (s.pathName() != null) {
+            line(board, o, i++, Component.text("\u2692 ", NamedTextColor.YELLOW)
+                .append(Component.text(s.pathName() + " ", NamedTextColor.GRAY))
+                .append(Component.text(String.valueOf(s.pathLevel()), NamedTextColor.WHITE)));
+            line(board, o, i++, Component.text("  " + Path.bar(s.pathXp()),
+                NamedTextColor.DARK_GRAY));
         }
 
         line(board, o, i++, Component.empty());

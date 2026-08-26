@@ -774,3 +774,37 @@ with their advantage intact, which turns the rule into a weapon.
 
 **Bookkeeping commands stay open.** `/sethome`, `/homes`, `/delhome` and `/buyhome` are not blocked.
 The exploit being closed is escaping a fight, not administration.
+## D-0038 - roleplay is the Second Ladder, and grants status but never power
+
+**Decision.** The roleplay system is Paths, Houses, Chronicles and in-character chat. Its complete
+reward surface is titles, colours, banners, emotes, lore and recognition. It never grants damage,
+health, speed, drop rate, reach, discounts or permissions. Design in `docs/roleplay-design.md`.
+
+**The problem it solves is bigger than the feature.** Row 30 guarantees that two hours of mining changes
+combat rating by exactly zero, which is what makes the ladder honest - and it leaves a hole. A player
+who loses fights has nothing to climb. Most players are not top-decile fighters, so a server where they
+see no progress loses them. Paths are a second ladder for everyone not winning fights, built so it can
+never leak into the first.
+
+**Why no power, stated once so it is never re-litigated.** A Path that granted a combat bonus would
+break Law 1's total equality AND violate row 30 directly, and it would make rank measure who ground a
+profession rather than who fought better. Every server that adds "just a small perk" discovers within a
+month that the perk is all anyone talks about. This is the same insight as 9.6's Champion title, which
+is valuable precisely BECAUSE it buys nothing.
+
+**Made structural, not promised.** There is no column in any roleplay table that could hold a bonus -
+verified by `test-roleplay.sh`, which searches every roleplay table for any column resembling damage,
+health, speed, bonus, multiplier, discount, permission or drop and requires zero hits. Adding one would
+need a migration somebody has to review. Prose is a request; a missing column is a guarantee.
+
+**Traps deliberately avoided.**
+* **Houses are not factions with land or taxes.** Taxes would create a second economy alongside the
+  Berry ledger, which is the same mistake as the shard shop refused in D-0035 and would break the
+  arbitrage audit's guarantee that value is created in exactly one place.
+* **Chronicles are server-wide, not per-player quest chains.** Per-player chains need NPCs, dialogue
+  trees and state machines that do not fit in the memory this box has.
+* **Soft RP, not hard RP.** Breaking character is not punishable. Enforcement needs constant staff
+  attention this server does not have, and it turns moderation into taste policing.
+
+**The line to hold.** If a roleplay reward ever changes a number that matters in a fight, the design has
+failed.
