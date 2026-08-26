@@ -231,7 +231,6 @@ commands:
   laughtail:
     description: LaughTail administration. Never use vanilla /reload (never-break rule 7).
     usage: /laughtail <status|reload>
-    aliases: [lt]
   rules:
     description: Read the rules, and accept them.
     usage: /rules [accept]
