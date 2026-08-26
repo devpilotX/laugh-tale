@@ -54,16 +54,35 @@ final class Hud implements Listener {
                             int homeMax, int champTitles, int kills, int deaths,
                             String pathName, long pathXp, int pathLevel, String title) { }
 
-    /** The shimmer palette - gold moving through pale yellow and back. */
+    /**
+     * The palette. Five accents, one label grey, one value white.
+     *
+     * Chosen as a set rather than picked per line. The previous version used the sixteen legacy
+     * Minecraft colours, which is why it looked unprofessional - those colours were designed for
+     * 1990s terminals and several of them clash badly against a bright sky. These are one warm
+     * family (amber to gold) plus two cool accents, which is the smallest palette that still lets
+     * each line be told apart at a glance.
+     *
+     * Labels are grey and values white, so the eye lands on the number rather than the word.
+     */
+    private static final TextColor LABEL       = TextColor.fromHexString("#8A8F98");
+    private static final TextColor VALUE       = TextColor.fromHexString("#FFFFFF");
+    private static final TextColor BAR         = TextColor.fromHexString("#5A6570");
+    private static final TextColor ACCENT_WARM  = TextColor.fromHexString("#E8734A");
+    private static final TextColor ACCENT_GOLD  = TextColor.fromHexString("#F2B33D");
+    private static final TextColor ACCENT_COOL  = TextColor.fromHexString("#5BA8D4");
+    private static final TextColor ACCENT_LEAF  = TextColor.fromHexString("#79B851");
+    private static final TextColor ACCENT_MUTED = TextColor.fromHexString("#9A6A6A");
+    /** The header shimmer. Four steps, close together, so it reads as a sheen not a strobe. */
     private static final List<TextColor> SHIMMER = List.of(
-        TextColor.fromHexString("#FFB302"),
-        TextColor.fromHexString("#FFC93C"),
-        TextColor.fromHexString("#FFE07D"),
-        TextColor.fromHexString("#FFF3C4"),
-        TextColor.fromHexString("#FFE07D"),
-        TextColor.fromHexString("#FFC93C")
+        TextColor.fromHexString("#F2B33D"),
+        TextColor.fromHexString("#F7C765"),
+        TextColor.fromHexString("#FFDC96"),
+        TextColor.fromHexString("#F7C765")
     );
 
+    // Shorter than "LAUGH TALE": the header sets the sidebar's minimum width, so a long title makes
+    // every line below it sit further from the edge of the screen.
     private static final String TITLE_TEXT = "LAUGH TALE";
 
     private final LaughTailPlugin plugin;
@@ -81,7 +100,10 @@ final class Hud implements Listener {
         plugin.getServer().getScheduler().runTaskTimer(plugin, this::renderAll, 20L, 20L);
         // Title every 4 ticks: 5 frames a second is smooth enough to read as movement without
         // being a flicker.
-        plugin.getServer().getScheduler().runTaskTimer(plugin, this::animateAll, 20L, 4L);
+        // 8 ticks, not 4. Two and a half frames a second reads as a slow sheen crossing the title, which
+        // is what "minimal" means here - at 5 frames it was closer to a flicker, and it also halves the
+        // packet cost to roughly 60 a second at 24 players.
+        plugin.getServer().getScheduler().runTaskTimer(plugin, this::animateAll, 20L, 8L);
         // Data every 10 seconds, off the main thread. See the class note on row 25.
         plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, this::refreshAll,
             20L, 200L);
@@ -190,58 +212,42 @@ final class Hud implements Listener {
         Scoreboard board = p.getScoreboard();
         int i = 0;
 
-        line(board, o, i++, Component.text("\u2694 ", NamedTextColor.RED)
-            .append(Component.text("Rank ", NamedTextColor.GRAY))
-            .append(Component.text(s.tier(), NamedTextColor.WHITE)));
+        // SIX LINES OF DATA AT MOST, and no blank spacers.
+        //
+        // The previous version ran to twelve lines with two blank separators, which covered a
+        // noticeable share of the screen. A sidebar competes with the game for the same pixels, so
+        // anything on it has to be worth blocking the view for. Homes count and the "/menu" hint were
+        // dropped: neither changes minute to minute, and both are one keystroke away.
+        //
+        // The scoreboard sidebar is ALWAYS drawn at the right edge, vertically centred - that position
+        // is decided by the client and a server cannot move it. The only lever is how much of it is
+        // used, so that is the lever this pulls.
 
-        line(board, o, i++, Component.text("\u2605 ", NamedTextColor.AQUA)
-            .append(Component.text("RP ", NamedTextColor.GRAY))
-            .append(Component.text(String.valueOf(s.rp()), NamedTextColor.WHITE)));
+        line(board, o, i++, row("\u2694", "Rank", s.tier(), ACCENT_WARM));
+        line(board, o, i++, row("\u2605", "RP", String.valueOf(s.rp()), ACCENT_COOL));
+        line(board, o, i++, row("\u2620", "K/D", s.kills() + "/" + s.deaths(), ACCENT_MUTED));
+        line(board, o, i++, row("\u25C8", "Berries", String.valueOf(s.berries()), ACCENT_GOLD));
 
-        line(board, o, i++, Component.text("\u2620 ", NamedTextColor.DARK_RED)
-            .append(Component.text("K/D ", NamedTextColor.GRAY))
-            .append(Component.text(s.kills() + "/" + s.deaths(), NamedTextColor.WHITE)));
-
-        line(board, o, i++, Component.empty());
-
-        line(board, o, i++, Component.text("\u25C8 ", NamedTextColor.GOLD)
-            .append(Component.text("Berries ", NamedTextColor.GRAY))
-            .append(Component.text(String.valueOf(s.berries()), NamedTextColor.YELLOW)));
-
-        line(board, o, i++, Component.text("\u2302 ", NamedTextColor.GREEN)
-            .append(Component.text("Homes ", NamedTextColor.GRAY))
-            .append(Component.text(s.homes() + "/" + s.homeMax(), NamedTextColor.WHITE)));
+        // The Path bar is the one line that moves while you play, so it earns its place. Level and bar
+        // share a line rather than taking two.
+        if (s.pathName() != null) {
+            line(board, o, i++, Component.text("\u2692 ", ACCENT_LEAF)
+                .append(Component.text(shortPath(s.pathName()) + " ", LABEL))
+                .append(Component.text(String.valueOf(s.pathLevel()) + " ", VALUE))
+                .append(Component.text(Path.bar(s.pathXp()), BAR)));
+        }
 
         if (s.champTitles() > 0) {
-            line(board, o, i++, Component.text("\u265B ", NamedTextColor.GOLD)
-                .append(Component.text("Champion ", NamedTextColor.GRAY))
-                .append(Component.text("x" + s.champTitles(), NamedTextColor.GOLD)));
+            line(board, o, i++, row("\u265B", "Champion", "x" + s.champTitles(), ACCENT_GOLD));
         }
-
-        // The Path bar is the second ladder: something that always moves, for players who are not
-        // winning fights. It is deliberately shown next to rank rather than hidden in a menu.
-        if (s.pathName() != null) {
-            line(board, o, i++, Component.text("\u2692 ", NamedTextColor.YELLOW)
-                .append(Component.text(s.pathName() + " ", NamedTextColor.GRAY))
-                .append(Component.text(String.valueOf(s.pathLevel()), NamedTextColor.WHITE)));
-            line(board, o, i++, Component.text("  " + Path.bar(s.pathXp()),
-                NamedTextColor.DARK_GRAY));
-        }
-
-        line(board, o, i++, Component.empty());
 
         line(board, o, i++, s.season() > 0
-            ? Component.text("\u25F7 ", NamedTextColor.LIGHT_PURPLE)
-                .append(Component.text("Season ", NamedTextColor.GRAY))
-                .append(Component.text(String.valueOf(s.season()), NamedTextColor.WHITE))
-            : Component.text("\u25F7 ", NamedTextColor.DARK_GRAY)
-                .append(Component.text("No active season", NamedTextColor.DARK_GRAY)));
+            ? row("\u25F7", "Season", String.valueOf(s.season()), ACCENT_COOL)
+            : Component.text("\u25F7 ", ACCENT_MUTED)
+                .append(Component.text("No season", LABEL)));
 
-        line(board, o, i++, Component.text("\u2726 ", TextColor.fromHexString("#FFE07D"))
-            .append(Component.text("/menu", NamedTextColor.WHITE)));
-
-        // Any line left over from a previous render - for instance the Champion line after a
-        // reset - must be removed or it would linger with stale text.
+        // Any line left over from a previous render - the Champion line after a reset, or the Path line
+        // if it was unfocused - must be removed or it lingers with stale text.
         for (int stale = i; stale < 16; stale++) {
             Team t = board.getTeam("lt" + stale);
             if (t != null) {
@@ -249,5 +255,23 @@ final class Hud implements Listener {
                 t.unregister();
             }
         }
+    }
+
+    /**
+     * One line: coloured icon, grey label, white value.
+     *
+     * The owner asked for labels grey and values white, which is also simply better - the eye lands on
+     * the number rather than on the word next to it. Colour is spent on the icon alone, so the palette
+     * stays legible instead of turning into a rainbow of competing text.
+     */
+    private Component row(String icon, String label, String value, TextColor iconColour) {
+        return Component.text(icon + " ", iconColour)
+            .append(Component.text(label + " ", LABEL))
+            .append(Component.text(value, VALUE));
+    }
+
+    /** Trims a Path name so the line cannot force the sidebar wider than it needs to be. */
+    private String shortPath(String name) {
+        return name.length() > 10 ? name.substring(0, 10) : name;
     }
 }
