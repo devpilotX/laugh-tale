@@ -1,4 +1,4 @@
-﻿# LaughTail SMP - plugin and server manifest
+# LaughTail SMP - plugin and server manifest
 #
 # Never-break rule 9: never install a plugin that is not in this manifest
 # with a pinned version and a checksum. Spec 4.2: never a floating latest tag.
@@ -6,15 +6,33 @@
 # Every checksum here is stated by the PUBLISHER, fetched from its own API.
 # Regenerate with scripts/manifest-resolve.ps1. Verify with scripts/verify-manifest.ps1.
 #
-# Resolved 2026-08-26 against Minecraft 1.21.11 (decision D-0011).
+# Resolved 2026-08-26 against Minecraft 26.2.
 #
-# AARCH64 LOAD PROOF: PASSED for all nine components, 2026-08-26 (deviation D5).
-# All eight plugins were observed enabling on this Graviton host under Paper
-# 1.21.11-132 with zero ERROR or SEVERE lines. Paper additionally reported using
-# its native aarch64 libdeflate and OpenSSL, so the native path is exercised, not
-# merely absent. Re-run the proof whenever any pinned version changes.
+# VERSION MOVE, 1.21.11 -> 26.2, and why. D-0011 pinned 1.21.11 because it was the
+# newest version every plugin stated support for. That pin turned out to be the root
+# cause of unplayable movement: the owner - and anyone using the default launcher -
+# connects with 26.2, so ViaVersion translated every packet, and GrimAC predicts
+# movement FROM packets. Its own boot warning calls that combination unsupported, and
+# it produced setbacks that felt like being unable to sprint.
+#
+# Matching the server to the client generation removes the translation layer for
+# current-version players entirely. Checked BEFORE moving, not after:
+# plugin-support.ps1 confirmed ViaVersion, ViaBackwards, LuckPerms, Chunky, spark and
+# Simple Voice Chat all state 26.2, and Geyser and Floodgate track the newest release
+# by design (their own APIs return 2.11.2-b1232 and 2.2.5-b140 as latest).
+#
+# The one casualty is GrimAC: its latest release states 1.21.11 and has NO 26.2 build,
+# so it could not have worked with a 26.2 client under either pin. See its entry.
+#
+# Via stays at STABLE 5.11.0. Modrinth offers 5.12.0 for 26.2 but only as a SNAPSHOT,
+# and spec 4.2 forbids a floating pin. With the server on the client's version these
+# are now inert for current players and translate only for genuinely older clients.
+#
+# AARCH64 LOAD PROOF: re-run required. The proof below was taken under Paper
+# 1.21.11-132; the header rule is "re-run the proof whenever any pinned version
+# changes", and Paper and Chunky have both changed.
 
-minecraft_version: "1.21.11"
+minecraft_version: "26.2"
 architecture_required: "aarch64"
 
 # Container images. Never-break rule 9 is written about plugins, but a database
@@ -45,14 +63,14 @@ bundled:
 components:
   - name: "paper"
     role: "Server software (4.1)"
-    version: "1.21.11-132"
-    file: "paper-1.21.11-132.jar"
+    version: "26.2-119"
+    file: "paper-26.2-119.jar"
     checksum_algo: "sha256"
-    checksum: "5ffef465eeeb5f2a3c23a24419d97c51afd7dbb4923ff42df9a3f58bba1ccfba"
-    url: "https://fill-data.papermc.io/v1/objects/5ffef465eeeb5f2a3c23a24419d97c51afd7dbb4923ff42df9a3f58bba1ccfba/paper-1.21.11-132.jar"
+    checksum: "a8c9140c3075bd7c04973e9cdc491b21bfe6bad472b674ef932a4ae0fec19629"
+    url: "https://fill-data.papermc.io/v1/objects/a8c9140c3075bd7c04973e9cdc491b21bfe6bad472b674ef932a4ae0fec19629/paper-26.2-119.jar"
     checksum_source: "fill.papermc.io/v3"
     arm64_load_proof: "PASS 2026-08-26 03:14-03:15 UTC - observed Enabling on aarch64, Paper 1.21.11-132 / Temurin 25.0.4, Done (83.5s), zero ERROR or SEVERE. Evidence: scripts/remote/start-server-and-verify.sh"
-    notes: "java_minimum 21; jar size 54846016 bytes; built 2026-05-11T11:43:09Z"
+    notes: "build 119, channel STABLE. Replaces 1.21.11-132; see the version-move note in the header"
   - name: "geyser"
     role: "Bedrock crossplay (4.4)"
     version: "2.11.2-b1232"
@@ -100,14 +118,14 @@ components:
     arm64_load_proof: "PASS 2026-08-26 03:14-03:15 UTC - observed Enabling on aarch64, Paper 1.21.11-132 / Temurin 25.0.4, Done (83.5s), zero ERROR or SEVERE. Evidence: scripts/remote/start-server-and-verify.sh"
   - name: "chunky"
     role: "World pregeneration (Phase 2)"
-    version: "1.4.40"
-    file: "Chunky-Bukkit-1.4.40.jar"
+    version: "1.5.3"
+    file: "Chunky-Bukkit-1.5.3.jar"
     checksum_algo: "sha512"
-    checksum: "b017fd180141b5c14c38dfb10128d5f5a1072a68ff93ee486d4465953331f5851f09a09b4a159364837a95d192198d8e9885ce39c46eed32dacbf1fd65c6f30f"
-    url: "https://cdn.modrinth.com/data/fALzjamp/versions/P3y2MXnd/Chunky-Bukkit-1.4.40.jar"
+    checksum: "43ffecc6e6a734b752da41575bbb316526c124c3f878942437d5133c377bfbd9b78bda975520dc074d7158c15dade58a444ccd0fd8d8a25d165b6fc450140422"
+    url: "https://cdn.modrinth.com/data/fALzjamp/versions/MdY6JATr/Chunky-Bukkit-1.5.3.jar"
     checksum_source: "api.modrinth.com/v2"
     arm64_load_proof: "PASS 2026-08-26 03:14-03:15 UTC - observed Enabling on aarch64, Paper 1.21.11-132 / Temurin 25.0.4, Done (83.5s), zero ERROR or SEVERE. Evidence: scripts/remote/start-server-and-verify.sh"
-    notes: "newest Chunky release is 1.5.3 but it does NOT state 1.21.11 support; 1.4.40 does. Spec 4.2 requires stated support for the exact version."
+    notes: "1.5.3 now, because it states 26.2. The earlier 1.4.40 pin existed only because 1.5.3 did not state 1.21.11 - the version move resolves that inversion."
   - name: "grimac"
     role: "Simulation anti-cheat (14.1)"
     version: "2.3.73"

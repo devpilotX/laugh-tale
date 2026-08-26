@@ -1,7 +1,7 @@
 name: LaughTail
 version: '${project.version}'
 main: gg.laughtail.core.LaughTailPlugin
-api-version: '1.21'
+api-version: '26.2'
 author: LaughTail SMP
 description: The LaughTail core. Access, rules gate, player registry.
 

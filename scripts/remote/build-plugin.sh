@@ -11,7 +11,7 @@ set -e
 
 SRC=/home/ubuntu/laughtail-plugin
 M2=/home/ubuntu/.m2
-IMAGE=maven:3.9.9-eclipse-temurin-21
+IMAGE=maven:3.9-eclipse-temurin-25
 VERSION=0.1.0
 V=$(sudo -n ls -1 /var/lib/pelican/volumes | head -1)
 D="/var/lib/pelican/volumes/$V"
@@ -48,9 +48,11 @@ cat > "$SRC/pom.xml" <<'LT_SRC_EOF_pom_xml'
   snapshot, and OA-03 means no snapshot exists. A container needs nothing on the
   host and leaves nothing behind.
 
-  JAVA 21, not 25. The server runs Temurin 25, but Paper 1.21.11 targets Java 21 and
-  compiling to 21 means the jar runs on both. Targeting 25 would tie the plugin to
-  this exact runtime for no benefit.
+  JAVA 25, and not by choice. Paper 26.2's API jar is compiled to class file major
+  version 69, which IS Java 25 - a release 21 compile cannot even read it and
+  javac reports every symbol as missing rather than naming the version. Measured:
+  "class file has wrong version 69.0, should be 65.0". So Minecraft 26.x requires
+  Java 25, the server already runs Temurin 25, and the plugin now matches.
 
   THE MARIADB DRIVER IS SHADED IN, deliberately. Paper's plugin.yml `libraries:`
   mechanism would keep the jar small but downloads from Maven Central on first load,
@@ -70,10 +72,15 @@ cat > "$SRC/pom.xml" <<'LT_SRC_EOF_pom_xml'
   <name>LaughTail</name>
 
   <properties>
-    <maven.compiler.release>21</maven.compiler.release>
+    <maven.compiler.release>25</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <!-- Pinned. Never a floating version - spec 4.2. -->
-    <paper.api.version>1.21.11-R0.1-SNAPSHOT</paper.api.version>
+    <!-- Pinned. Never a floating version - spec 4.2.
+         Paper changed its API coordinate scheme for the 26.x line: the artifact is
+         26.2.build.<n>-stable, which pins the API to the EXACT server build rather
+         than to a version-wide -R0.1-SNAPSHOT. That is strictly better for this
+         project - API and server cannot drift apart - and it is why the first
+         attempt at 26.2-R0.1-SNAPSHOT could not be resolved. -->
+    <paper.api.version>26.2.build.119-stable</paper.api.version>
     <mariadb.driver.version>3.5.2</mariadb.driver.version>
   </properties>
 
@@ -111,7 +118,11 @@ cat > "$SRC/pom.xml" <<'LT_SRC_EOF_pom_xml'
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-shade-plugin</artifactId>
-        <version>3.5.3</version>
+        <!-- 3.6.2, not 3.5.3. Shade rewrites bytecode with ASM, and 3.5.3's ASM
+             cannot read Java 25 class files: it fails with
+             "Unsupported class file major version 69" AFTER a successful compile,
+             which looks like a shading bug and is really a toolchain version gap. -->
+        <version>3.6.2</version>
         <executions>
           <execution>
             <phase>package</phase>
@@ -164,7 +175,7 @@ cat > "$SRC/src/main/resources/plugin.yml" <<'LT_SRC_EOF_src_main_resources_plug
 name: LaughTail
 version: '${project.version}'
 main: gg.laughtail.core.LaughTailPlugin
-api-version: '1.21'
+api-version: '26.2'
 author: LaughTail SMP
 description: The LaughTail core. Access, rules gate, player registry.
 

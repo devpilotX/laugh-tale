@@ -509,3 +509,33 @@ Rule 4 requires **25% or 768 MB**. It was failing both tests, and the reassuring
 **One honest limitation:** connections are opened per operation rather than pooled. That is fine for a handful of writes per join and 24 players, and it will need revisiting before Phase 3's order book, which is write-heavy and latency-sensitive. Noted rather than glossed.
 
 **Verified:** loads on aarch64 as the 9th plugin, `Database reachable, migration V1 present.`, zero ERROR lines, and `/laughtail status` reports version, rules version and database state over RCON.
+
+
+---
+
+## D-0028 | 2026-08-26 | The server moves from Minecraft 1.21.11 to 26.2, matching the client
+
+**This reverses the version half of D-0011**, and the reason is that D-0011's premise was right but incomplete. It pinned 1.21.11 because that was the newest version every plugin *stated* support for. What it did not account for is that **players do not choose the server's version - their launcher does**. The owner connected with 26.2, so ViaVersion translated every packet, and GrimAC - which predicts movement *from* packets - mispredicted and set them back. The symptom reported was "I cannot even sprint".
+
+So the pin was not merely conservative, it was the cause of an unplayable server.
+
+**Checked before moving, not after.** `scripts/plugin-support.ps1` asked each publisher directly: ViaVersion, ViaBackwards, LuckPerms, Chunky, spark and Simple Voice Chat all state 26.2; Geyser and Floodgate track the newest release by design and their own APIs return 2.11.2-b1232 and 2.2.5-b140 as latest, which are already the pinned builds.
+
+**Two pins changed:** Paper 1.21.11-132 → **26.2-119** (stable), and Chunky 1.4.40 → **1.5.3**. That second one is a satisfying inversion: 1.4.40 was pinned *only* because 1.5.3 did not state 1.21.11 support. Moving to 26.2 resolved the conflict rather than working around it.
+
+**Via stays at stable 5.11.0.** Modrinth offers 5.12.0 for 26.2 but only as a SNAPSHOT, and spec 4.2 forbids a floating pin. With the server on the client's generation, Via is now inert for current players and translates only for genuinely older ones - which also means the OA-27 conflict no longer affects anybody playing on a current client.
+
+**The casualty is GrimAC, and it was unavoidable either way.** Its latest release states 1.21.11 and has **no 26.2 build at all**, so it could not have worked with a 26.2 client under either pin. It stays quarantined, still checksum-verified in the manifest. **Acceptance row 50 remains unclaimable and has never been claimed.** This is now the single most important open item before launch: a PvP server whose product is fairness cannot open without anti-cheat. OA-27 is updated accordingly.
+
+**Four toolchain problems the move exposed, each of which reported something other than its cause:**
+
+1. **`paper-api:26.2-R0.1-SNAPSHOT` does not exist.** Paper changed its API coordinate scheme for the 26.x line to `26.2.build.119-stable`. That is strictly better for this project - the API is pinned to the exact server build, so the two cannot drift - but the failure read as a missing repository.
+2. **`class file has wrong version 69.0, should be 65.0`.** Major version 69 is **Java 25**: Minecraft 26.x requires it. Compiling with `release 21` could not read the API at all, and javac reported *every symbol as missing* rather than naming the version. The plugin now targets 25, which the server already runs.
+3. **`Unsupported class file major version 69`** from maven-shade-plugin 3.5.3, *after* a successful compile - its bundled ASM cannot read Java 25 bytecode. Fixed by moving to shade 3.6.2. This one looked like a shading bug and was a toolchain gap.
+4. **`--` inside an XML comment** is illegal, which broke the POM after I wrote `release 21` with dashes in a comment. Trivial, and worth recording because the error message pointed at a character position, not at the rule.
+
+**The world upgraded, and the owner's original world did not.** Paper performed a `WorldFolderMigration` on boot; the `laughtail` world now reports **DataVersion 4903**, which is 26.2. The pre-existing `world/` directory - which was 26.2 all along, and was the reason D-0013 pointed `level-name` elsewhere - still has an unchanged mtime. It is now *readable* by this server for the first time, but it stays untouched: D-0013 stands until the owner says otherwise.
+
+**And a real defect this surfaced:** Paper reported `Ambiguous plugin name 'Chunky'` because both 1.5.3 and 1.4.40 sat in `plugins/`, with load order decided by chance. The cause was a **bare `[ -f ]`** in the installer - the sixth instance of that class in this project. The `ubuntu` user cannot traverse the Pelican volume, so the test returned false for a file that existed and the quarantine was silently skipped. The same script also still contained the *original* instance, which had been reporting "server.jar.prebuild already exists, leaving it" for a rollback copy it had never checked. Both now use `sudo -n test -f`.
+
+**Verified:** Paper 26.2-119 running, API 26.2.build.119-stable, all 8 plugins loaded including Chunky 1.5.3 and LaughTail 0.1.0, boot in 45 s, **zero ERROR lines**, 31 of 31 deploy stages green.

@@ -54,7 +54,7 @@ $a = { param($s) $o.Add($s) }
 & $a ''
 & $a 'SRC=/home/ubuntu/laughtail-plugin'
 & $a 'M2=/home/ubuntu/.m2'
-& $a 'IMAGE=maven:3.9.9-eclipse-temurin-21'
+& $a 'IMAGE=maven:3.9-eclipse-temurin-25'
 & $a ('VERSION={0}' -f $version)
 & $a 'V=$(sudo -n ls -1 /var/lib/pelican/volumes | head -1)'
 & $a 'D="/var/lib/pelican/volumes/$V"'
