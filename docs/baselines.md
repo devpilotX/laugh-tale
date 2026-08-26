@@ -60,3 +60,29 @@ Deliberately listed so the gaps are visible rather than assumed:
 * **Per-player cost.** Needs real or bot clients; Phase 6.
 * **Pregenerated-world I/O.** This world is spawn-sized only. Phase 2 changes it materially.
 * **Anything under CPU-credit throttling.** This instance is burstable (**R1**, **OA-05**), and every figure above was taken with a healthy credit balance. A throttled reading would look completely different, which is precisely why OA-05 must be settled before Phase 6.
+
+
+---
+
+## B2 - the same server, with the database container added
+
+Captured 2026-08-26 04:11 UTC, immediately after `V1__init.sql` was applied. Same host, same server, same heap. The only change is that spec 5.2's `db` container is now running.
+
+| Measure | B1 (no database) | B2 (with database) | Change |
+| --- | --- | --- | --- |
+| Host memory used | 3,175 MB | 3,306 MB | **+131 MB** |
+| Host memory available | 650 MB | **519 MB** | **−131 MB** |
+| Page cache | 695 MB | 592 MB | −103 MB |
+| `laughtail-db` memory | - | 180.4 MiB of a 320 MiB cap | new |
+| `laughtail-db` CPU | - | 0.03% | negligible |
+| Game container | 2.468 GiB / 3.025 GiB | unchanged | - |
+
+**CPU is a non-issue; memory is the whole story.** The database costs 0.03% CPU and 180 MiB. Nothing here is failing, and the container's own 320 MiB cap means it cannot grow into the game server's space.
+
+**But the trend is the finding.** Available memory has now gone 1,844 MB → 650 MB → 519 MB across this session, in two deliberate steps: fixing the heap at 2 GiB, then adding the database. Both were correct decisions - the first fixed a never-break rule 4 violation, the second is required by spec 5.2 - and together they have consumed most of the slack this box had.
+
+What still has to fit into what remains: Chunky pregeneration (Phase 2), backup compression running alongside the tick loop (5.2 puts `backup` and `monitor` on the same box), and 20-plus real players. **This is the third data point for Q-41 and all three point the same way.** The honest position is that this box is now close to full with none of the game's actual features built, and that is a sizing conclusion rather than a tuning one.
+
+### Query performance, for what it is worth
+
+`V1__init.sql` applied in **379 ms** for five tables with foreign keys - nothing to tune. Recorded only so that a future migration taking materially longer is visibly different rather than merely feeling slow.
