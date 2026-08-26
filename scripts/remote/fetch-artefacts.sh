@@ -149,9 +149,9 @@ else
   fi
 fi
 
-# ---- grimac 2.3.73 ----
+# ---- grimac 2.3.74-961fa54 ----
 EXPECT="bf9be1194eb45afe1dec6bd8e98d078dacf41539025c8aabe24d31337cbea86625774e30842568b47f34ca174472c724c7876cc30793945e7408b03609672655"
-FILE="grimac-bukkit-2.3.73.jar"
+FILE="grimac-bukkit-2.3.74-961fa54.jar"
 if [ -f "$FILE" ] && [ "$(sha512sum "$FILE" | cut -d" " -f1)" = "$EXPECT" ]; then
   echo "  cached+verified grimac  $FILE"
 else

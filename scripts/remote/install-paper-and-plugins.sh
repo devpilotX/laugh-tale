@@ -32,7 +32,7 @@ sudo -n sha256sum "$D/server.jar"
 
 echo "=== quarantine plugins that are not in the manifest ==="
 sudo -n mkdir -p "$Q"
-for f in Geyser-ViaProxy.jar FastAsyncWorldEdit-Paper-2.15.4.jar Chunky-Bukkit-1.4.40.jar; do
+for f in Geyser-ViaProxy.jar FastAsyncWorldEdit-Paper-2.15.4.jar Chunky-Bukkit-1.4.40.jar grimac-bukkit-2.3.73.jar grimac-bukkit-2.3.74-961fa54.jar; do
   # `sudo -n test -f`, NOT a bare [ -f ]. The ubuntu user cannot traverse
   # /var/lib/pelican/volumes, so a bare test returns FALSE for a file that exists and
   # the move is silently skipped. That is exactly what happened here: the old
@@ -46,19 +46,13 @@ for f in Geyser-ViaProxy.jar FastAsyncWorldEdit-Paper-2.15.4.jar Chunky-Bukkit-1
 done
 
 echo "=== install the manifest plugins ==="
-# GrimAC IS DELIBERATELY ABSENT FROM THIS LIST. It is pinned in the manifest and
-# still downloaded and checksum-verified, but it is not installed, because it makes
-# the server unplayable for a client newer than 1.21.11: it predicts movement from
-# packets ViaVersion has translated, mispredicts, and sets the player back. Measured
-# on the owner's own session - Simulation violations in the hundreds at offsets of
-# 0.008 blocks, and "I cannot even sprint".
-#
-# Without this exclusion, every deploy would reinstall it and undo the fix, which is
-# precisely the kind of silent regression a deploy script should never cause.
-#
-# Re-add it here the moment OA-27 is decided - either the server moves to the client's
-# version, or old clients are dropped so no translation happens. Acceptance row 50
-# cannot be claimed until then, and has not been.
+# GrimAC IS NOT INSTALLED. It was re-added on 2026-08-26 after discovering that 126 of
+# its versions state 26.2, then removed again the same hour because it does not WORK on
+# Paper 26.2 - it loads and then fails:
+#   [GrimAC] Failed to start PacketManager: ... NMS_ITEM_STACK_CLASS is null
+#   [GrimAC] Failed to register commands! Grim will run without command support.
+# Stating support and having a working packet layer are different things. Tested rather
+# than assumed, twice. Row 50 stays unclaimable. See OA-27 and the manifest entry.
 for f in Geyser-Spigot.jar floodgate-spigot.jar ViaVersion-5.11.0.jar ViaBackwards-5.11.0.jar \
          LuckPerms-Bukkit-5.5.71.jar Chunky-Bukkit-1.5.3.jar \
          voicechat-bukkit-2.6.21.jar; do

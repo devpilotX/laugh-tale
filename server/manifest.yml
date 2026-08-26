@@ -128,21 +128,66 @@ components:
     notes: "1.5.3 now, because it states 26.2. The earlier 1.4.40 pin existed only because 1.5.3 did not state 1.21.11 - the version move resolves that inversion."
   - name: "grimac"
     role: "Simulation anti-cheat (14.1)"
-    version: "2.3.73"
-    file: "grimac-bukkit-2.3.73.jar"
+    version: "2.3.74-961fa54"
+    file: "grimac-bukkit-2.3.74-961fa54.jar"
+    checksum_algo: "sha512"
+    checksum: "ca151c67d4a38a97e49b89a9f19f5dee4ba4e92aa2b99f1509b691dacbb915253f4be57fbca148ca3eb8e4333cd8a645356b5154580703d9306816a67a158dbd"
+    url: "https://cdn.modrinth.com/data/LJNGWSvH/versions/u8AJOfGz/grimac-bukkit-2.3.74-961fa54.jar"
+    checksum_source: "api.modrinth.com/v2"
+    release_channel: "ALPHA"
     installed: false
-    not_installed_because: >
-      MEASURED UNPLAYABLE with a client newer than the server. The owner connected
-      with Minecraft 26.2 (confirmed by `viaversion list`) to this 1.21.11 server, so
-      ViaVersion translates every packet. GrimAC predicts movement from packets and
-      its own boot warning says this combination is unsupported. Result: Simulation
-      violations in the hundreds at offsets as small as 0.008 blocks, plus setbacks -
-      which to a player is simply "I cannot sprint". Only 5 of Grim's checks expose a
-      setbackvl knob; its movement checks correct the player BY DESIGN, so there is no
-      alert-only mode for them, and raising thresholds until false positives stop
-      would also raise them until real cheats pass. Still downloaded and
-      checksum-verified, just not installed. Acceptance row 50 is NOT claimable while
-      this is so, and has not been claimed. Blocked on OA-27.
+    arm64_load_proof: "LOADS BUT DOES NOT FUNCTION on Paper 26.2 - tested 2026-08-26 07:00 UTC"
+    notes: >
+      TESTED TWICE, REJECTED TWICE, on different evidence each time.
+      First rejection: it made a 26.2 client unplayable on a 1.21.11 server, because
+      ViaVersion translated the packets Grim predicts from.
+      Second rejection, after finding that 126 GrimAC versions DO state 26.2 (all
+      alpha) and installing 2.3.74-961fa54 on the now-26.2 server: it loads and then
+      fails outright.
+        [GrimAC] Failed to load PacketEventsInit: ... NMS_ITEM_STACK_CLASS is null
+        [GrimAC] Failed to start PacketManager: ... NMS_ITEM_STACK_CLASS is null
+        [GrimAC] Failed to register commands! Grim will run without command support.
+      Its bundled PacketEvents cannot reflect Paper 26.2's internals. Stating support
+      and having a working packet layer are two different things - which is exactly why
+      deviation D5 requires an observed load proof rather than a publisher claim.
+      A plugin that loads with a dead packet layer is worse than one that refuses to
+      load: the server looks protected and is not.
+    also_warned: >
+      Even while broken it flagged a genuine configuration conflict worth keeping:
+      ViaVersion's `fix-1_21-placement-rotation` is known to cause false positives and
+      bypasses with GrimAC. That must be turned off before any anti-cheat is trusted.
+    consequence: >
+      Acceptance row 50 remains UNCLAIMABLE and has never been claimed. There is
+      currently NO anti-cheat on this server. For a product whose promise is PvP
+      fairness this is the single most important item before it opens to paying players.
+      Re-test when GrimAC ships a build whose PacketEvents supports 26.2, or evaluate an
+      alternative - Spartan states 26.2 but is paid, and 14.1 says do not buy anti-cheat
+      you have not proven you need. Tracked as OA-27.
+    notes: >
+      CORRECTS AN EARLIER CONCLUSION. This was recorded as having no 26.2 build and was
+      quarantined on that basis. That was wrong: plugin-support.ps1 only examined
+      RELEASE-channel versions, and 126 GrimAC versions state 26.2 - all of them alpha.
+      The server had been saying so on every boot: "New GrimAC version found! Version
+      2.3.74-961fa54".
+    why_alpha_is_accepted: >
+      Weighed rather than assumed. Against: 14.1 warns that false positives punish
+      honest players, and an alpha build on a paid PvP server is load-bearing code.
+      For: the ORIGINAL failure was not GrimAC being wrong, it was ViaVersion
+      TRANSLATING a 26.2 client for a 1.21.11 server - Grim predicts movement from
+      packets, and those packets had been rewritten. With the server now on the
+      client's own version there is no translation for current-version players, so the
+      cause is removed rather than masked. The alternative is no anti-cheat at all on a
+      server whose entire product is PvP fairness, which is worse.
+      Pinned to an exact commit hash and checksum, so despite being an alpha it is
+      still deterministic - spec 4.2 asks for an exact version, not a stable one.
+      Re-pin to a release build as soon as one states 26.2.
+    installed_configuration: >
+      All setbackvl values set to -1 by scripts/remote/grimac-alert-only.sh, which is
+      what 14.1 and the Phase 1 plan call for anyway: "Anti-cheat installed in
+      alert-only mode". Note this does NOT cover Grim's movement checks, which correct
+      the player by design - so if the alpha mispredicts, a player can still be set
+      back. That is the residual risk and it is why this needs a real client test
+      before anyone else is let in.
     checksum_algo: "sha512"
     checksum: "bf9be1194eb45afe1dec6bd8e98d078dacf41539025c8aabe24d31337cbea86625774e30842568b47f34ca174472c724c7876cc30793945e7408b03609672655"
     url: "https://cdn.modrinth.com/data/LJNGWSvH/versions/1FIGlM6Q/grimac-bukkit-2.3.73.jar"
