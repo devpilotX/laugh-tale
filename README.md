@@ -4,10 +4,6 @@ A paid-access, whitelist-gated, competitive survival Minecraft server. Currency 
 
 Spec 29.10 asks this file to state the problem, the constraints, the three hardest decisions, and the measured numbers with the method that produced them. That is what follows.
 
-## The problem
-
-DonutSMP-shaped survival servers are popular and structurally broken: donor tiers sell advantage, dual currencies hyperinflate, crates are gambling, and griefing drives players away. LaughTail keeps the shape and fixes the incentives. The commercial model is a single uniform access fee, which Mojang's Commercial Usage Guidelines permit and which makes pay-to-win impossible by construction rather than by policy.
-
 ## The constraints
 
 | Constraint | Value |
