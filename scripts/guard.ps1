@@ -32,6 +32,30 @@ $script:GuardAllowedDeleteRoots = @(
 # every ordinary day of work. A teardown happens once; widening the everyday list to permit it
 # would leave the box permanently one typo away from losing the panel.
 $script:GuardTeardownDeleteRoots = @(
+  '/var/lib/docker',
+  '/var/lib/containerd',
+  '/etc/docker',
+  '/etc/nginx',
+  '/var/log/nginx',
+  '/var/www',
+  '/etc/letsencrypt',
+  '/var/lib/letsencrypt',
+  '/var/log/letsencrypt',
+  # Build leftovers, named individually. /home/ubuntu ITSELF IS DELIBERATELY ABSENT, and so is /home:
+  # permitting either would allow deleting ~/.ssh/authorized_keys, which locks every account out of
+  # the box permanently and cannot be recovered without console access. That is the one deletion here
+  # that is worse than losing the world, so the guard refuses it even during a teardown.
+  # These two also appear in GuardAllowedDeleteRoots, but WITH a trailing slash - so the bare
+  # directory itself does not match there. Listed here without one so the teardown can remove the
+  # directory and not merely its contents.
+  '/home/ubuntu/laughtail-plugin',
+  '/home/ubuntu/laughtail-scratch',
+  '/home/ubuntu/laughtail-db',
+  '/home/ubuntu/laughtail-monitor',
+  '/home/ubuntu/laughtail-stage',
+  '/home/ubuntu/mcbuild',
+  '/home/ubuntu/.m2',
+  '/home/ubuntu/.cache',
   '/var/lib/pelican',
   '/var/www/pelican',
   '/etc/pelican',

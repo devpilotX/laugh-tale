@@ -824,3 +824,27 @@ What remains recoverable: the SERVER, entirely, from
 Owner should now: keep C:\Laugh-Tale-DATA-BACKUP somewhere with a second copy. It is a
      271 MB folder holding the entire history of the server and it currently exists on
      one disk, which is the same exposure OA-33 was raised about.
+RESOLVED 2026-08-27 - OA-35 Full host cleanup and dependency update
+What the owner asked: nothing left on the VPS at all, and every dependency updated.
+What was removed on top of the earlier teardown: Docker, containerd, nginx, certbot,
+     the MariaDB client, and every openjdk/php package; their data directories
+     (/var/lib/docker, /etc/nginx, /var/www, /etc/letsencrypt and the rest); the docker
+     apt repository and key; and 622 MB of build leftovers in the home directory
+     (~/.m2, mcbuild, laughtail-stage, laughtail-db and the others).
+     Then apt upgrade, full-upgrade, autoremove --purge, autoclean, journal vacuum, and
+     a reboot onto the newer kernel.
+Result: disk went 13 GB used -> 4.8 GB used (14 GB free). Home directory 622 MB -> 2.5 MB.
+     Kernel 6.17.0-1017-aws -> 7.0.0-1011-aws. Only port 22 listening. No Docker, no
+     Java, no nginx. 654 packages, 2 upgradable and those are Ubuntu PHASED updates,
+     which are held back on a fraction of machines by design and arrive on their own.
+The TLS certificate for panel.devpilotx.com was deleted with certbot. It certified the
+     Pelican panel, which no longer exists, so it protected nothing - and certbot
+     reissues one in seconds if that subdomain is wanted again. Flagged because it is a
+     deliberate deletion rather than a side effect.
+WHAT THE GUARD REFUSED, AND WHY IT MATTERED: it blocked every path in this cleanup until
+     each was named explicitly. /home/ubuntu itself, /home, /etc, /var and / remain
+     refused even under -TeardownApproved, and this was tested rather than assumed. That
+     matters because deleting /home/ubuntu would take ~/.ssh/authorized_keys with it and
+     lock every account out of the box permanently - the one deletion on this machine
+     worse than losing the world, since it cannot be undone without console access.
+     ~/.ssh, ~/.bashrc and ~/.profile were preserved and verified present afterwards.
