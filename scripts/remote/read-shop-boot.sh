@@ -1,2 +1,0 @@
-V=$(sudo -n ls -1 /var/lib/pelican/volumes | head -1)
-sudo -n grep "Row 25 verified\|ORDER BOOK SELF-TEST\|ARBITRAGE AUDIT" /var/lib/pelican/volumes/$V/logs/latest.log | tail -3 | sed 's/.*LaughTail\] //'
