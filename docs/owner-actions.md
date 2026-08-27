@@ -31,7 +31,7 @@ Still outstanding: no remote is configured. See OA-02.
 ```
 
 ```
-BLOCKED - OA-02 GitHub repository and a way to push to it
+RESOLVED 2026-08-27 - OA-02 GitHub repository and a way to push to it
 What I need: a GitHub repository named laughtail-smp, and either a deploy key or a
      fine-grained personal access token that can push to it.
 Why: Spec 32.3 rows 5 and 6. Section 29 makes the repository the only source of
@@ -749,3 +749,32 @@ is too new for any anti-cheat to support yet.
    problem re-diagnosed rather than assumed solved.
 
 **I cannot decide this** - every option trades away something the owner cares about.
+## OA-02 resolution note - 2026-08-27
+
+Pushed to `https://github.com/devpilotX/laugh-tale`, all 83 commits, 266 files, branch `main`. Local
+and remote HEAD verified identical.
+
+**The owner chose a PUBLIC repository, having been shown the trade-off.** Recorded here because it is a
+decision rather than an oversight, and because it constrains future work.
+
+**What was checked before publishing**, since publishing history cannot be undone:
+
+* All 83 commits scanned - 4.2 MB of diff - for password assignments, RCON passwords, Panel `APP_KEY`,
+  private key blocks, GitHub tokens and AWS access keys. **Every hit was a regex pattern, a
+  `__PRESERVE__` placeholder, or an explicitly fake test key.** No real credential has ever been
+  committed.
+* Anti-farm and manipulation thresholds confirmed absent from every commit. They live in
+  `docs/private/`, which is gitignored, and the tracked deploy script ships that file without
+  containing its values.
+* After pushing, `raw.githubusercontent.com` was queried directly for `docs/private/private.yml` and
+  `scripts/host.env.ps1`. Both return absent.
+
+**Never-break rule 10 still holds**, and the distinction matters: the rule forbids publishing detector
+*thresholds*, and the numbers are not published. What a reader can now see is the detection *method* in
+`CombatTracker.java` - that same-IP kills are suppressed, that repeat kills decay, that staff are
+excluded. A determined player could design around the shape of it without knowing the numbers.
+
+**Consequence to accept, so nobody is surprised later:** the thresholds are now the only thing standing
+between the anti-farm system and a reader who wants to evade it. That makes `docs/private/` genuinely
+load-bearing rather than merely tidy. If it is ever committed by accident, the anti-farm system should be
+treated as compromised and the numbers changed, not just the file removed.
