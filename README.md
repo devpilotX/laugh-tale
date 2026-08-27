@@ -54,7 +54,7 @@ README.md              This file
 .gitignore             Written before the first commit. Never-break rule 5
 docs/
   spec/
-    MASTER.md          The specification, v6.0 FINAL, 3,994 lines. The archive
+    MASTER.md          The specification, v6.0 FINAL, 2,950 lines. The archive
     INDEX.md           The working entry point. 280 headings mapped to 43 files
     00-...33-, A-...G- One file per section and appendix. Load on demand
   progress.md          Running state and the proposed build order
@@ -75,4 +75,49 @@ Read `AGENTS.md`, then `docs/progress.md`, then `docs/decisions.md`, then `docs/
 
 ## Status
 
-**Day Zero. The plan is written and awaiting owner approval.** No server code has been written and no server configuration has been changed. See `docs/progress.md`.
+**Playable and running. Not yet open to paying players.** Last updated 2026-08-27.
+
+The server runs Paper 26.2 on the VPS with a clean boot, and `docs/progress.md` carries the running
+handoff. What exists:
+
+| Area | State |
+| --- | --- |
+| **Core plugin** | 27 source files, no dependency beyond Paper. Written from scratch |
+| **Database** | 7 migrations, 33 tables, forward-only runner that refuses a tampered checksum |
+| **Economy** | Single currency, transactional ledger, 777-item shop, dynamic prices, order-book bazaar |
+| **Ranking** | Ten PvP tiers, monthly seasons, one Champion enforced by a database constraint |
+| **Roleplay** | Six Paths, four Houses, a five-chapter Chronicle. Status only, never power |
+| **Ops** | One-command deploy, hourly backups, restore drill that passes, monitoring |
+| **Acceptance** | 81 criteria: 9 pass with evidence, 8 partial, 7 built but untested, 57 not started |
+
+### Three things are re-proven on every single boot
+
+Because a check that has to be remembered stops being run:
+
+* **No blocking database call on the main thread.** The plugin deliberately attempts one and confirms
+  it is refused.
+* **The bazaar cannot create or destroy value.** A real order match runs inside a transaction and is
+  rolled back, asserting Berries and items are conserved.
+* **The shop cannot be turned into a money printer.** All 1,585 recipes are checked for a profitable
+  cycle, pessimistically. If one is found the shop **closes itself** rather than trading.
+
+That last one is not theoretical: it found 220 profitable recipes the first time the full catalogue was
+priced, and the server now lowers offending prices automatically.
+
+### What stands between this and opening
+
+* **No anti-cheat.** Tested twice, failed twice - Minecraft 26.2 is too new for any anti-cheat to
+  support. On a server whose entire value is a fair PvP ladder this is the launch blocker, and it is a
+  decision rather than an engineering task (`docs/owner-actions.md`, OA-32).
+* **No land claims**, so griefing is currently unprevented.
+* **No load test**, so the 24-player cap is an assertion rather than a measurement.
+* **No website or legal pages**, which a paid server needs before it can charge.
+
+`docs/a-to-z.md` is the honest full inventory, including everything missing.
+
+### A note on reading this repository
+
+The commit messages are unusually long on purpose. Each explains *why* a change was made and, where a
+bug was found, what the failure mode was - several of them record bugs that were invisible because the
+test meant to catch them had silently stopped working. `docs/decisions.md` holds the same reasoning for
+the decisions that shaped the design, and `docs/rejected.md` records what was deliberately not built.
