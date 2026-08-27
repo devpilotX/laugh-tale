@@ -69,6 +69,17 @@ scripts/               Every state-changing command lives in a script, never ad 
 db/migrations/         Schema migrations, version-controlled from the first commit
 ```
 
+## Recreating this server from scratch
+
+`docs/REBUILD.md` is the runbook: clone, fill in three values, run one command, and a bare VPS becomes an
+identical server in about 45 minutes. There is no credential to carry across - the database password
+regenerates itself and the IP salt is freshly random.
+
+**It rebuilds the server, not the data.** The world and every player balance live in backups, not in git,
+and a 271 MB world does not belong in a repository. `docs/MIGRATION.md` covers moving live data to a new
+box; OA-33 covers getting those backups off the machine they are protecting, which is the one gap that
+currently matters.
+
 ## Where to start
 
 Read `AGENTS.md`, then `docs/progress.md`, then `docs/decisions.md`, then `docs/owner-actions.md` - in that order, every session. Then load only the specification sections the current task needs, using `docs/spec/INDEX.md`. Do not load `MASTER.md`; spec 33.4 explains why.

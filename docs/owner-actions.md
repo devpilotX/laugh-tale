@@ -778,3 +778,24 @@ excluded. A determined player could design around the shape of it without knowin
 between the anti-farm system and a reader who wants to evade it. That makes `docs/private/` genuinely
 load-bearing rather than merely tidy. If it is ever committed by accident, the anti-farm system should be
 treated as compromised and the numbers changed, not just the file removed.
+BLOCKED - OA-33 Backups are on the same machine as the server
+What I need: a decision to send backups off the box, and an S3 bucket (or equivalent)
+     with VERSIONING enabled.
+Why: the owner asked whether the server can be recreated from GitHub after deleting the
+     VPS. The answer is yes for the SERVER and no for the DATA, and the reason is that
+     every backup currently lives on the same machine it is protecting. That covers a bad
+     deploy or a corrupted world; it covers nothing about losing the machine.
+     GitHub holds all 266 files needed to rebuild an identical EMPTY server in about 45
+     minutes. It holds no Berries, no ranks, no homes and no world - 271 MB of world data
+     does not belong in git.
+Steps for the owner:
+     1. Create a bucket, e.g. laughtail-backups, in the same region as the VPS.
+     2. TURN ON VERSIONING. This matters more than the bucket: without it, a corrupted
+        world backed up on schedule overwrites the last good copy, and the backup becomes
+        the thing that destroys the data.
+     3. Attach an IAM role to the instance allowing PutObject on that bucket only. A role
+        rather than keys, so there is no credential to leak.
+     4. Tell me, and I will add one line to backup-run.sh and prove it with a restore.
+Cost: a few cents a month at this size.
+Until then: the honest position is that GitHub protects the server and nothing protects
+     the world. Recorded in docs/REBUILD.md so it is not discovered the hard way.
