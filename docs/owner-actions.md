@@ -848,3 +848,33 @@ WHAT THE GUARD REFUSED, AND WHY IT MATTERED: it blocked every path in this clean
      lock every account out of the box permanently - the one deletion on this machine
      worse than losing the world, since it cannot be undone without console access.
      ~/.ssh, ~/.bashrc and ~/.profile were preserved and verified present afterwards.
+## OA-35 addendum - what a deep sweep found after the cleanup "finished"
+
+The first cleanup reported success and the box was not clean. A deeper sweep found eight more things,
+recorded because the pattern is more useful than the list: **every one was in a place nobody thinks to
+look, which is exactly why leftovers survive on machines for years.**
+
+| Found | Why it mattered |
+| --- | --- |
+| `/root/pelican-credentials.txt` | **A credentials file, still readable.** Shredded rather than deleted, and its contents were never printed |
+| `pelican` system user and group, `docker` group | An orphaned UID can own files a later install creates; a reused GID can silently grant access |
+| ufw rules opening 8443 and 25565 to the whole internet | Ports held open for services that no longer existed |
+| `/usr/local/sbin/laughtail-{backup,monitor}.sh` | Host helper scripts, outside every directory the teardown knew about |
+| `/etc/cron.daily/pelican-maintenance`, 3 logrotate configs | Scheduled work referring to nothing |
+| `/etc/pelican-php-version`, two `99-pelican.ini` files | Config for packages already purged |
+| `/var/backups/laughtail`, `/var/log/pelican` | Data and logs outside the paths the teardown covered |
+| 3 packages in residual-config state, incl. an old kernel | Removed but not purged, holding disk |
+
+**fail2ban was failing, and that one was self-inflicted.** Its `nginx-http-auth` jail watched
+`/var/log/nginx/pelican.error.log`, which the cleanup had deleted - so removing nginx silently disabled
+**SSH brute-force protection** on a box about to host a public website. The jail was removed and fail2ban
+now runs with the sshd jail active, verified reporting. The original config was kept as
+`jail.local.before-cleanup`.
+
+**The lesson worth keeping:** the first cleanup verified the paths it knew about and reported success.
+It took an independent sweep - `find / -xdev` for the project's names, plus checks for users, groups,
+firewall rules, residual packages and failed units - to find the rest. A cleanup script can only verify
+its own assumptions, which is the same blind spot the restore drill had.
+
+**Final state:** no project files anywhere on the filesystem, 0 failed units, only ports 22/80/443 open,
+4.8 GB of 19 GB used, Ubuntu 24.04.4 on kernel 7.0.0-1011-aws, fail2ban protecting SSH.

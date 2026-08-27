@@ -32,6 +32,8 @@ $script:GuardAllowedDeleteRoots = @(
 # every ordinary day of work. A teardown happens once; widening the everyday list to permit it
 # would leave the box permanently one typo away from losing the panel.
 $script:GuardTeardownDeleteRoots = @(
+  '/var/backups/laughtail',
+  '/var/log/pelican',
   '/var/lib/docker',
   '/var/lib/containerd',
   '/etc/docker',
