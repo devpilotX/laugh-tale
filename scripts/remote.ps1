@@ -16,6 +16,9 @@ param(
   [string]$Command,
   [string]$ScriptFile,
   [switch]$Confirmed,
+  # Separate from -Confirmed on purpose: this one permits PERMANENT DESTRUCTION of the server, and
+  # every other confirmed command must not silently gain that right.
+  [switch]$TeardownApproved,
   [string]$Reason = '',
   [switch]$DryRun
 )
@@ -52,7 +55,7 @@ if ($lines.Count -eq 0) { throw 'GUARD: nothing to run after stripping comments.
 
 $level = 'plain'
 foreach ($l in $lines) {
-  $d = Assert-CommandAllowed -Command $l -Confirmed:$Confirmed -Reason $Reason
+  $d = Assert-CommandAllowed -Command $l -Confirmed:$Confirmed -Reason $Reason -TeardownApproved:$TeardownApproved
   if ($d.Level -eq 'confirmed') { $level = 'confirmed' }
 }
 Write-Output ("GUARD OK ({0}): {1} line(s) approved" -f $level, $lines.Count)

@@ -799,3 +799,28 @@ Steps for the owner:
 Cost: a few cents a month at this size.
 Until then: the honest position is that GitHub protects the server and nothing protects
      the world. Recorded in docs/REBUILD.md so it is not discovered the hard way.
+RESOLVED 2026-08-27 - OA-34 Permanent teardown of the Minecraft server
+What the owner asked: delete everything Minecraft-related from 13.206.200.102
+     permanently, to free the box for a website.
+What was done FIRST, because the guard refused until it was: the newest world backup
+     (271,197,962 bytes) and database dump were downloaded to the owner's PC at
+     C:\Laugh-Tale-DATA-BACKUP and verified there - gzip magic 1f8b on both, the tar
+     confirmed to decompress, and the SQL dump confirmed to contain 33 CREATE TABLE
+     statements, 2 triggers and 19 INSERT statements. Without that step the teardown
+     would have destroyed the only copy of the world and every player record.
+Why the guard mattered here: scripts/guard.ps1 refused the teardown outright under
+     never-break rule 8 and told me to document it and get explicit confirmation. That
+     is the guard doing its job on the one command in this project that cannot be undone.
+     Rather than weakening it, a separate -TeardownApproved switch was added. It is
+     deliberately NOT folded into -Confirmed, because otherwise every ordinary confirmed
+     command would silently gain the right to delete the world. It relaxes exactly two
+     rules - container removal and volume pruning - and recursive deletes still go
+     through the literal-path check.
+What remains recoverable: the SERVER, entirely, from
+     https://github.com/devpilotX/laugh-tale via docs/REBUILD.md - clone, three values,
+     one command, about 45 minutes. The DATA is recoverable only from the two files now
+     on the owner's PC, which are the sole surviving copy. If those are lost, the world
+     and every balance, rank, home and Path level are gone permanently.
+Owner should now: keep C:\Laugh-Tale-DATA-BACKUP somewhere with a second copy. It is a
+     271 MB folder holding the entire history of the server and it currently exists on
+     one disk, which is the same exposure OA-33 was raised about.

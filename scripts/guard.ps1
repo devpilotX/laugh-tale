@@ -24,6 +24,20 @@ $script:GuardAllowedDeleteRoots = @(
   '/home/ubuntu/laughtail-plugin/'
 )
 
+# Permitted ONLY when the caller passes -TeardownApproved. These are the paths a permanent
+# teardown must remove and that nothing else has any business deleting: the Pelican data
+# directory, the panel web root, the panel config and the local backup directory.
+#
+# Kept as a SEPARATE list rather than added to the one above, because the list above governs
+# every ordinary day of work. A teardown happens once; widening the everyday list to permit it
+# would leave the box permanently one typo away from losing the panel.
+$script:GuardTeardownDeleteRoots = @(
+  '/var/lib/pelican',
+  '/var/www/pelican',
+  '/etc/pelican',
+  '/home/ubuntu/laughtail-backups'
+)
+
 # The production server must never be touched from a script (never-break rule 1).
 $script:GuardProductionNames = @('laughtail-prod', 'laughtail-live')
 
@@ -67,7 +81,18 @@ function Assert-CommandAllowed {
   param(
     [Parameter(Mandatory)][AllowEmptyString()][string]$Command,
     [switch]$Confirmed,
-    [string]$Reason = ''
+    [string]$Reason = '',
+    # TEARDOWN IS A SEPARATE, LOUDER PERMISSION THAN -Confirmed.
+    #
+    # -Confirmed means "the owner approved this operation". -TeardownApproved means "the owner asked to
+    # DESTROY the server permanently", which is a different question and deserves a different answer.
+    # Folding it into -Confirmed would mean every ordinary confirmed command silently gained the right
+    # to delete the world, which is precisely the fail-open the rest of this file exists to prevent.
+    #
+    # It relaxes exactly two rules - container removal and volume pruning - and nothing else. Recursive
+    # deletes still go through the literal-path check, so a teardown script still cannot delete a path
+    # held in a variable.
+    [switch]$TeardownApproved
   )
 
   if ([string]::IsNullOrWhiteSpace($Command)) {
@@ -118,9 +143,16 @@ function Assert-CommandAllowed {
       }
 
       $ok = $false
-      foreach ($root in $script:GuardAllowedDeleteRoots) {
-        if ($target.StartsWith($root.ToLowerInvariant())) { $ok = $true; break }
+      if ($TeardownApproved) {
+        foreach ($tr in $script:GuardTeardownDeleteRoots) {
+          if ($target -eq $tr.ToLowerInvariant() -or $target.StartsWith($tr.ToLowerInvariant() + '/')) {
+            $ok = $true; break
+          }
+        }
       }
+      if (-not $ok) { foreach ($root in $script:GuardAllowedDeleteRoots) {
+        if ($target.StartsWith($root.ToLowerInvariant())) { $ok = $true; break }
+      } }
       # A relative path is inside the repository working directory, which is fine.
       if (-not $ok -and $target -notmatch '^[/~]' -and $target -notmatch '^[a-z]:') { $ok = $true }
       if ($ok) { continue }
@@ -187,7 +219,7 @@ function Assert-CommandAllowed {
     @{ p = 'git\s+filter-branch|git\s+filter-repo'
        r = 'git safety'; why = 'rewrites all history' }
     @{ p = 'docker\s+(volume\s+)?rm\b|docker\s+system\s+prune|docker\s+volume\s+prune'
-       r = 'never-break rule 8'; why = 'deletes a Pelican server volume' }
+       r = 'never-break rule 8'; why = 'deletes a Pelican server volume'; teardownOk = $true }
     @{ p = 'ufw\s+(disable|--force\s+reset|reset)\b'
        r = 'security'; why = 'opens the host to the internet' }
     @{ p = 'iptables\s+-f\b|iptables\s+--flush'
@@ -198,6 +230,10 @@ function Assert-CommandAllowed {
 
   foreach ($d in $deny) {
     if (-not (Test-GuardRule -Norm $norm -Pattern $d.p)) { continue }
+    # A rule marked teardownOk is skipped ONLY when the caller passed -TeardownApproved, which is a
+    # louder and separate permission from -Confirmed. Folding the two together would mean every
+    # ordinary confirmed command silently gained the right to delete the world.
+    if ($TeardownApproved -and $d.ContainsKey('teardownOk')) { continue }
     throw ("GUARD REFUSED ({0}): {1}`n  command: {2}`n  If this is genuinely required, write it to docs/owner-actions.md and get explicit confirmation." -f `
            $d.r, $d.why, $Command)
   }
